@@ -85,11 +85,18 @@ export LD_LIBRARY_PATH="$LIBDIR:$LIBDIR/libweston-16:$LIBDIR/weston:\$LD_LIBRARY
 export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/tmp}"
 export WESTON_MODULE_MAP="anland-backend.so=$LIBDIR/libweston-16/anland-backend.so;gl-renderer.so=$LIBDIR/libweston-16/gl-renderer.so;vulkan-renderer.so=$LIBDIR/libweston-16/vulkan-renderer.so;desktop-shell.so=$LIBDIR/weston/desktop-shell.so;xwayland.so=$LIBDIR/libweston-16/xwayland.so"
 
-# Route GL through zink-on-turnip and force the default Vulkan device so it
-# doesn't fall back to llvmpipe (software) on the kgsl backend. Needed for
-# Xwayland / X11 clients to get hardware acceleration.
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+# Native freedreno GL on the kgsl GPU node (loader name "kgsl"). GALLIUM_DRIVER
+# is set so EGL does NOT silently fall back to zink if freedreno init fails
+# (we require freedreno end-to-end).
+export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+export GALLIUM_DRIVER=kgsl
+# Force the freedreno DRM layer to open /dev/kgsl-3d0 directly. EGL/GBM clients
+# (Xwayland glamor, GL apps) are otherwise handed the sde-kms display node
+# (renderD128), which drmGetVersion reports as "msm" with no GPU behind it ->
+# half-initialised screen -> crash. The Adreno GPU is kgsl-only on this device.
+export FD_FORCE_KGSL=1
 export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
+export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE_DRI3=1
 
 shift 2>/dev/null || true
 exec $PREFIX/bin/weston -Banland-backend.so --disp-sock="\$SOCK" --xwayland "\$@"
@@ -107,10 +114,14 @@ chmod 0700 "\$XDG_RUNTIME_DIR"
 export WESTON_MODULE_MAP="anland-backend.so=$LIBDIR/libweston-16/anland-backend.so;gl-renderer.so=$LIBDIR/libweston-16/gl-renderer.so;vulkan-renderer.so=$LIBDIR/libweston-16/vulkan-renderer.so;xwayland.so=$LIBDIR/libweston-16/xwayland.so;kiosk-shell.so=$LIBDIR/weston/kiosk-shell.so"
 unset DISPLAY
 
-# Route GL through zink-on-turnip and force the default Vulkan device so it
-# doesn't fall back to llvmpipe (software) on the kgsl backend. Needed for
-# Xwayland / X11 clients to get hardware acceleration.
-export MESA_LOADER_DRIVER_OVERRIDE=zink
+# Use the native freedreno GL driver on the kgsl GPU node. The gallium driver
+# is registered under the name "kgsl" (an alias of msm in the patched mesa from
+# mesa-for-android-container dev branch) — NOT "freedreno", which is not a valid
+# loader name and would fall through to zink->llvmpipe.
+# GALLIUM_DRIVER pins it so EGL won't silently fall back to zink on failure.
+export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+export GALLIUM_DRIVER=kgsl
+export FD_FORCE_KGSL=1
 export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 
 WESTON_PID=
@@ -125,13 +136,6 @@ cleanup() {
     wait 2>/dev/null
 }
 trap cleanup EXIT
-
-if ! command -v startplasma-wayland >/dev/null 2>&1; then
-    echo "ERROR: startplasma-wayland not found."
-    echo "Install the standard Plasma Wayland session launcher:"
-    echo "  sudo apt-get install -y plasma-workspace-wayland"
-    exit 1
-fi
 
 rm -f "\${XDG_RUNTIME_DIR}"/wayland-* 2>/dev/null
 
@@ -156,20 +160,20 @@ fi
 echo "weston socket: \$WESTON_SOCKET"
 
 export WAYLAND_DISPLAY="\$WESTON_SOCKET"
-export MESA_LOADER_DRIVER_OVERRIDE=zink
-export GALLIUM_DRIVER=zink
-# Force the default Vulkan device so zink picks turnip instead of falling back
-# to llvmpipe. The plain var covers the surfaceless path; the _DRI3 variant
-# (added to this patched mesa) covers Xwayland's GBM/DRI3 glamor path, whose
-# render-node DRM major/minor never matches turnip on the kgsl backend.
+# Native freedreno GL on the kgsl GPU node. Registered loader name is "kgsl"
+# (alias of msm in the patched mesa), NOT "freedreno". GALLIUM_DRIVER pins it
+# so EGL won't silently fall back to zink if freedreno init fails.
+export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+export GALLIUM_DRIVER=kgsl
+export FD_FORCE_KGSL=1
+# Kept for any client that still falls back to the zink path: force the default
+# Vulkan device (plain var = surfaceless, _DRI3 = Xwayland GBM/DRI3 glamor path)
+# so it lands on turnip instead of llvmpipe.
 export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE_DRI3=1
 export QT_QPA_PLATFORM=wayland
-
-# Standard Plasma startup. With WAYLAND_DISPLAY pointing at weston,
-# startplasma-wayland brings up kwin_wayland nested in weston (--wayland-fd),
-# spawns Xwayland, plasmashell and the full set of KDE daemons itself — no
-# manual wiring of kded/kactivitymanagerd/kwin needed.
+export FD_MESA_DEBUG=notile
+export XWAYLAND_NO_DRI3_MODIFIERS=1
 dbus-run-session startplasma-wayland &
 KDE_PID=\$!
 
