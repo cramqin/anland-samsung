@@ -1,3 +1,2023 @@
+diff --git a/src/backends/CMakeLists.txt b/src/backends/CMakeLists.txt
+index 93e1991..6d08333 100644
+--- a/src/backends/CMakeLists.txt
++++ b/src/backends/CMakeLists.txt
+@@ -1,3 +1,4 @@
++add_subdirectory(anland)
+ add_subdirectory(drm)
+ add_subdirectory(fakeinput)
+ add_subdirectory(libinput)
+diff --git a/src/backends/anland/CMakeLists.txt b/src/backends/anland/CMakeLists.txt
+new file mode 100644
+index 0000000..6186224
+--- /dev/null
++++ b/src/backends/anland/CMakeLists.txt
+@@ -0,0 +1,13 @@
++target_sources(kwin PRIVATE
++    anland_backend.cpp
++    anland_egl_backend.cpp
++    anland_input.cpp
++    anland_logging.cpp
++    anland_output.cpp
++    # vendored libdisplay_producer (talks to the Android display daemon)
++    display_producer.c
++    socket_utils.c
++)
++
++target_include_directories(kwin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(kwin Libdrm::Libdrm)
+diff --git a/src/backends/anland/anland_backend.cpp b/src/backends/anland/anland_backend.cpp
+new file mode 100644
+index 0000000..02ae8fd
+--- /dev/null
++++ b/src/backends/anland/anland_backend.cpp
+@@ -0,0 +1,301 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "anland_backend.h"
++#include "anland_egl_backend.h"
++#include "anland_input.h"
++#include "anland_logging.h"
++#include "anland_output.h"
++
++#include "core/renderloop.h"
++
++#include <QSocketNotifier>
++#include <QTimer>
++
++#include <sys/eventfd.h>
++#include <unistd.h>
++
++namespace KWin
++{
++
++static const QString s_defaultSocketPath = QStringLiteral("/tmp/display_daemon.sock");
++static const int s_reconnectIntervalMs = 200;
++
++AnlandBackend::AnlandBackend(const QString &socketPath, QObject *parent)
++    : OutputBackend(parent)
++    , m_socketPath(socketPath.isEmpty() ? s_defaultSocketPath : socketPath)
++{
++}
++
++AnlandBackend::~AnlandBackend()
++{
++    teardownNotifiers();
++    if (m_reconnectTimer) {
++        m_reconnectTimer->stop();
++    }
++    // m_outputs are QObject children of this backend; ~QObject deletes them.
++    m_outputs.clear();
++    m_inputDevice.reset();
++    if (m_display) {
++        ::disconnect(m_display); // C producer API, not QObject::disconnect
++        m_display = nullptr;
++    }
++    if (sceneEglDisplay() != EGL_NO_DISPLAY) {
++        eglTerminate(sceneEglDisplay());
++    }
++}
++
++bool AnlandBackend::initialize()
++{
++    if (connect_to_deamon(&m_display, m_socketPath.toLocal8Bit().constData()) < 0) {
++        qCWarning(KWIN_ANLAND) << "failed to connect to display daemon at" << m_socketPath;
++        return false;
++    }
++
++    set_fallback_callback(m_display, &AnlandBackend::fallbackTrampoline, this);
++
++    uint32_t w = 0, h = 0, fmt = 0, refresh = 0;
++    get_screen_info(m_display, &w, &h, &fmt, &refresh);
++    qCInfo(KWIN_ANLAND) << "connected to daemon at" << m_socketPath
++                        << "screen" << w << "x" << h << "refresh" << refresh << "mHz";
++
++    if (w == 0 || h == 0) {
++        qCWarning(KWIN_ANLAND) << "daemon reported invalid screen size";
++        return false;
++    }
++
++    m_inputDevice = std::make_unique<AnlandInputDevice>();
++
++    auto *output = new AnlandOutput(this, QStringLiteral("anland-1"));
++    output->init(QSize(w, h), static_cast<int>(refresh), 1.0);
++    m_outputs.append(output);
++    Q_EMIT outputAdded(output);
++    output->updateEnabled(true);
++    Q_EMIT outputsQueried();
++
++    m_reconnectTimer = new QTimer(this);
++    m_reconnectTimer->setInterval(s_reconnectIntervalMs);
++    connect(m_reconnectTimer, &QTimer::timeout, this, &AnlandBackend::onReconnectTimer);
++
++    setupNotifiers();
++
++    return true;
++}
++
++std::unique_ptr<OpenGLBackend> AnlandBackend::createOpenGLBackend()
++{
++    return std::make_unique<AnlandEglBackend>(this);
++}
++
++std::unique_ptr<InputBackend> AnlandBackend::createInputBackend()
++{
++    return std::make_unique<AnlandInputBackend>(this);
++}
++
++QVector<CompositingType> AnlandBackend::supportedCompositors() const
++{
++    return QVector<CompositingType>{OpenGLCompositing};
++}
++
++Outputs AnlandBackend::outputs() const
++{
++    return m_outputs;
++}
++
++bool AnlandBackend::notifyFramePresented()
++{
++    if (m_consumerReady) {
++        trigger_refresh(m_display);
++        m_consumerReady = false;
++        return true;
++    }
++    return false;
++}
++
++void AnlandBackend::setupNotifiers()
++{
++    teardownNotifiers();
++
++    const int dataFd = get_data_fd(m_display);
++    if (dataFd >= 0) {
++        m_inputNotifier = new QSocketNotifier(dataFd, QSocketNotifier::Read, this);
++        connect(m_inputNotifier, &QSocketNotifier::activated, this, [this]() {
++            onInputReadable();
++        });
++    }
++
++    const int bufReadyFd = get_buffer_ready_fd(m_display);
++    if (bufReadyFd >= 0) {
++        m_bufReadyNotifier = new QSocketNotifier(bufReadyFd, QSocketNotifier::Read, this);
++        connect(m_bufReadyNotifier, &QSocketNotifier::activated, this, [this]() {
++            onBufferReady();
++        });
++    }
++}
++
++void AnlandBackend::teardownNotifiers()
++{
++    if (m_inputNotifier) {
++        m_inputNotifier->setEnabled(false);
++        m_inputNotifier->deleteLater();
++        m_inputNotifier = nullptr;
++    }
++    if (m_bufReadyNotifier) {
++        m_bufReadyNotifier->setEnabled(false);
++        m_bufReadyNotifier->deleteLater();
++        m_bufReadyNotifier = nullptr;
++    }
++}
++
++void AnlandBackend::onInputReadable()
++{
++    if (m_inFallback) {
++        return;
++    }
++
++    InputEvent ev;
++    while (poll_input_event(m_display, &ev, 0) > 0) {
++        processInputEvent(ev);
++        if (m_inFallback) {
++            break; // poll_input_event may have triggered fallback
++        }
++    }
++}
++
++void AnlandBackend::processInputEvent(const InputEvent &ev)
++{
++    if (!m_inputDevice || m_outputs.isEmpty()) {
++        return;
++    }
++    const qreal scale = m_outputs[0]->scale();
++
++    switch (ev.type) {
++    case INPUT_TYPE_POINTER_MOTION:
++        m_inputDevice->pointerMotionAbsolute(QPointF(ev.pointer_motion.x, ev.pointer_motion.y) / scale);
++        break;
++    case INPUT_TYPE_POINTER_BUTTON:
++        m_inputDevice->pointerButton(ev.pointer_button.button, ev.pointer_button.pressed != 0);
++        break;
++    case INPUT_TYPE_POINTER_AXIS: {
++        // protocol axis: 0 = vertical scroll, 1 = horizontal scroll (wayland order)
++        const InputRedirection::PointerAxis axis =
++            ev.pointer_axis.axis == 0 ? InputRedirection::PointerAxisVertical : InputRedirection::PointerAxisHorizontal;
++        m_inputDevice->pointerAxis(axis, ev.pointer_axis.value, ev.pointer_axis.discrete * 120);
++        break;
++    }
++    case INPUT_TYPE_KEY:
++        m_inputDevice->keyboardKey(ev.key.keycode, ev.key.action == INPUT_ACTION_DOWN);
++        break;
++    case INPUT_TYPE_TOUCH: {
++        const QPointF pos = QPointF(ev.touch.x, ev.touch.y) / scale;
++        switch (ev.touch.action) {
++        case INPUT_ACTION_DOWN:
++            m_inputDevice->touchDown(ev.touch.pointer_id, pos);
++            break;
++        case INPUT_ACTION_UP:
++            m_inputDevice->touchUp(ev.touch.pointer_id);
++            break;
++        case INPUT_ACTION_MOVE:
++            m_inputDevice->touchMotion(ev.touch.pointer_id, pos);
++            break;
++        default:
++            break;
++        }
++        break;
++    }
++    case INPUT_TYPE_TOUCH_FRAME:
++        m_inputDevice->touchFrame();
++        break;
++    default:
++        break;
++    }
++}
++
++void AnlandBackend::onBufferReady()
++{
++    if (m_inFallback) {
++        return;
++    }
++
++    const int fd = get_buffer_ready_fd(m_display);
++
++    if (!m_dmabufReceived) {
++        // First readiness signal: receive the dmabuf set from the daemon.
++        wait_buffer_async(m_display);
++        void *buf = nullptr;
++        if (wait_buffer_async_result(m_display, &buf) != 0) {
++            return; // may have entered fallback
++        }
++        m_dmabufReceived = true;
++    } else if (fd >= 0) {
++        eventfd_t val;
++        eventfd_read(fd, &val);
++    }
++
++    m_consumerReady = true;
++
++    // Buffer-ready is our frame-completion signal: complete the in-flight frame
++    // (if any) and schedule the next one, keeping the render cycle paced by the
++    // consumer rather than a timer.
++    if (!m_outputs.isEmpty()) {
++        m_outputs[0]->onConsumerReady();
++    }
++}
++
++void AnlandBackend::fallbackTrampoline(void *data)
++{
++    static_cast<AnlandBackend *>(data)->enterFallback();
++}
++
++void AnlandBackend::enterFallback()
++{
++    if (m_inFallback) {
++        return;
++    }
++    qCWarning(KWIN_ANLAND) << "consumer disconnected, entering fallback";
++
++    if (m_inputDevice) {
++        m_inputDevice->touchCancel();
++    }
++
++    // A frame may be in flight awaiting a buffer-ready that will never come now;
++    // fail it so the RenderLoop's frame accounting does not stall.
++    if (!m_outputs.isEmpty()) {
++        m_outputs[0]->onConsumerLost();
++    }
++
++    teardownNotifiers();
++
++    m_consumerReady = false;
++    m_dmabufReceived = false;
++    m_inFallback = true;
++
++    if (m_reconnectTimer) {
++        m_reconnectTimer->start();
++    }
++}
++
++void AnlandBackend::onReconnectTimer()
++{
++    if (!m_inFallback) {
++        m_reconnectTimer->stop();
++        return;
++    }
++
++    try_reconnect(m_display);
++    if (is_fallback(m_display)) {
++        return; // still down, keep retrying
++    }
++
++    qCInfo(KWIN_ANLAND) << "consumer reconnected";
++    m_inFallback = false;
++    m_dmabufReceived = false;
++    m_consumerReady = false;
++    setupNotifiers();
++    m_reconnectTimer->stop();
++}
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_backend.h b/src/backends/anland/anland_backend.h
+new file mode 100644
+index 0000000..2056fb9
+--- /dev/null
++++ b/src/backends/anland/anland_backend.h
+@@ -0,0 +1,91 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++
++    Native KWin output+input backend that talks to the Android display daemon
++    directly (via libdisplay_producer), instead of running nested inside the
++    weston "anland" compositor. Port of weston/libweston/backend-anland/anland.c
++    to KWin's OutputBackend architecture.
++*/
++#pragma once
++
++#include "core/outputbackend.h"
++
++#include <QVector>
++#include <memory>
++
++extern "C" {
++#include "display_producer.h"
++#include "protocol.h"
++}
++
++class QSocketNotifier;
++class QTimer;
++
++namespace KWin
++{
++
++class AnlandOutput;
++class AnlandInputDevice;
++
++class KWIN_EXPORT AnlandBackend : public OutputBackend
++{
++    Q_OBJECT
++
++public:
++    explicit AnlandBackend(const QString &socketPath = QString(), QObject *parent = nullptr);
++    ~AnlandBackend() override;
++
++    bool initialize() override;
++
++    std::unique_ptr<OpenGLBackend> createOpenGLBackend() override;
++    std::unique_ptr<InputBackend> createInputBackend() override;
++    QVector<CompositingType> supportedCompositors() const override;
++    Outputs outputs() const override;
++
++    display_ctx *display() const
++    {
++        return m_display;
++    }
++    AnlandInputDevice *inputDevice() const
++    {
++        return m_inputDevice.get();
++    }
++
++    /**
++     * Called by AnlandEglBackend::present(): hand the freshly painted buffer to
++     * the consumer (signals refresh_done_efd). Returns true if the buffer was
++     * actually handed over (consumer was ready), false otherwise — the caller
++     * uses this to decide how to complete the RenderLoop frame.
++     */
++    bool notifyFramePresented();
++
++private:
++    void setupNotifiers();
++    void teardownNotifiers();
++    void onInputReadable();
++    void onBufferReady();
++    void processInputEvent(const InputEvent &ev);
++    void onReconnectTimer();
++    void enterFallback();
++
++    static void fallbackTrampoline(void *data);
++
++    QString m_socketPath;
++    display_ctx *m_display = nullptr;
++
++    QVector<AnlandOutput *> m_outputs;
++    std::unique_ptr<AnlandInputDevice> m_inputDevice;
++
++    QSocketNotifier *m_inputNotifier = nullptr;
++    QSocketNotifier *m_bufReadyNotifier = nullptr;
++    QTimer *m_reconnectTimer = nullptr;
++
++    bool m_consumerReady = false;
++    bool m_dmabufReceived = false;
++    bool m_inFallback = false;
++};
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_egl_backend.cpp b/src/backends/anland/anland_egl_backend.cpp
+new file mode 100644
+index 0000000..aa743cd
+--- /dev/null
++++ b/src/backends/anland/anland_egl_backend.cpp
+@@ -0,0 +1,328 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "anland_egl_backend.h"
++#include "anland_backend.h"
++#include "anland_logging.h"
++#include "anland_output.h"
++
++// kwin
++#include "basiceglsurfacetexture_internal.h"
++#include "basiceglsurfacetexture_wayland.h"
++#include "core/dmabufattributes.h"
++#include "utils/filedescriptor.h"
++// kwin libs
++#include <kwineglimagetexture.h>
++#include <kwinglutils.h>
++
++#include <drm_fourcc.h>
++#include <unistd.h>
++
++#ifndef EGL_PLATFORM_SURFACELESS_MESA
++#define EGL_PLATFORM_SURFACELESS_MESA 0x31DD
++#endif
++
++namespace KWin
++{
++
++/*
++ * The daemon's screen_info.format / buf_info.format uses the consumer-side
++ * pixel-format enum (see common/protocol.h). 1 == RGBA_8888 in Android memory
++ * layout, which is ABGR8888 in DRM fourcc terms; everything else is treated as
++ * XRGB8888. Mirrors protocol_format_to_drm() in weston's backend-anland.
++ */
++static uint32_t protocol_format_to_drm(uint32_t fmt)
++{
++    switch (fmt) {
++    case 1:
++        return DRM_FORMAT_ABGR8888;
++    default:
++        return DRM_FORMAT_XRGB8888;
++    }
++}
++
++AnlandEglLayer::AnlandEglLayer(AnlandOutput *output, AnlandEglBackend *backend)
++    : m_backend(backend)
++    , m_output(output)
++{
++}
++
++AnlandEglLayer::~AnlandEglLayer()
++{
++    dropBuffers();
++}
++
++void AnlandEglLayer::dropBuffers()
++{
++    for (int i = 0; i < MAX_BUFS; i++) {
++        m_fbos[i].reset();
++        m_textures[i].reset();
++        m_accumDamage[i] = QRegion();
++    }
++    m_bufCount = 0;
++}
++
++bool AnlandEglLayer::importBuffers(int count)
++{
++    display_ctx *display = m_backend->display();
++    const QSize size = m_output->modeSize();
++    const QRegion full = QRect(QPoint(0, 0), size);
++
++    dropBuffers();
++
++    for (int i = 0; i < count; i++) {
++        const int fd = get_dmabuf_fd_at(display, i);
++        buf_info info;
++        if (fd < 0 || get_dmabuf_info_at(display, i, &info) < 0) {
++            qCWarning(KWIN_ANLAND) << "failed to get dmabuf info for buffer" << i;
++            dropBuffers();
++            return false;
++        }
++
++        DmaBufAttributes attrs;
++        attrs.planeCount = 1;
++        attrs.width = size.width();
++        attrs.height = size.height();
++        attrs.format = protocol_format_to_drm(info.format);
++        attrs.modifier = info.modifier;
++        // The producer owns the dmabuf fd; DmaBufAttributes (and the EGLImage we
++        // hand the fd to) must not close it, so dup() into the owning slot.
++        attrs.fd[0] = FileDescriptor(dup(fd));
++        attrs.offset[0] = static_cast<int>(info.offset);
++        attrs.pitch[0] = static_cast<int>(info.stride);
++
++        EGLImageKHR image = m_backend->importDmaBufAsImage(attrs);
++        if (image == EGL_NO_IMAGE_KHR) {
++            qCWarning(KWIN_ANLAND) << "failed to import dmabuf" << i << "as EGLImage";
++            dropBuffers();
++            return false;
++        }
++
++        auto texture = std::make_unique<EGLImageTexture>(m_backend->eglDisplay(), image, GL_RGBA8, size);
++        auto fbo = std::make_unique<GLFramebuffer>(texture.get());
++        // The consumer reads this dmabuf top-down, while GL renders bottom-up.
++        // Mark the target Y-inverted so the renderer flips the projection at the
++        // root and writes directly into the dmabuf the right way up (zero copy).
++        fbo->setYInverted(true);
++        if (!fbo->valid()) {
++            qCWarning(KWIN_ANLAND) << "framebuffer for dmabuf" << i << "is not complete";
++            dropBuffers();
++            return false;
++        }
++
++        qCDebug(KWIN_ANLAND) << "imported buffer" << i << "fd" << fd << size
++                             << "fmt" << Qt::hex << attrs.format << "mod" << attrs.modifier;
++
++        m_textures[i] = std::move(texture);
++        m_fbos[i] = std::move(fbo);
++        // Freshly imported dmabuf has undefined contents: owe it a full frame.
++        m_accumDamage[i] = full;
++    }
++
++    m_bufCount = count;
++    return true;
++}
++
++std::optional<OutputLayerBeginFrameInfo> AnlandEglLayer::beginFrame()
++{
++    m_backend->makeCurrent();
++
++    display_ctx *display = m_backend->display();
++    const int count = get_buf_count(display);
++
++    // Consumer went away (fallback) -> release our stale imports.
++    if (count == 0) {
++        if (m_bufCount > 0) {
++            dropBuffers();
++        }
++        return std::nullopt;
++    }
++
++    // (Re)connected and dmabufs are available but not imported yet.
++    if (m_bufCount == 0) {
++        if (!importBuffers(count)) {
++            return std::nullopt;
++        }
++    }
++
++    m_currentIndex = get_selected_idx(display);
++    if (m_currentIndex < 0 || m_currentIndex >= m_bufCount) {
++        m_currentIndex = 0;
++    }
++
++    return OutputLayerBeginFrameInfo{
++        .renderTarget = RenderTarget(m_fbos[m_currentIndex].get()),
++        .repaint = m_accumDamage[m_currentIndex],
++    };
++}
++
++bool AnlandEglLayer::endFrame(const QRegion &renderedRegion, const QRegion &damagedRegion)
++{
++    // Every buffer owes this frame's damage; the buffer we just painted is now
++    // fully up to date, so clear its debt.
++    for (int i = 0; i < m_bufCount; i++) {
++        m_accumDamage[i] += damagedRegion;
++    }
++    if (m_currentIndex < m_bufCount) {
++        m_accumDamage[m_currentIndex] = QRegion();
++    }
++
++    glFlush(); // flush pending rendering commands into the dmabuf.
++    return true;
++}
++
++AnlandEglBackend::AnlandEglBackend(AnlandBackend *b)
++    : AbstractEglBackend()
++    , m_backend(b)
++{
++    // Egl is always direct rendering.
++    setIsDirectRendering(true);
++}
++
++AnlandEglBackend::~AnlandEglBackend()
++{
++    m_outputs.clear();
++    cleanup();
++}
++
++display_ctx *AnlandEglBackend::display() const
++{
++    return m_backend->display();
++}
++
++bool AnlandEglBackend::initializeEgl()
++{
++    initClientExtensions();
++    EGLDisplay display = m_backend->sceneEglDisplay();
++
++    if (display == EGL_NO_DISPLAY) {
++        if (hasClientExtension(QByteArrayLiteral("EGL_MESA_platform_surfaceless"))) {
++            display = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
++        } else {
++            qCWarning(KWIN_ANLAND) << "Extension EGL_MESA_platform_surfaceless not available";
++        }
++    }
++
++    if (display == EGL_NO_DISPLAY) {
++        return false;
++    }
++    setEglDisplay(display);
++    return initEglAPI();
++}
++
++void AnlandEglBackend::init()
++{
++    if (!initializeEgl()) {
++        setFailed("Could not initialize egl");
++        return;
++    }
++    if (!initRenderingContext()) {
++        setFailed("Could not initialize rendering context");
++        return;
++    }
++
++    initKWinGL();
++    if (checkGLError("Init")) {
++        setFailed("Error during init of AnlandEglBackend");
++        return;
++    }
++
++    // The consumer rotates buffers externally; we manage damage per buffer
++    // ourselves and never rely on EGL_EXT_buffer_age of a swapchain.
++    setSupportsBufferAge(false);
++    initWayland();
++
++    const auto outputs = m_backend->outputs();
++    for (Output *output : outputs) {
++        addOutput(output);
++    }
++
++    connect(m_backend, &AnlandBackend::outputAdded, this, &AnlandEglBackend::addOutput);
++    connect(m_backend, &AnlandBackend::outputRemoved, this, &AnlandEglBackend::removeOutput);
++}
++
++bool AnlandEglBackend::initRenderingContext()
++{
++    initBufferConfigs();
++
++    if (!createContext()) {
++        return false;
++    }
++
++    return makeCurrent();
++}
++
++void AnlandEglBackend::addOutput(Output *output)
++{
++    makeCurrent();
++    m_outputs[output] = std::make_unique<AnlandEglLayer>(static_cast<AnlandOutput *>(output), this);
++}
++
++void AnlandEglBackend::removeOutput(Output *output)
++{
++    makeCurrent();
++    m_outputs.erase(output);
++}
++
++bool AnlandEglBackend::initBufferConfigs()
++{
++    const EGLint config_attribs[] = {
++        EGL_SURFACE_TYPE,
++        EGL_WINDOW_BIT,
++        EGL_RED_SIZE,
++        1,
++        EGL_GREEN_SIZE,
++        1,
++        EGL_BLUE_SIZE,
++        1,
++        EGL_ALPHA_SIZE,
++        0,
++        EGL_RENDERABLE_TYPE,
++        isOpenGLES() ? EGL_OPENGL_ES2_BIT : EGL_OPENGL_BIT,
++        EGL_CONFIG_CAVEAT,
++        EGL_NONE,
++        EGL_NONE,
++    };
++
++    EGLint count;
++    EGLConfig configs[1024];
++    if (eglChooseConfig(eglDisplay(), config_attribs, configs, 1, &count) == EGL_FALSE) {
++        return false;
++    }
++    if (count != 1) {
++        return false;
++    }
++    setConfig(configs[0]);
++
++    return true;
++}
++
++std::unique_ptr<SurfaceTexture> AnlandEglBackend::createSurfaceTextureInternal(SurfacePixmapInternal *pixmap)
++{
++    return std::make_unique<BasicEGLSurfaceTextureInternal>(this, pixmap);
++}
++
++std::unique_ptr<SurfaceTexture> AnlandEglBackend::createSurfaceTextureWayland(SurfacePixmapWayland *pixmap)
++{
++    return std::make_unique<BasicEGLSurfaceTextureWayland>(this, pixmap);
++}
++
++OutputLayer *AnlandEglBackend::primaryLayer(Output *output)
++{
++    return m_outputs[output].get();
++}
++
++void AnlandEglBackend::present(Output *output)
++{
++    // Hand the freshly painted buffer to the consumer (refresh_done_efd). Frame
++    // timing is paced by the daemon's eventfds, not a timer: if the buffer was
++    // handed over, the frame completes when the consumer signals buffer-ready;
++    // otherwise it is completed immediately. See AnlandOutput::onPresented().
++    const bool handedToConsumer = m_backend->notifyFramePresented();
++    static_cast<AnlandOutput *>(output)->onPresented(handedToConsumer);
++}
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_egl_backend.h b/src/backends/anland/anland_egl_backend.h
+new file mode 100644
+index 0000000..10e8d58
+--- /dev/null
++++ b/src/backends/anland/anland_egl_backend.h
+@@ -0,0 +1,96 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++
++    OpenGL/EGL render backend for the anland backend. It renders the KWin scene
++    directly into the dmabuf buffers provided by the display daemon (imported by
++    fd) and tells the daemon to present them. Modeled on VirtualEglBackend, with
++    the render target being one of the daemon's dmabufs instead of an internal
++    FBO. The consumer rotates the buffer index externally (shared memory), so the
++    layer keeps per-buffer accumulated damage (buffer-age equivalent), exactly
++    like weston's backend-anland.
++*/
++#pragma once
++
++#include "abstract_egl_backend.h"
++#include "core/outputlayer.h"
++
++#include <QRegion>
++#include <array>
++#include <map>
++#include <memory>
++
++extern "C" {
++#include "display_producer.h"
++#include "protocol.h"
++}
++
++namespace KWin
++{
++class GLFramebuffer;
++class GLTexture;
++class AnlandBackend;
++class AnlandEglBackend;
++class AnlandOutput;
++
++class AnlandEglLayer : public OutputLayer
++{
++public:
++    AnlandEglLayer(AnlandOutput *output, AnlandEglBackend *backend);
++    ~AnlandEglLayer() override;
++
++    std::optional<OutputLayerBeginFrameInfo> beginFrame() override;
++    bool endFrame(const QRegion &renderedRegion, const QRegion &damagedRegion) override;
++
++private:
++    bool importBuffers(int count);
++    void dropBuffers();
++
++    AnlandEglBackend *const m_backend;
++    AnlandOutput *m_output;
++
++    int m_bufCount = 0;
++    int m_currentIndex = 0;
++    std::array<std::unique_ptr<GLTexture>, MAX_BUFS> m_textures;
++    std::array<std::unique_ptr<GLFramebuffer>, MAX_BUFS> m_fbos;
++    /* Per-buffer accumulated damage: each buffer must remember everything that
++     * changed since it was last rendered, because the consumer rotates the
++     * selected index out from under us. */
++    std::array<QRegion, MAX_BUFS> m_accumDamage;
++};
++
++class AnlandEglBackend : public AbstractEglBackend
++{
++    Q_OBJECT
++
++public:
++    AnlandEglBackend(AnlandBackend *b);
++    ~AnlandEglBackend() override;
++
++    std::unique_ptr<SurfaceTexture> createSurfaceTextureInternal(SurfacePixmapInternal *pixmap) override;
++    std::unique_ptr<SurfaceTexture> createSurfaceTextureWayland(SurfacePixmapWayland *pixmap) override;
++    OutputLayer *primaryLayer(Output *output) override;
++    void present(Output *output) override;
++    void init() override;
++
++    AnlandBackend *backend() const
++    {
++        return m_backend;
++    }
++    display_ctx *display() const;
++
++private:
++    bool initializeEgl();
++    bool initBufferConfigs();
++    bool initRenderingContext();
++
++    void addOutput(Output *output);
++    void removeOutput(Output *output);
++
++    AnlandBackend *m_backend;
++    std::map<Output *, std::unique_ptr<AnlandEglLayer>> m_outputs;
++};
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_input.cpp b/src/backends/anland/anland_input.cpp
+new file mode 100644
+index 0000000..64731cd
+--- /dev/null
++++ b/src/backends/anland/anland_input.cpp
+@@ -0,0 +1,163 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "anland_input.h"
++#include "anland_backend.h"
++
++#include <chrono>
++
++namespace KWin
++{
++
++static std::chrono::microseconds now()
++{
++    return std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch());
++}
++
++AnlandInputDevice::AnlandInputDevice(QObject *parent)
++    : InputDevice(parent)
++{
++}
++
++QString AnlandInputDevice::sysName() const
++{
++    return QStringLiteral("anland-input");
++}
++
++QString AnlandInputDevice::name() const
++{
++    return QStringLiteral("anland virtual input");
++}
++
++bool AnlandInputDevice::isEnabled() const
++{
++    return m_enabled;
++}
++
++void AnlandInputDevice::setEnabled(bool enabled)
++{
++    m_enabled = enabled;
++}
++
++LEDs AnlandInputDevice::leds() const
++{
++    return LEDs();
++}
++
++void AnlandInputDevice::setLeds(LEDs leds)
++{
++}
++
++bool AnlandInputDevice::isKeyboard() const
++{
++    return true;
++}
++
++bool AnlandInputDevice::isAlphaNumericKeyboard() const
++{
++    return true;
++}
++
++bool AnlandInputDevice::isPointer() const
++{
++    return true;
++}
++
++bool AnlandInputDevice::isTouchpad() const
++{
++    return false;
++}
++
++bool AnlandInputDevice::isTouch() const
++{
++    return true;
++}
++
++bool AnlandInputDevice::isTabletTool() const
++{
++    return false;
++}
++
++bool AnlandInputDevice::isTabletPad() const
++{
++    return false;
++}
++
++bool AnlandInputDevice::isTabletModeSwitch() const
++{
++    return false;
++}
++
++bool AnlandInputDevice::isLidSwitch() const
++{
++    return false;
++}
++
++void AnlandInputDevice::pointerMotionAbsolute(const QPointF &position)
++{
++    Q_EMIT InputDevice::pointerMotionAbsolute(position, now(), this);
++}
++
++void AnlandInputDevice::pointerButton(quint32 button, bool pressed)
++{
++    Q_EMIT pointerButtonChanged(button,
++                                pressed ? InputRedirection::PointerButtonPressed : InputRedirection::PointerButtonReleased,
++                                now(), this);
++}
++
++void AnlandInputDevice::pointerAxis(InputRedirection::PointerAxis axis, qreal delta, qint32 deltaV120)
++{
++    const InputRedirection::PointerAxisSource source =
++        deltaV120 != 0 ? InputRedirection::PointerAxisSourceWheel : InputRedirection::PointerAxisSourceContinuous;
++    Q_EMIT pointerAxisChanged(axis, delta, deltaV120, source, now(), this);
++}
++
++void AnlandInputDevice::keyboardKey(quint32 keycode, bool pressed)
++{
++    Q_EMIT keyChanged(keycode,
++                      pressed ? InputRedirection::KeyboardKeyPressed : InputRedirection::KeyboardKeyReleased,
++                      now(), this);
++}
++
++void AnlandInputDevice::touchDown(qint32 id, const QPointF &position)
++{
++    Q_EMIT InputDevice::touchDown(id, position, now(), this);
++}
++
++void AnlandInputDevice::touchMotion(qint32 id, const QPointF &position)
++{
++    Q_EMIT InputDevice::touchMotion(id, position, now(), this);
++}
++
++void AnlandInputDevice::touchUp(qint32 id)
++{
++    Q_EMIT InputDevice::touchUp(id, now(), this);
++}
++
++void AnlandInputDevice::touchFrame()
++{
++    Q_EMIT InputDevice::touchFrame(this);
++}
++
++void AnlandInputDevice::touchCancel()
++{
++    Q_EMIT touchCanceled(this);
++}
++
++AnlandInputBackend::AnlandInputBackend(AnlandBackend *backend)
++    : m_backend(backend)
++{
++}
++
++void AnlandInputBackend::initialize()
++{
++    if (AnlandInputDevice *device = m_backend->inputDevice()) {
++        Q_EMIT deviceAdded(device);
++    }
++}
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_input.h b/src/backends/anland/anland_input.h
+new file mode 100644
+index 0000000..7650a0e
+--- /dev/null
++++ b/src/backends/anland/anland_input.h
+@@ -0,0 +1,73 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++
++    Input for the anland backend. A single combined InputDevice (pointer +
++    keyboard + touch) fed from the display daemon's data fd. Mirrors the single
++    weston_seat that weston's backend-anland sets up.
++*/
++#pragma once
++
++#include "core/inputbackend.h"
++#include "core/inputdevice.h"
++
++namespace KWin
++{
++
++class AnlandBackend;
++
++class AnlandInputDevice : public InputDevice
++{
++    Q_OBJECT
++
++public:
++    explicit AnlandInputDevice(QObject *parent = nullptr);
++
++    QString sysName() const override;
++    QString name() const override;
++    bool isEnabled() const override;
++    void setEnabled(bool enabled) override;
++    LEDs leds() const override;
++    void setLeds(LEDs leds) override;
++
++    bool isKeyboard() const override;
++    bool isAlphaNumericKeyboard() const override;
++    bool isPointer() const override;
++    bool isTouchpad() const override;
++    bool isTouch() const override;
++    bool isTabletTool() const override;
++    bool isTabletPad() const override;
++    bool isTabletModeSwitch() const override;
++    bool isLidSwitch() const override;
++
++    // Event injection helpers (called by AnlandBackend from the data-fd reader).
++    void pointerMotionAbsolute(const QPointF &position);
++    void pointerButton(quint32 button, bool pressed);
++    void pointerAxis(InputRedirection::PointerAxis axis, qreal delta, qint32 deltaV120);
++    void keyboardKey(quint32 keycode, bool pressed);
++    void touchDown(qint32 id, const QPointF &position);
++    void touchMotion(qint32 id, const QPointF &position);
++    void touchUp(qint32 id);
++    void touchFrame();
++    void touchCancel();
++
++private:
++    bool m_enabled = true;
++};
++
++class AnlandInputBackend : public InputBackend
++{
++    Q_OBJECT
++
++public:
++    explicit AnlandInputBackend(AnlandBackend *backend);
++
++    void initialize() override;
++
++private:
++    AnlandBackend *m_backend;
++};
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_logging.cpp b/src/backends/anland/anland_logging.cpp
+new file mode 100644
+index 0000000..130469f
+--- /dev/null
++++ b/src/backends/anland/anland_logging.cpp
+@@ -0,0 +1,8 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "anland_logging.h"
++Q_LOGGING_CATEGORY(KWIN_ANLAND, "kwin_backend_anland", QtWarningMsg)
+diff --git a/src/backends/anland/anland_logging.h b/src/backends/anland/anland_logging.h
+new file mode 100644
+index 0000000..d3928b8
+--- /dev/null
++++ b/src/backends/anland/anland_logging.h
+@@ -0,0 +1,10 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#pragma once
++#include <QDebug>
++#include <QLoggingCategory>
++Q_DECLARE_LOGGING_CATEGORY(KWIN_ANLAND)
+diff --git a/src/backends/anland/anland_output.cpp b/src/backends/anland/anland_output.cpp
+new file mode 100644
+index 0000000..c90e9ec
+--- /dev/null
++++ b/src/backends/anland/anland_output.cpp
+@@ -0,0 +1,101 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++#include "anland_output.h"
++#include "anland_backend.h"
++
++#include "core/renderloop_p.h"
++
++#include <chrono>
++
++namespace KWin
++{
++
++AnlandOutput::AnlandOutput(AnlandBackend *parent, const QString &name)
++    : Output(parent)
++    , m_backend(parent)
++    , m_renderLoop(std::make_unique<RenderLoop>())
++{
++    setInformation(Information{
++        .name = name,
++        .manufacturer = QStringLiteral("anland"),
++        .model = QStringLiteral("anland"),
++        .internal = true,
++    });
++}
++
++AnlandOutput::~AnlandOutput()
++{
++}
++
++RenderLoop *AnlandOutput::renderLoop() const
++{
++    return m_renderLoop.get();
++}
++
++void AnlandOutput::init(const QSize &pixelSize, int refresh, qreal scale)
++{
++    // refresh is in mHz, like RenderLoop/OutputMode expect.
++    if (refresh <= 0) {
++        refresh = 60000;
++    }
++    m_renderLoop->setRefreshRate(refresh);
++
++    auto mode = std::make_shared<OutputMode>(pixelSize, refresh, OutputMode::Flag::Preferred);
++
++    setState(State{
++        .position = QPoint(0, 0),
++        .scale = scale,
++        .modes = {mode},
++        .currentMode = mode,
++    });
++}
++
++void AnlandOutput::updateEnabled(bool enabled)
++{
++    State next = m_state;
++    next.enabled = enabled;
++    setState(next);
++}
++
++void AnlandOutput::completeFrame()
++{
++    const auto now = std::chrono::steady_clock::now().time_since_epoch();
++    RenderLoopPrivate::get(m_renderLoop.get())->notifyFrameCompleted(now);
++}
++
++void AnlandOutput::onPresented(bool handedToConsumer)
++{
++    if (handedToConsumer) {
++        // The consumer will present the buffer and then signal buffer-ready;
++        // defer frame completion until then (see onConsumerReady()).
++        m_awaitingPresent = true;
++    } else {
++        // Nothing was handed to the consumer this frame, so no buffer-ready will
++        // arrive for it — complete it now to keep the RenderLoop balanced.
++        completeFrame();
++    }
++}
++
++void AnlandOutput::onConsumerReady()
++{
++    if (m_awaitingPresent) {
++        m_awaitingPresent = false;
++        completeFrame();
++    }
++    // Render the next frame in lockstep with the consumer.
++    m_renderLoop->scheduleRepaint();
++}
++
++void AnlandOutput::onConsumerLost()
++{
++    if (m_awaitingPresent) {
++        m_awaitingPresent = false;
++        RenderLoopPrivate::get(m_renderLoop.get())->notifyFrameFailed();
++    }
++}
++
++} // namespace KWin
+diff --git a/src/backends/anland/anland_output.h b/src/backends/anland/anland_output.h
+new file mode 100644
+index 0000000..2020f97
+--- /dev/null
++++ b/src/backends/anland/anland_output.h
+@@ -0,0 +1,67 @@
++/*
++    KWin - the KDE window manager
++    This file is part of the KDE project.
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++
++    Native output for the "anland" backend. The render cycle is paced by the
++    display daemon's eventfds, not a software timer: present() hands the buffer
++    to the consumer (refresh_done_efd) and the consumer's buffer-ready signal
++    (buf_ready_efd) completes the frame — mirroring how the DRM backend completes
++    a frame on a page-flip event. This keeps KWin's compositing in lockstep with
++    the frontend instead of free-running on a vsync timer.
++*/
++#pragma once
++
++#include "core/output.h"
++
++#include <QObject>
++
++namespace KWin
++{
++
++class AnlandBackend;
++
++class AnlandOutput : public Output
++{
++    Q_OBJECT
++
++public:
++    AnlandOutput(AnlandBackend *parent, const QString &name);
++    ~AnlandOutput() override;
++
++    RenderLoop *renderLoop() const override;
++
++    /** @p pixelSize and @p refresh (in mHz) come from the display daemon. */
++    void init(const QSize &pixelSize, int refresh, qreal scale);
++    void updateEnabled(bool enabled);
++
++    /**
++     * Called from AnlandEglBackend::present() once per composited frame.
++     * @p handedToConsumer is true if the buffer was actually handed to the
++     * consumer (refresh triggered); the frame is then completed later, when the
++     * consumer signals buffer-ready. If false (nothing was presented, e.g. no
++     * dmabufs yet or in fallback), the frame is completed immediately so the
++     * RenderLoop's frame accounting stays balanced and never stalls.
++     */
++    void onPresented(bool handedToConsumer);
++
++    /** Consumer signalled buffer-ready (buf_ready_efd): complete the in-flight
++     *  frame and schedule the next one, keeping the cycle consumer-paced. */
++    void onConsumerReady();
++
++    /** Consumer went away mid-frame: fail any in-flight frame so the RenderLoop
++     *  does not wait forever for a buffer-ready that will never arrive. */
++    void onConsumerLost();
++
++private:
++    void completeFrame();
++
++    Q_DISABLE_COPY(AnlandOutput);
++
++    AnlandBackend *m_backend;
++    std::unique_ptr<RenderLoop> m_renderLoop;
++    bool m_awaitingPresent = false;
++};
++
++} // namespace KWin
+diff --git a/src/backends/anland/display_producer.c b/src/backends/anland/display_producer.c
+new file mode 100644
+index 0000000..02c9616
+--- /dev/null
++++ b/src/backends/anland/display_producer.c
+@@ -0,0 +1,408 @@
++#define _GNU_SOURCE
++#include "display_producer.h"
++#include "socket_utils.h"
++
++#include <errno.h>
++#include <poll.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/eventfd.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++struct display_ctx {
++    int      ctrl_fd;
++    int      data_fd;
++    int      buf_ready_efd;
++    int      refresh_done_efd;
++    int      shm_fd;
++    volatile uint32_t *shm_ptr;
++    uint32_t screen_w, screen_h;
++    uint32_t pixel_format;
++    uint32_t refresh;
++    bool     fallback;
++
++    bool     async_pending;
++    int      dmabuf_fds[MAX_BUFS];
++    struct buf_info dmabuf_infos[MAX_BUFS];
++    int      buf_count;
++
++    void (*fallback_cb)(void *);
++    void  *fallback_userdata;
++};
++
++static void enter_fallback(display_ctx *ctx)
++{
++    if (ctx->fallback)
++        return;
++    ctx->fallback = true;
++
++    for (int i = 0; i < ctx->buf_count; i++) {
++        if (ctx->dmabuf_fds[i] >= 0) {
++            close(ctx->dmabuf_fds[i]);
++            ctx->dmabuf_fds[i] = -1;
++        }
++    }
++    ctx->buf_count = 0;
++    if (ctx->data_fd >= 0)         { close(ctx->data_fd);         ctx->data_fd = -1; }
++    if (ctx->buf_ready_efd >= 0)   { close(ctx->buf_ready_efd);   ctx->buf_ready_efd = -1; }
++    if (ctx->refresh_done_efd >= 0){ close(ctx->refresh_done_efd); ctx->refresh_done_efd = -1; }
++    if (ctx->shm_ptr) { munmap((void *)ctx->shm_ptr, sizeof(uint32_t)); ctx->shm_ptr = NULL; }
++    if (ctx->shm_fd >= 0)         { close(ctx->shm_fd);           ctx->shm_fd = -1; }
++
++    if (ctx->fallback_cb)
++        ctx->fallback_cb(ctx->fallback_userdata);
++}
++
++static int pickup_fds(display_ctx *ctx)
++{
++    struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
++    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
++        return -1;
++
++    int fds[4];
++    int fd_count = 0;
++    struct ctrl_msg resp;
++    int n = recv_fds(ctx->ctrl_fd, &resp, sizeof(resp), fds, 4, &fd_count);
++    if (n <= 0 || resp.type != CTRL_MSG_FDS_READY || fd_count < 4)
++        return -1;
++
++    ctx->buf_ready_efd = fds[0];
++    ctx->refresh_done_efd = fds[1];
++    ctx->data_fd = fds[2];
++    ctx->shm_fd = fds[3];
++
++    ctx->shm_ptr = mmap(NULL, sizeof(uint32_t), PROT_READ,
++                        MAP_SHARED, ctx->shm_fd, 0);
++    if (ctx->shm_ptr == MAP_FAILED) {
++        ctx->shm_ptr = NULL;
++        return -1;
++    }
++
++    ctx->fallback = false;
++    return 0;
++}
++
++int connect_to_deamon(display_ctx **out, const char *socket_path)
++{
++    display_ctx *ctx = calloc(1, sizeof(*ctx));
++    if (!ctx)
++        return -1;
++
++    ctx->ctrl_fd = -1;
++    ctx->data_fd = -1;
++    ctx->buf_ready_efd = -1;
++    ctx->refresh_done_efd = -1;
++    ctx->shm_fd = -1;
++    ctx->shm_ptr = NULL;
++    ctx->fallback = true;
++    for (int i = 0; i < MAX_BUFS; i++)
++        ctx->dmabuf_fds[i] = -1;
++
++    ctx->ctrl_fd = connect_unix(socket_path);
++    if (ctx->ctrl_fd < 0)
++        goto fail;
++
++    struct ctrl_msg hdr = { .type = CTRL_MSG_PRODUCER_HELLO, .size = 0 };
++    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
++        goto fail;
++
++    uint8_t buf[sizeof(struct ctrl_msg) + sizeof(struct screen_info)];
++    if (recv_all(ctx->ctrl_fd, buf, sizeof(buf)) < 0)
++        goto fail;
++
++    struct ctrl_msg resp;
++    memcpy(&resp, buf, sizeof(resp));
++    if (resp.type != CTRL_MSG_SCREEN_INFO || resp.size != sizeof(struct screen_info))
++        goto fail;
++
++    struct screen_info si;
++    memcpy(&si, buf + sizeof(struct ctrl_msg), sizeof(si));
++    ctx->screen_w = si.width;
++    ctx->screen_h = si.height;
++    ctx->pixel_format = si.format;
++    ctx->refresh = si.refresh;
++
++    if (pickup_fds(ctx) < 0)
++        goto fail;
++
++    *out = ctx;
++    return 0;
++
++fail:
++    if (ctx->shm_ptr) munmap((void *)ctx->shm_ptr, sizeof(uint32_t));
++    if (ctx->shm_fd >= 0)         close(ctx->shm_fd);
++    if (ctx->ctrl_fd >= 0)         close(ctx->ctrl_fd);
++    if (ctx->data_fd >= 0)         close(ctx->data_fd);
++    if (ctx->buf_ready_efd >= 0)   close(ctx->buf_ready_efd);
++    if (ctx->refresh_done_efd >= 0) close(ctx->refresh_done_efd);
++    free(ctx);
++    return -1;
++}
++
++void disconnect(display_ctx *ctx)
++{
++    if (!ctx)
++        return;
++    for (int i = 0; i < ctx->buf_count; i++) {
++        if (ctx->dmabuf_fds[i] >= 0)
++            close(ctx->dmabuf_fds[i]);
++    }
++    if (ctx->shm_ptr) munmap((void *)ctx->shm_ptr, sizeof(uint32_t));
++    if (ctx->shm_fd >= 0)         close(ctx->shm_fd);
++    if (ctx->ctrl_fd >= 0)         close(ctx->ctrl_fd);
++    if (ctx->data_fd >= 0)         close(ctx->data_fd);
++    if (ctx->buf_ready_efd >= 0)   close(ctx->buf_ready_efd);
++    if (ctx->refresh_done_efd >= 0) close(ctx->refresh_done_efd);
++    free(ctx);
++}
++
++int get_screen_info(display_ctx *ctx, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *refresh)
++{
++    *width  = ctx->screen_w;
++    *height = ctx->screen_h;
++    *format = ctx->pixel_format;
++    *refresh = ctx->refresh;
++    return 0;
++}
++
++int wait_buffer_async(display_ctx *ctx)
++{
++    ctx->async_pending = true;
++    return 0;
++}
++
++static int receive_dmabufs(display_ctx *ctx)
++{
++    if (ctx->buf_count > 0)
++        return 0;
++
++    struct data_msg dhdr;
++    int fds[MAX_BUFS];
++    int fd_count = 0;
++
++    int n = recv_fds(ctx->data_fd, &dhdr, sizeof(dhdr), fds, MAX_BUFS, &fd_count);
++    if (n < (int)sizeof(struct data_msg) || fd_count < 1) {
++        enter_fallback(ctx);
++        return -1;
++    }
++
++    if (dhdr.type != DATA_MSG_BUFS_READY) {
++        for (int i = 0; i < fd_count; i++)
++            close(fds[i]);
++        return -1;
++    }
++
++    int count = dhdr.size / sizeof(struct buf_info);
++    if (count != fd_count || count > MAX_BUFS) {
++        for (int i = 0; i < fd_count; i++)
++            close(fds[i]);
++        return -1;
++    }
++
++    struct buf_info infos[MAX_BUFS];
++    if (recv_all(ctx->data_fd, infos, dhdr.size) < 0) {
++        for (int i = 0; i < fd_count; i++)
++            close(fds[i]);
++        enter_fallback(ctx);
++        return -1;
++    }
++
++    for (int i = 0; i < count; i++) {
++        ctx->dmabuf_fds[i] = fds[i];
++        ctx->dmabuf_infos[i] = infos[i];
++    }
++    ctx->buf_count = count;
++    return 0;
++}
++
++int wait_buffer_async_result(display_ctx *ctx, void **buffer)
++{
++    *buffer = NULL;
++
++    if (ctx->fallback) {
++        ctx->async_pending = false;
++        if (pickup_fds(ctx) < 0)
++            return -1;
++    }
++
++    if (!ctx->async_pending)
++        return -1;
++
++    struct pollfd pfd[2] = {
++        { .fd = ctx->buf_ready_efd, .events = POLLIN },
++        { .fd = ctx->data_fd,       .events = POLLIN | POLLHUP | POLLERR },
++    };
++
++    while (1) {
++        int ret = poll(pfd, 2, 5000);
++        if (ret < 0) {
++            if (errno == EINTR) continue;
++            enter_fallback(ctx);
++            ctx->async_pending = false;
++            return -1;
++        }
++        if (ret == 0) continue;
++
++        if (pfd[1].revents & (POLLHUP | POLLERR)) {
++            enter_fallback(ctx);
++            ctx->async_pending = false;
++            return -1;
++        }
++        if (pfd[0].revents & POLLIN)
++            break;
++    }
++
++    eventfd_t val;
++    eventfd_read(ctx->buf_ready_efd, &val);
++
++    if (receive_dmabufs(ctx) < 0) {
++        ctx->async_pending = false;
++        return -1;
++    }
++
++    ctx->async_pending = false;
++    *buffer = NULL;
++    return 0;
++}
++
++int trigger_refresh(display_ctx *ctx)
++{
++    if (ctx->fallback)
++        return 0;
++
++    eventfd_t val = 1;
++    eventfd_write(ctx->refresh_done_efd, val);
++    return 0;
++}
++
++int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
++{
++    if (ctx->fallback)
++        return 0;
++
++    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
++    int ret = poll(&pfd, 1, timeout_ms);
++    if (ret <= 0)
++        return 0;
++
++    if (pfd.revents & (POLLHUP | POLLERR)) {
++        enter_fallback(ctx);
++        return -1;
++    }
++
++    uint8_t msg_buf[sizeof(struct data_msg) + sizeof(struct InputEvent)];
++    ssize_t n = recv(ctx->data_fd, msg_buf, sizeof(msg_buf), MSG_PEEK);
++    if (n < (ssize_t)sizeof(struct data_msg))
++        return 0;
++
++    struct data_msg hdr;
++    memcpy(&hdr, msg_buf, sizeof(hdr));
++    if (hdr.type != DATA_MSG_INPUT_EVENT)
++        return 0;
++
++    if (recv_all(ctx->data_fd, msg_buf, sizeof(struct data_msg) + sizeof(struct InputEvent)) < 0)
++        return -1;
++
++    memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
++    return 1;
++}
++
++int set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *userdata)
++{
++    ctx->fallback_cb = on_fallback;
++    ctx->fallback_userdata = userdata;
++    return 0;
++}
++
++bool is_fallback(display_ctx *ctx)
++{
++    return ctx->fallback;
++}
++
++int try_reconnect(display_ctx *ctx)
++{
++    if (!ctx->fallback)
++        return 0;
++
++    struct ctrl_msg hdr = { .type = CTRL_MSG_PICKUP_FDS, .size = 0 };
++    if (send_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) < 0)
++        return -1;
++
++    struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
++    if (poll(&pfd, 1, 100) <= 0)
++        return -1;
++
++    int fds[4];
++    int fd_count = 0;
++    struct ctrl_msg resp;
++    int n = recv_fds(ctx->ctrl_fd, &resp, sizeof(resp), fds, 4, &fd_count);
++    if (n <= 0 || resp.type != CTRL_MSG_FDS_READY || fd_count < 4)
++        return -1;
++
++    ctx->buf_ready_efd = fds[0];
++    ctx->refresh_done_efd = fds[1];
++    ctx->data_fd = fds[2];
++    ctx->shm_fd = fds[3];
++
++    ctx->shm_ptr = mmap(NULL, sizeof(uint32_t), PROT_READ,
++                        MAP_SHARED, ctx->shm_fd, 0);
++    if (ctx->shm_ptr == MAP_FAILED) {
++        ctx->shm_ptr = NULL;
++        return -1;
++    }
++
++    ctx->fallback = false;
++    ctx->buf_count = 0;
++    return 0;
++}
++
++int get_data_fd(display_ctx *ctx)
++{
++    return ctx->data_fd;
++}
++
++int get_buffer_ready_fd(display_ctx *ctx)
++{
++    return ctx->buf_ready_efd;
++}
++
++int get_buf_count(display_ctx *ctx)
++{
++    return ctx->buf_count;
++}
++
++int get_selected_idx(display_ctx *ctx)
++{
++    if (!ctx->shm_ptr)
++        return 0;
++    uint32_t idx = *ctx->shm_ptr;
++    return (idx < (uint32_t)ctx->buf_count) ? (int)idx : 0;
++}
++
++int get_dmabuf_fd(display_ctx *ctx)
++{
++    return get_dmabuf_fd_at(ctx, get_selected_idx(ctx));
++}
++
++int get_dmabuf_fd_at(display_ctx *ctx, int idx)
++{
++    if (idx < 0 || idx >= ctx->buf_count)
++        return -1;
++    return ctx->dmabuf_fds[idx];
++}
++
++int get_dmabuf_info(display_ctx *ctx, struct buf_info *info)
++{
++    return get_dmabuf_info_at(ctx, get_selected_idx(ctx), info);
++}
++
++int get_dmabuf_info_at(display_ctx *ctx, int idx, struct buf_info *info)
++{
++    if (idx < 0 || idx >= ctx->buf_count)
++        return -1;
++    *info = ctx->dmabuf_infos[idx];
++    return 0;
++}
+diff --git a/src/backends/anland/display_producer.h b/src/backends/anland/display_producer.h
+new file mode 100644
+index 0000000..b61a405
+--- /dev/null
++++ b/src/backends/anland/display_producer.h
+@@ -0,0 +1,29 @@
++#ifndef DISPLAY_PRODUCER_H
++#define DISPLAY_PRODUCER_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include "protocol.h"
++
++typedef struct display_ctx display_ctx;
++
++int  connect_to_deamon(display_ctx **ctx, const char *socket_path);
++void disconnect(display_ctx *ctx);
++int  get_screen_info(display_ctx *ctx, uint32_t *width, uint32_t *height, uint32_t *format, uint32_t *refresh);
++int  wait_buffer_async(display_ctx *ctx);
++int  wait_buffer_async_result(display_ctx *ctx, void **buffer);
++int  trigger_refresh(display_ctx *ctx);
++int  poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms);
++int  set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *userdata);
++bool is_fallback(display_ctx *ctx);
++int  try_reconnect(display_ctx *ctx);
++int  get_data_fd(display_ctx *ctx);
++int  get_buffer_ready_fd(display_ctx *ctx);
++int  get_buf_count(display_ctx *ctx);
++int  get_selected_idx(display_ctx *ctx);
++int  get_dmabuf_fd(display_ctx *ctx);
++int  get_dmabuf_fd_at(display_ctx *ctx, int idx);
++int  get_dmabuf_info(display_ctx *ctx, struct buf_info *info);
++int  get_dmabuf_info_at(display_ctx *ctx, int idx, struct buf_info *info);
++
++#endif
+diff --git a/src/backends/anland/protocol.h b/src/backends/anland/protocol.h
+new file mode 100644
+index 0000000..744179a
+--- /dev/null
++++ b/src/backends/anland/protocol.h
+@@ -0,0 +1,88 @@
++#ifndef DISPLAY_PROTOCOL_H
++#define DISPLAY_PROTOCOL_H
++
++#include <stdint.h>
++
++#define CTRL_MSG_CONSUMER_HELLO  1
++#define CTRL_MSG_PRODUCER_HELLO  2
++#define CTRL_MSG_SCREEN_INFO     7
++#define CTRL_MSG_REJECT          8
++#define CTRL_MSG_PICKUP_FDS      9
++#define CTRL_MSG_FDS_READY      10
++
++#define DATA_MSG_BUF_READY       100
++#define DATA_MSG_REFRESH_DONE    101
++#define DATA_MSG_INPUT_EVENT     102
++#define DATA_MSG_BUFS_READY      200
++
++#define MAX_BUFS 8
++
++struct ctrl_msg {
++    uint32_t type;
++    uint32_t size;
++    uint8_t  payload[];
++} __attribute__((packed));
++
++struct data_msg {
++    uint32_t type;
++    uint32_t size;
++    uint8_t  payload[];
++} __attribute__((packed));
++
++struct screen_info {
++    uint32_t width;
++    uint32_t height;
++    uint32_t format;
++    uint32_t refresh;
++} __attribute__((packed));
++
++struct buf_info {
++    uint32_t stride;
++    uint32_t format;
++    uint64_t modifier;
++    uint32_t offset;
++} __attribute__((packed));
++
++#define INPUT_TYPE_TOUCH          1
++#define INPUT_TYPE_KEY            2
++#define INPUT_TYPE_POINTER_MOTION 3
++#define INPUT_TYPE_POINTER_BUTTON 4
++#define INPUT_TYPE_POINTER_AXIS   5
++#define INPUT_TYPE_TOUCH_FRAME    6
++
++#define INPUT_ACTION_DOWN    0
++#define INPUT_ACTION_UP      1
++#define INPUT_ACTION_MOVE    2
++
++struct InputEvent {
++    uint32_t type;
++    union {
++        struct {
++            int32_t  action;
++            float    x;
++            float    y;
++            int32_t  pointer_id;
++        } touch;
++        struct {
++            int32_t  action;
++            int32_t  keycode;
++        } key;
++        struct {
++            float    x;
++            float    y;
++            float    dx;
++            float    dy;
++        } pointer_motion;
++        struct {
++            uint32_t button;
++            int32_t  pressed;
++        } pointer_button;
++        struct {
++            uint32_t axis;
++            float    value;
++            int32_t  discrete;
++        } pointer_axis;
++    };
++} __attribute__((packed));
++
++#endif
+diff --git a/src/backends/anland/socket_utils.c b/src/backends/anland/socket_utils.c
+new file mode 100644
+index 0000000..1b4ef31
+--- /dev/null
++++ b/src/backends/anland/socket_utils.c
+@@ -0,0 +1,121 @@
++#include "socket_utils.h"
++
++#include <errno.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++int send_fds(int sock, const void *data, size_t data_len,
++             const int *fds, int fd_count)
++{
++    struct iovec iov = {
++        .iov_base = (void *)data,
++        .iov_len  = data_len,
++    };
++
++    char cmsg_buf[CMSG_SPACE(sizeof(int) * fd_count)];
++    memset(cmsg_buf, 0, sizeof(cmsg_buf));
++
++    struct msghdr msg = {
++        .msg_iov        = &iov,
++        .msg_iovlen     = 1,
++        .msg_control    = cmsg_buf,
++        .msg_controllen = sizeof(cmsg_buf),
++    };
++
++    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++    cmsg->cmsg_level = SOL_SOCKET;
++    cmsg->cmsg_type  = SCM_RIGHTS;
++    cmsg->cmsg_len   = CMSG_LEN(sizeof(int) * fd_count);
++    memcpy(CMSG_DATA(cmsg), fds, sizeof(int) * fd_count);
++
++    ssize_t n = sendmsg(sock, &msg, MSG_NOSIGNAL);
++    return (n == (ssize_t)data_len) ? 0 : -1;
++}
++
++int recv_fds(int sock, void *data, size_t data_len,
++             int *fds, int fd_count, int *fds_received)
++{
++    struct iovec iov = {
++        .iov_base = data,
++        .iov_len  = data_len,
++    };
++
++    char cmsg_buf[CMSG_SPACE(sizeof(int) * fd_count)];
++    memset(cmsg_buf, 0, sizeof(cmsg_buf));
++
++    struct msghdr msg = {
++        .msg_iov        = &iov,
++        .msg_iovlen     = 1,
++        .msg_control    = cmsg_buf,
++        .msg_controllen = sizeof(cmsg_buf),
++    };
++
++    ssize_t n = recvmsg(sock, &msg, 0);
++    if (n <= 0)
++        return -1;
++
++    *fds_received = 0;
++    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++    if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
++        int count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++        if (count > fd_count)
++            count = fd_count;
++        memcpy(fds, CMSG_DATA(cmsg), sizeof(int) * count);
++        *fds_received = count;
++    }
++
++    return (int)n;
++}
++
++int connect_unix(const char *path)
++{
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0)
++        return -1;
++
++    struct sockaddr_un addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
++
++    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
++        close(fd);
++        return -1;
++    }
++    return fd;
++}
++
++int send_all(int fd, const void *buf, size_t len)
++{
++    const uint8_t *p = buf;
++    size_t sent = 0;
++    while (sent < len) {
++        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
++        if (n <= 0) {
++            if (n < 0 && errno == EINTR)
++                continue;
++            return -1;
++        }
++        sent += n;
++    }
++    return 0;
++}
++
++int recv_all(int fd, void *buf, size_t len)
++{
++    uint8_t *p = buf;
++    size_t got = 0;
++    while (got < len) {
++        ssize_t n = recv(fd, p + got, len - got, 0);
++        if (n <= 0) {
++            if (n < 0 && errno == EINTR)
++                continue;
++            return -1;
++        }
++        got += n;
++    }
++    return 0;
++}
+diff --git a/src/backends/anland/socket_utils.h b/src/backends/anland/socket_utils.h
+new file mode 100644
+index 0000000..06ba8f4
+--- /dev/null
++++ b/src/backends/anland/socket_utils.h
+@@ -0,0 +1,18 @@
++#ifndef DISPLAY_SOCKET_UTILS_H
++#define DISPLAY_SOCKET_UTILS_H
++
++#include <stddef.h>
++
++int send_fds(int sock, const void *data, size_t data_len,
++             const int *fds, int fd_count);
++
++int recv_fds(int sock, void *data, size_t data_len,
++             int *fds, int fd_count, int *fds_received);
++
++int connect_unix(const char *path);
++
++int send_all(int fd, const void *buf, size_t len);
++
++int recv_all(int fd, void *buf, size_t len);
++
++#endif
 diff --git a/src/backends/wayland/wayland_backend.cpp b/src/backends/wayland/wayland_backend.cpp
 index 831cde5..1e1805d 100644
 --- a/src/backends/wayland/wayland_backend.cpp
@@ -47,7 +2067,7 @@ index 831cde5..1e1805d 100644
 +        Q_EMIT touchMotion(tp->id(), scalePos(tp->position()), std::chrono::milliseconds(tp->time()), this);
      });
  }
-
+ 
 diff --git a/src/backends/wayland/wayland_egl_backend.cpp b/src/backends/wayland/wayland_egl_backend.cpp
 index c5a715e..1cc612d 100644
 --- a/src/backends/wayland/wayland_egl_backend.cpp
@@ -67,18 +2087,18 @@ index c5a715e..1cc612d 100644
 +    surface->damage(scaledDamage);
      surface->commit();
      Q_EMIT m_waylandOutput->outputChange(m_damageJournal.lastDamage());
-
+ 
 diff --git a/src/backends/wayland/wayland_output.cpp b/src/backends/wayland/wayland_output.cpp
 index 9c2c7e6..49ed72f 100644
 --- a/src/backends/wayland/wayland_output.cpp
 +++ b/src/backends/wayland/wayland_output.cpp
 @@ -41,7 +41,7 @@ namespace Wayland
  {
-
+ 
  using namespace KWayland::Client;
 -static const int s_refreshRate = 60000; // TODO: can we get refresh rate data from Wayland host?
 +static const int s_refreshRate = 144000; // TODO: can we get refresh rate data from Wayland host?
-
+ 
  WaylandCursor::WaylandCursor(WaylandBackend *backend)
      : m_backend(backend)
 @@ -101,7 +101,6 @@ void WaylandCursor::sync()
@@ -96,14 +2116,14 @@ index 9c2c7e6..49ed72f 100644
 -        resize(size * scale());
 +        resize(size);
      }
-
+ 
      m_ready = true;
 diff --git a/src/backends/wayland/wayland_qpainter_backend.cpp b/src/backends/wayland/wayland_qpainter_backend.cpp
 index 2555665..75801f8 100644
 --- a/src/backends/wayland/wayland_qpainter_backend.cpp
 +++ b/src/backends/wayland/wayland_qpainter_backend.cpp
 @@ -70,8 +70,13 @@ void WaylandQPainterPrimaryLayer::present()
-
+ 
      auto s = m_waylandOutput->surface();
      s->attachBuffer(m_back->buffer);
 -    s->damage(m_damageJournal.lastDamage());
@@ -117,4 +2137,369 @@ index 2555665..75801f8 100644
 +    s->damage(scaledDamage);
      s->commit();
  }
-
+ 
+diff --git a/src/cursordelegate_opengl.cpp b/src/cursordelegate_opengl.cpp
+index ecfe615..3f79b1d 100644
+--- a/src/cursordelegate_opengl.cpp
++++ b/src/cursordelegate_opengl.cpp
+@@ -48,11 +48,21 @@ void CursorDelegateOpenGL::paint(RenderTarget *renderTarget, const QRegion &regi
+     const QRect cursorRect = layer()->mapToGlobal(layer()->rect());
+     const qreal scale = renderTarget->devicePixelRatio();
+ 
++    GLFramebuffer *fbo = std::get<GLFramebuffer *>(renderTarget->nativeHandle());
++
+     QMatrix4x4 mvp;
++    // If the target stores its contents top-down (e.g. the anland dmabuf
++    // backend), flip the projection exactly as the scene renderer does, so the
++    // cursor is composited at the same orientation as the rest of the frame.
++    // Without this the cursor would land at the vertically mirrored position
++    // (and shape), and since KWin computes its erase-damage at the cursor's
++    // logical position the mirrored pixels would never be cleared -> trailing.
++    if (fbo->isYInverted()) {
++        mvp.scale(1, -1, 1);
++    }
+     mvp.ortho(QRect(QPoint(0, 0), renderTarget->size()));
+     mvp.translate(std::round(cursorRect.x() * scale), std::round(cursorRect.y() * scale));
+ 
+-    GLFramebuffer *fbo = std::get<GLFramebuffer *>(renderTarget->nativeHandle());
+     GLFramebuffer::pushFramebuffer(fbo);
+ 
+     // Don't need to call GLVertexBuffer::beginFrame() and GLVertexBuffer::endOfFrame() because
+diff --git a/src/effects/blur/blur.cpp b/src/effects/blur/blur.cpp
+index 1b6d999..df3d322 100644
+--- a/src/effects/blur/blur.cpp
++++ b/src/effects/blur/blur.cpp
+@@ -655,6 +655,13 @@ void BlurEffect::drawWindow(EffectWindow *w, int mask, const QRegion &region, Wi
+         // rendering takes care of that, starting with the projection matrix
+         // here that we reset to a simple unscaled orthographic projection.
+         QMatrix4x4 projectionMatrix;
++        // If the output framebuffer stores its contents top-down (e.g. the
++        // anland dmabuf backend), flip the projection so the blurred patch is
++        // composited the same way up as the rest of the scene. Defaults off, so
++        // ordinary outputs are unaffected.
++        if (GLFramebuffer::currentFramebuffer()->isYInverted()) {
++            projectionMatrix.scale(1, -1, 1);
++        }
+         projectionMatrix.ortho(screen);
+ 
+         if (!shape.isEmpty()) {
+diff --git a/src/effects/screenshot/screenshot.cpp b/src/effects/screenshot/screenshot.cpp
+index afddb4d..3db7d47 100644
+--- a/src/effects/screenshot/screenshot.cpp
++++ b/src/effects/screenshot/screenshot.cpp
+@@ -43,7 +43,7 @@ struct ScreenShotScreenData
+     EffectScreen *screen = nullptr;
+ };
+ 
+-static void convertFromGLImage(QImage &img, int w, int h)
++static void convertFromGLImage(QImage &img, int w, int h, bool mirror = true)
+ {
+     // from QtOpenGL/qgl.cpp
+     // SPDX-FileCopyrightText: 2010 Nokia Corporation and /or its subsidiary(-ies)
+@@ -70,7 +70,12 @@ static void convertFromGLImage(QImage &img, int w, int h)
+             }
+         }
+     }
+-    img = img.mirrored();
++    // GL framebuffers are normally bottom-up, so the read-back image is mirrored
++    // to get a top-down QImage. A Y-inverted source (e.g. the anland dmabuf
++    // backend) is already top-down, so the caller asks to skip the mirror.
++    if (mirror) {
++        img = img.mirrored();
++    }
+ }
+ 
+ bool ScreenShotEffect::supported()
+@@ -370,7 +375,12 @@ QImage ScreenShotEffect::blitScreenshot(const QRect &geometry, qreal devicePixel
+             glReadPixels(0, 0, nativeSize.width(), nativeSize.height(), GL_RGBA,
+                          GL_UNSIGNED_BYTE, static_cast<GLvoid *>(image.bits()));
+         }
+-        convertFromGLImage(image, nativeSize.width(), nativeSize.height());
++        // If we grabbed from a Y-inverted target (top-down rows, e.g. the anland
++        // dmabuf backend), the captured image is already upright — skip the
++        // mirror that the normal bottom-up framebuffer needs.
++        const GLFramebuffer *current = GLFramebuffer::currentFramebuffer();
++        const bool yInverted = current && current->isYInverted();
++        convertFromGLImage(image, nativeSize.width(), nativeSize.height(), !yInverted);
+     }
+ 
+     image.setDevicePixelRatio(devicePixelRatio);
+diff --git a/src/libkwineffects/kwinglutils.cpp b/src/libkwineffects/kwinglutils.cpp
+index 1c380f2..4dd7aa3 100644
+--- a/src/libkwineffects/kwinglutils.cpp
++++ b/src/libkwineffects/kwinglutils.cpp
+@@ -1142,15 +1142,21 @@ void GLFramebuffer::blitFromFramebuffer(const QRect &source, const QRect &destin
+     const QRect s = source.isNull() ? QRect(QPoint(0, 0), top->size()) : source;
+     const QRect d = destination.isNull() ? QRect(QPoint(0, 0), size()) : destination;
+ 
++    // glBlitFramebuffer works in GL (bottom-left origin) coordinates, so a
++    // top-left rect is normally mirrored with `height - (y + h)`. A Y-inverted
++    // framebuffer already stores its rows top-down, so for those the rect maps
++    // straight through. Source and destination are evaluated independently so a
++    // blit between a normal and a Y-inverted framebuffer stays correct. Both
++    // default to non-inverted, leaving every existing blit unchanged.
+     const GLuint srcX0 = s.x();
+-    const GLuint srcY0 = top->size().height() - (s.y() + s.height());
+     const GLuint srcX1 = s.x() + s.width();
+-    const GLuint srcY1 = top->size().height() - s.y();
++    const GLuint srcY0 = top->isYInverted() ? s.y() : top->size().height() - (s.y() + s.height());
++    const GLuint srcY1 = top->isYInverted() ? s.y() + s.height() : top->size().height() - s.y();
+ 
+     const GLuint dstX0 = d.x();
+-    const GLuint dstY0 = mSize.height() - (d.y() + d.height());
+     const GLuint dstX1 = d.x() + d.width();
+-    const GLuint dstY1 = mSize.height() - d.y();
++    const GLuint dstY0 = isYInverted() ? d.y() : mSize.height() - (d.y() + d.height());
++    const GLuint dstY1 = isYInverted() ? d.y() + d.height() : mSize.height() - d.y();
+ 
+     glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, GL_COLOR_BUFFER_BIT, filter);
+ 
+@@ -2035,7 +2041,8 @@ void GLVertexBuffer::draw(const QRegion &region, GLenum primitiveMode, int first
+             // Clip using scissoring
+             const GLFramebuffer *current = GLFramebuffer::currentFramebuffer();
+             for (const QRect &r : region) {
+-                glScissor(r.x(), current->size().height() - (r.y() + r.height()), r.width(), r.height());
++                const int sy = current->isYInverted() ? r.y() : current->size().height() - (r.y() + r.height());
++                glScissor(r.x(), sy, r.width(), r.height());
+                 glDrawElementsBaseVertex(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, nullptr, first);
+             }
+         }
+@@ -2048,7 +2055,8 @@ void GLVertexBuffer::draw(const QRegion &region, GLenum primitiveMode, int first
+         // Clip using scissoring
+         const GLFramebuffer *current = GLFramebuffer::currentFramebuffer();
+         for (const QRect &r : region) {
+-            glScissor(r.x(), current->size().height() - (r.y() + r.height()), r.width(), r.height());
++            const int sy = current->isYInverted() ? r.y() : current->size().height() - (r.y() + r.height());
++            glScissor(r.x(), sy, r.width(), r.height());
+             glDrawArrays(primitiveMode, first, count);
+         }
+     }
+diff --git a/src/libkwineffects/kwinglutils.h b/src/libkwineffects/kwinglutils.h
+index 70e02ee..219ffb9 100644
+--- a/src/libkwineffects/kwinglutils.h
++++ b/src/libkwineffects/kwinglutils.h
+@@ -425,6 +425,24 @@ public:
+         return mValid;
+     }
+ 
++    /**
++     * Whether the contents of this framebuffer are stored vertically flipped
++     * relative to KWin's normal (top-left origin) convention, i.e. the consumer
++     * of the underlying buffer reads row 0 as the top of the image. Backends
++     * that render straight into a buffer whose consumer expects a top-down
++     * layout (e.g. the anland dmabuf backend) set this so the renderer flips the
++     * projection and scissor at the root, with no extra copy. Defaults to false,
++     * so every other framebuffer is unaffected.
++     */
++    bool isYInverted() const
++    {
++        return mYInverted;
++    }
++    void setYInverted(bool inverted)
++    {
++        mYInverted = inverted;
++    }
++
+     static void initStatic();
+     static bool supported()
+     {
+@@ -485,6 +503,7 @@ private:
+     QSize mSize;
+     bool mValid = false;
+     bool mForeign = false;
++    bool mYInverted = false;
+ };
+ 
+ enum VertexAttributeType {
+diff --git a/src/main_wayland.cpp b/src/main_wayland.cpp
+index 2aed5a8..f25fd01 100644
+--- a/src/main_wayland.cpp
++++ b/src/main_wayland.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include <config-kwin.h>
+ 
++#include "backends/anland/anland_backend.h"
+ #include "backends/drm/drm_backend.h"
+ #include "backends/virtual/virtual_backend.h"
+ #include "backends/wayland/wayland_backend.h"
+@@ -361,6 +362,7 @@ int main(int argc, char *argv[])
+                                      i18n("Exits this instance so it can be restarted by kwin_wayland_wrapper."));
+ 
+     QCommandLineOption drmOption(QStringLiteral("drm"), i18n("Render through drm node."));
++    QCommandLineOption anlandOption(QStringLiteral("anland"), i18n("Render to the anland display daemon."));
+     QCommandLineOption locale1Option(QStringLiteral("locale1"), i18n("Extract locale information from locale1 rather than the user's configuration"));
+ 
+     QCommandLineParser parser;
+@@ -380,6 +382,7 @@ int main(int argc, char *argv[])
+     parser.addOption(scaleOption);
+     parser.addOption(outputCountOption);
+     parser.addOption(drmOption);
++    parser.addOption(anlandOption);
+     parser.addOption(locale1Option);
+ 
+     QCommandLineOption inputMethodOption(QStringLiteral("inputmethod"),
+@@ -441,6 +444,7 @@ int main(int argc, char *argv[])
+         X11,
+         Wayland,
+         Virtual,
++        Anland,
+     };
+ 
+     BackendType backendType;
+@@ -450,7 +454,9 @@ int main(int argc, char *argv[])
+     qreal outputScale = 1;
+ 
+     // Decide what backend to use.
+-    if (parser.isSet(drmOption)) {
++    if (parser.isSet(anlandOption)) {
++        backendType = BackendType::Anland;
++    } else if (parser.isSet(drmOption)) {
+         backendType = BackendType::Kms;
+     } else if (parser.isSet(x11DisplayOption)) {
+         backendType = BackendType::X11;
+@@ -549,6 +555,14 @@ int main(int argc, char *argv[])
+         }
+         a.setOutputBackend(std::make_unique<KWin::DrmBackend>(a.session()));
+         break;
++    case BackendType::Anland: {
++        // The display-daemon socket path comes from $ANLAND_SOCKET; the backend
++        // falls back to its built-in default (/tmp/display_daemon.sock) if unset.
++        const QString anlandSocket = qEnvironmentVariable("ANLAND_SOCKET");
++        a.setSession(KWin::Session::create(KWin::Session::Type::Noop));
++        a.setOutputBackend(std::make_unique<KWin::AnlandBackend>(anlandSocket));
++        break;
++    }
+     case BackendType::Virtual: {
+         auto outputBackend = std::make_unique<KWin::VirtualBackend>();
+         for (int i = 0; i < outputCount; ++i) {
+diff --git a/src/platformsupport/scenes/opengl/abstract_egl_backend.cpp b/src/platformsupport/scenes/opengl/abstract_egl_backend.cpp
+index 8085684..d9e9243 100644
+--- a/src/platformsupport/scenes/opengl/abstract_egl_backend.cpp
++++ b/src/platformsupport/scenes/opengl/abstract_egl_backend.cpp
+@@ -377,7 +377,18 @@ std::shared_ptr<GLTexture> AbstractEglBackend::textureForOutput(Output *requeste
+ {
+     std::shared_ptr<GLTexture> texture(new GLTexture(GL_RGBA8, requestedOutput->pixelSize()));
+     GLFramebuffer renderTarget(texture.get());
+-    renderTarget.blitFromFramebuffer(QRect(0, texture->height(), texture->width(), -texture->height()));
++    const GLFramebuffer *current = GLFramebuffer::currentFramebuffer();
++    if (current && current->isYInverted()) {
++        // The source already stores its rows top-down (e.g. the anland dmabuf
++        // backend renders straight into a buffer whose consumer reads row 0 as
++        // the top). blitFromFramebuffer() reads such a source upright, so copy
++        // it straight through — the usual negative-height blit below would flip
++        // an already-upright image. This yields a texture in the same
++        // orientation screenshot/screencast get on a normal output.
++        renderTarget.blitFromFramebuffer(QRect(0, 0, texture->width(), texture->height()));
++    } else {
++        renderTarget.blitFromFramebuffer(QRect(0, texture->height(), texture->width(), -texture->height()));
++    }
+     return texture;
+ }
+ 
+diff --git a/src/scene/itemrenderer.cpp b/src/scene/itemrenderer.cpp
+index 8934f7c..39b2f73 100644
+--- a/src/scene/itemrenderer.cpp
++++ b/src/scene/itemrenderer.cpp
+@@ -42,9 +42,14 @@ QRect ItemRenderer::renderTargetRect() const
+     return m_renderTargetRect.toRect();
+ }
+ 
+-static QMatrix4x4 createProjectionMatrix(const QRectF &rect, qreal scale)
++static QMatrix4x4 createProjectionMatrix(const QRectF &rect, qreal scale, bool yInverted)
+ {
+     QMatrix4x4 ret;
++    if (yInverted) {
++        // Flip clip-space Y so the scene renders straight into a render target
++        // whose consumer reads row 0 as the top (see setRenderTargetYInverted).
++        ret.scale(1, -1, 1);
++    }
+     ret.ortho(QRectF(rect.left() * scale, rect.top() * scale, rect.width() * scale, rect.height() * scale));
+     return ret;
+ }
+@@ -56,7 +61,7 @@ void ItemRenderer::setRenderTargetRect(const QRectF &rect)
+     }
+ 
+     m_renderTargetRect = rect;
+-    m_renderTargetProjectionMatrix = createProjectionMatrix(rect, m_renderTargetScale);
++    m_renderTargetProjectionMatrix = createProjectionMatrix(rect, m_renderTargetScale, m_renderTargetYInverted);
+ }
+ 
+ qreal ItemRenderer::renderTargetScale() const
+@@ -71,7 +76,17 @@ void ItemRenderer::setRenderTargetScale(qreal scale)
+     }
+ 
+     m_renderTargetScale = scale;
+-    m_renderTargetProjectionMatrix = createProjectionMatrix(m_renderTargetRect, scale);
++    m_renderTargetProjectionMatrix = createProjectionMatrix(m_renderTargetRect, scale, m_renderTargetYInverted);
++}
++
++void ItemRenderer::setRenderTargetYInverted(bool inverted)
++{
++    if (inverted == m_renderTargetYInverted) {
++        return;
++    }
++
++    m_renderTargetYInverted = inverted;
++    m_renderTargetProjectionMatrix = createProjectionMatrix(m_renderTargetRect, m_renderTargetScale, inverted);
+ }
+ 
+ QRegion ItemRenderer::mapToRenderTarget(const QRegion &region) const
+diff --git a/src/scene/itemrenderer.h b/src/scene/itemrenderer.h
+index 719ae40..6d9593f 100644
+--- a/src/scene/itemrenderer.h
++++ b/src/scene/itemrenderer.h
+@@ -32,6 +32,15 @@ public:
+     void setRenderTargetRect(const QRectF &rect);
+     qreal renderTargetScale() const;
+     void setRenderTargetScale(qreal scale);
++    /**
++     * Whether the current render target stores its contents vertically flipped
++     * (its consumer reads row 0 as the top). When set, the projection matrix is
++     * built with a Y flip so the scene is rendered straight into such a buffer
++     * with the correct orientation and no extra copy. The OpenGL renderer drives
++     * this from GLFramebuffer::isYInverted() in beginFrame(); it defaults to
++     * false, so ordinary render targets are unaffected.
++     */
++    void setRenderTargetYInverted(bool inverted);
+ 
+     QRegion mapToRenderTarget(const QRegion &region) const;
+     virtual QPainter *painter() const;
+@@ -48,6 +57,7 @@ protected:
+     QMatrix4x4 m_renderTargetProjectionMatrix;
+     QRectF m_renderTargetRect;
+     qreal m_renderTargetScale = 1;
++    bool m_renderTargetYInverted = false;
+ };
+ 
+ } // namespace KWin
+diff --git a/src/scene/itemrenderer_opengl.cpp b/src/scene/itemrenderer_opengl.cpp
+index bb1467d..8ebdc4f 100644
+--- a/src/scene/itemrenderer_opengl.cpp
++++ b/src/scene/itemrenderer_opengl.cpp
+@@ -29,6 +29,11 @@ void ItemRendererOpenGL::beginFrame(RenderTarget *renderTarget)
+     GLFramebuffer *fbo = std::get<GLFramebuffer *>(renderTarget->nativeHandle());
+     GLFramebuffer::pushFramebuffer(fbo);
+ 
++    // If the render target stores its contents top-down (e.g. the anland dmabuf
++    // backend rendering straight into the consumer's buffer), flip the
++    // projection so the scene lands the right way up with no extra copy.
++    setRenderTargetYInverted(fbo->isYInverted());
++
+     GLVertexBuffer::streamingBuffer()->beginFrame();
+ }
+ 
+@@ -236,10 +241,12 @@ void ItemRendererOpenGL::renderBackground(const QRegion &region)
+ 
+         const auto scale = renderTargetScale();
+         const auto targetRect = scaledRect(renderTargetRect(), scale).toRect();
++        const bool yInverted = GLFramebuffer::currentFramebuffer()->isYInverted();
+ 
+         for (const QRect &r : region) {
+             auto deviceRect = scaledRect(r, scale).toAlignedRect();
+-            glScissor(deviceRect.x(), targetRect.height() - (deviceRect.y() + deviceRect.height()), deviceRect.width(), deviceRect.height());
++            const int sy = yInverted ? deviceRect.y() : targetRect.height() - (deviceRect.y() + deviceRect.height());
++            glScissor(deviceRect.x(), sy, deviceRect.width(), deviceRect.height());
+             glClear(GL_COLOR_BUFFER_BIT);
+         }
+ 
