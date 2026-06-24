@@ -97,6 +97,9 @@ private:
     void sendClipboardToConsumer(const QByteArray &text);
     void sendClipboardToKWin(const QByteArray &text);
 
+    // Inject UTF-8 text from the consumer's IME into the focused KWin client.
+    void sendTextInputToKWin(const QByteArray &text);
+
     static void fallbackTrampoline(void *data);
 
     QString m_socketPath;

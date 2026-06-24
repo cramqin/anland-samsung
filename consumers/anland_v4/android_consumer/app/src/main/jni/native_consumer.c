@@ -645,3 +645,27 @@ Java_com_anland_consumer_MainActivity_nativeSendClipboard(
     push_input_event_with_length(g_state.ctx, &ev, buf, len);
     free(buf);
 }
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_MainActivity_nativeSendTextInput(
+    JNIEnv *env, jobject thiz, jbyteArray data)
+{
+    if (!g_state.ctx)
+        return;
+
+    jsize len = (*env)->GetArrayLength(env, data);
+    if (len <= 0)
+        return;
+
+    char *buf = malloc(len);
+    if (!buf)
+        return;
+    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TEXT_INPUT,
+        .text_input = { .size = (uint32_t)len },
+    };
+    push_input_event_with_length(g_state.ctx, &ev, buf, len);
+    free(buf);
+}

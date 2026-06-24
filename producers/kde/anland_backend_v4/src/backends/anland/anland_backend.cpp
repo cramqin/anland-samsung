@@ -12,12 +12,14 @@
 
 #include "core/drmdevice.h"
 #include "core/renderloop.h"
+#include "inputmethod.h"
+#include "main.h"
 #include "opengl/egldisplay.h"
 #include "utils/filedescriptor.h"
 #include "utils/pipe.h"
 #include "wayland/abstract_data_source.h"
-#include "wayland/seat.h"
 #include "wayland/display.h"
+#include "wayland/seat.h"
 #include "wayland_server.h"
 
 #include <QScopeGuard>
@@ -325,6 +327,18 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
         }
         break;
     }
+    case INPUT_TYPE_TEXT_INPUT: {
+        // The text input event carries the raw text data as inline payload after
+        // the InputEvent header.  ev.text_input.size tells us how many bytes follow.
+        const uint32_t size = ev.text_input.size;
+        if (size == 0)
+            break;
+        QByteArray text(static_cast<int>(size), Qt::Uninitialized);
+        if (poll_input_event_extend_data(m_display, text.data(), size, 5000) == 1) {
+            sendTextInputToKWin(text);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -596,6 +610,35 @@ void AnlandBackend::sendClipboardToKWin(const QByteArray &text)
     // holds a raw pointer, keep both alive for the lifetime of the seat's selection.
     // Parent the source to the seat to ensure it outlives the selection reference.
     source->setParent(seat);
+}
+
+// ---------------------------------------------------------------------------
+// Text input
+// ---------------------------------------------------------------------------
+
+/*
+ * Inject UTF-8 text the consumer's IME committed into the focused KWin client.
+ *
+ * The pipeline is IME -> compositor -> app. The consumer's Android keyboard is
+ * the IME; this hands the committed text to KWin's InputMethod at exactly the
+ * point a zwp_input_method_v1 commit_string arrives (InputMethod::commitText ->
+ * commitString). KWin then owns delivery: to the focused text-input client
+ * (text-input v1/v2/v3, carrying CJK / emoji) or as synthesized key events when
+ * the client has no text-input interface. We deliberately do not write to the
+ * client's text-input ourselves — this code is not the compositor's IME router.
+ */
+void AnlandBackend::sendTextInputToKWin(const QByteArray &text)
+{
+    if (m_inFallback)
+        return;
+
+    const QString str = QString::fromUtf8(text);
+    if (str.isEmpty())
+        return;
+
+    if (InputMethod *im = kwinApp()->inputMethod()) {
+        im->commitText(str);
+    }
 }
 
 } // namespace KWin

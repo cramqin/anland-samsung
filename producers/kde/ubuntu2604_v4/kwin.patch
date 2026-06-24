@@ -1,3 +1,40 @@
+diff -ruN a/src/inputmethod.cpp b/src/inputmethod.cpp
+--- a/src/inputmethod.cpp	2026-05-12 18:26:46.000000000 +0800
++++ b/src/inputmethod.cpp	2026-06-24 13:22:39.044705903 +0800
+@@ -615,6 +615,16 @@
+     }
+ }
+ 
++void InputMethod::commitText(const QString &text)
++{
++    if (text.isEmpty()) {
++        return;
++    }
++    // Same entry point the zwp_input_method_v1 context's commitString signal is
++    // wired to (see adoptInputMethodContext): KWin decides how to deliver it.
++    commitString(m_serial++, text);
++}
++
+ void InputMethod::commitString(qint32 serial, const QString &text)
+ {
+     if (auto t1 = waylandServer()->seat()->textInputV1(); t1 && t1->isEnabled()) {
+diff -ruN a/src/inputmethod.h b/src/inputmethod.h
+--- a/src/inputmethod.h	2026-05-12 18:26:46.000000000 +0800
++++ b/src/inputmethod.h	2026-06-24 13:19:46.130416897 +0800
+@@ -71,6 +71,13 @@
+ 
+     void commitPendingText();
+ 
++    // Inject committed text from a compositor-side input source that does not
++    // speak zwp_input_method_v1 (e.g. the anland Android consumer's keyboard).
++    // Enters KWin's routing at the same point a real IME's commit_string does:
++    // delivered to the focused text-input client, or synthesized as key events
++    // when the client has no text-input interface enabled.
++    void commitText(const QString &text);
++
+     // for use by the QPA
+     InternalInputMethodContext *internalContext() const
+     {
 diff -ruN a/src/backends/CMakeLists.txt b/src/backends/CMakeLists.txt
 --- a/src/backends/CMakeLists.txt	2026-05-12 18:26:46.000000000 +0800
 +++ b/src/backends/CMakeLists.txt	2026-06-21 16:16:45.502196971 +0800

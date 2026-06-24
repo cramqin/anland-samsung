@@ -475,6 +475,16 @@ void handle_unhandled_event(display_ctx *ctx, const struct InputEvent *event)
             }
         }
         break;
+    case INPUT_TYPE_TEXT_INPUT:
+        //客户端发送了一个文本输入事件，后续会有变长数据跟随，但是库调用者没有处理这个事件，所以我们需要把后续的变长数据读掉，避免阻塞
+        if (event->text_input.size > 0) {
+            void* payload = malloc(event->text_input.size);
+            if (payload) {
+                poll_input_event_extend_data(ctx, payload, event->text_input.size, 1000);
+                free(payload);
+            }
+        }
+        break;
     default:
         break;
     }
