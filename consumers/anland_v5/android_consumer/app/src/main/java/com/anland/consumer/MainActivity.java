@@ -687,7 +687,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                nativeSendMouseMotion(event.getX(), event.getY(),
+                        
+                // Масштабирование
+                float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                        (float)customScreenWidth / viewWidth : 1.0f;
+                float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                        (float)customScreenHeight / viewHeight : 1.0f;
+        
+                nativeSendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
                                       event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
                                       event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
                 return true;
@@ -809,12 +816,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean handleMouseEvent(MotionEvent event) {
         float dx = 0f;
         float dy = 0f;
+        
+        // Масштабирование
+        float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                   (float)customScreenWidth / viewWidth : 1.0f;
+        float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                   (float)customScreenHeight / viewHeight : 1.0f;
+        
         if (event.getHistorySize() > 0) {
             int last = event.getHistorySize() - 1;
-            dx = event.getX() - event.getHistoricalX(0, last);
-            dy = event.getY() - event.getHistoricalY(0, last);
+            dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
+            dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
         }
-        nativeSendMouseMotion(event.getX(), event.getY(), dx, dy);
+        nativeSendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
 
         int currentBS = event.getButtonState();
         for (int[] btn : BUTTON_MAP) {
@@ -840,55 +854,55 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private boolean handleTouchEvent(MotionEvent event) {
-    int action = event.getActionMasked();
-    int pointerIdx = event.getActionIndex();
-    int pointerId = event.getPointerId(pointerIdx);
+        int action = event.getActionMasked();
+        int pointerIdx = event.getActionIndex();
+        int pointerId = event.getPointerId(pointerIdx);
     
-    // Масштабирование
-    float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                   (float)customScreenWidth / viewWidth : 1.0f;
-    float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                   (float)customScreenHeight / viewHeight : 1.0f;
+        // Масштабирование
+        float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                       (float)customScreenWidth / viewWidth : 1.0f;
+        float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                       (float)customScreenHeight / viewHeight : 1.0f;
     
-    switch (action) {
-        case MotionEvent.ACTION_DOWN:
-        case MotionEvent.ACTION_POINTER_DOWN:
-            nativeSendTouch(0, 
-                event.getX(pointerIdx) * scaleX, 
-                event.getY(pointerIdx) * scaleY, 
-                pointerId);
-            nativeSendTouchFrame();
-            return true;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                nativeSendTouch(0, 
+                    event.getX(pointerIdx) * scaleX, 
+                    event.getY(pointerIdx) * scaleY, 
+                    pointerId);
+                nativeSendTouchFrame();
+                return true;
             
-        case MotionEvent.ACTION_UP:
-        case MotionEvent.ACTION_POINTER_UP:
-            nativeSendTouch(1, 
-                event.getX(pointerIdx) * scaleX, 
-                event.getY(pointerIdx) * scaleY, 
-                pointerId);
-            nativeSendTouchFrame();
-            return true;
-            
-        case MotionEvent.ACTION_MOVE:
-            for (int i = 0; i < event.getPointerCount(); i++) {
-                nativeSendTouch(2, 
-                    event.getX(i) * scaleX, 
-                    event.getY(i) * scaleY, 
-                    event.getPointerId(i));
-            }
-            nativeSendTouchFrame();
-            return true;
-            
-        case MotionEvent.ACTION_CANCEL:
-            for (int i = 0; i < event.getPointerCount(); i++) {
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
                 nativeSendTouch(1, 
-                    event.getX(i) * scaleX, 
-                    event.getY(i) * scaleY, 
-                    event.getPointerId(i));
-            }
-            nativeSendTouchFrame();
-            return true;
+                    event.getX(pointerIdx) * scaleX, 
+                    event.getY(pointerIdx) * scaleY, 
+                    pointerId);
+                nativeSendTouchFrame();
+                return true;
+            
+            case MotionEvent.ACTION_MOVE:
+                for (int i = 0; i < event.getPointerCount(); i++) {
+                    nativeSendTouch(2, 
+                        event.getX(i) * scaleX, 
+                        event.getY(i) * scaleY, 
+                        event.getPointerId(i));
+                }
+                nativeSendTouchFrame();
+                return true;
+            
+            case MotionEvent.ACTION_CANCEL:
+                for (int i = 0; i < event.getPointerCount(); i++) {
+                    nativeSendTouch(1, 
+                        event.getX(i) * scaleX, 
+                        event.getY(i) * scaleY, 
+                        event.getPointerId(i));
+                }
+                nativeSendTouchFrame();
+                return true;
+        }
+        return false;
     }
-    return false;
-}
 }
