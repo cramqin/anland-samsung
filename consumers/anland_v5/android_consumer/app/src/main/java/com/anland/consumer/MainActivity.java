@@ -58,6 +58,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
     private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
+    private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private EditText hiddenInput;
     private InputMethodManager imm;
     private int mImeBottom = 0;   // last IME bottom inset
