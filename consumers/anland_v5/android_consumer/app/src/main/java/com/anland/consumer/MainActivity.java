@@ -51,10 +51,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String KEY_SOCKET_PATH = "socket_path";
     private static final String KEY_USE_ROOT = "use_root";
     private static final String KEY_MIC_ENABLED = "mic_enabled";
+    private static final String KEY_CAMERA_ENABLED = "camera_enabled";
     // Latency presets in ms; 0 = engine default. Shared with SettingsActivity.
     static final String KEY_SPEAKER_LATENCY_MS = "speaker_latency_ms";
     static final String KEY_MIC_LATENCY_MS = "mic_latency_ms";
     private static final int REQ_RECORD_AUDIO = 1001;
+    private static final int REQ_CAMERA = 1002;
+    // Camera service fds/threads are created once and persist across reconnects;
+    // this guards that one-time init (see applyCameraState).
+    private boolean cameraInited = false;
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
     private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
@@ -98,6 +103,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private native void nativeSendTextInput(byte[] data);
     private native void nativeSetMicEnabled(boolean enabled);
     private native void nativeSetAudioLatency(int speakerMs, int micMs);
+    private native void nativeInitCameraService();
+    private native void nativeDestroyCameraService();
     // Called from native event thread to set clipboard text on Android
     public void nativeSetClipboardText(String text) {
         ClipboardManager cm = getSystemService(ClipboardManager.class);
@@ -293,6 +300,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.registerDisplayListener(displayListener, null);
+        // Bring the camera service up (or confirm it disabled) BEFORE nativeStart, so
+        // the render thread's do_connect() sees a settled camera_service_is_ready()
+        // and registers SERVICE_TYPE_CAMERA on the very first connect rather than a
+        // later reconnect. Idempotent, so safe to call on every resume.
+        applyCameraState();
         if (surfaceReady) {
             nativeStop();
             applyConnectionConfig();
@@ -310,6 +322,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
         nativeStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (cameraInited) {
+            nativeDestroyCameraService();
+            cameraInited = false;
+        }
+    }
+
+    /*
+     * Bring the camera service up only when the user enabled it AND CAMERA is
+     * granted. The native fds/threads are created once and persist across transport
+     * restarts, so this is idempotent (guarded by cameraInited). When the toggle is
+     * off we never init, so do_connect() never registers SERVICE_TYPE_CAMERA and the
+     * producer never sees it. Request the permission if enabled but not yet granted;
+     * onRequestPermissionsResult finishes the init.
+     */
+    private void applyCameraState() {
+        boolean want = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_CAMERA_ENABLED, false);
+        if (!want || cameraInited)
+            return;
+        if (checkSelfPermission(Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED) {
+            nativeInitCameraService();
+            cameraInited = true;
+        } else {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+        }
     }
 
     /*
@@ -351,6 +394,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
             nativeSetMicEnabled(granted);
+        } else if (requestCode == REQ_CAMERA) {
+            boolean granted = grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted && !cameraInited) {
+                nativeInitCameraService();
+                cameraInited = true;
+            }
         }
     }
 
@@ -364,6 +414,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         viewWidth = width;
         viewHeight = height;
         surfaceReady = true;
+        // Same ordering guarantee as onResume: camera service settled before connect.
+        applyCameraState();
         nativeStop();
         applyConnectionConfig();
         nativeStart(holder.getSurface());

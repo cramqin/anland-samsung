@@ -33,8 +33,58 @@ struct display_ctx {
     void (*exit_fallback_cb)(void *);
     void  *fallback_userdata;
     void  *exit_fallback_userdata;
+    struct service_info *services;
+    int             num_services;
+    struct resources *resources;
 };
-
+void allocate_services(struct display_ctx *ctx, struct service_info *services, int num_services){
+    ctx->services = services;
+    ctx->num_services = num_services;
+    ctx->resources = (struct resources*)malloc(sizeof(struct resources) * num_services);
+    for(int i=0;i<num_services;i++){
+        ctx->resources[i].service_type = services[i].type;
+        ctx->resources[i].type = -1;//unallocated
+        ctx->resources[i].num = 0;
+        ctx->resources[i].fds = NULL;
+    }
+}
+void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event, int* fds, int fd_count);
+void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event){
+    uint32_t service_type = event->resources_request.type;
+    uint8_t found = 0;
+    int i;
+    for(i=0;i<ctx->num_services;i++){
+        if(ctx->services[i].type == service_type){
+            //if failed fds=NULL, num=0
+            struct resources res = ctx->services[i].allocate_resource(event->resources_request.args);
+            if (ctx->resources[i].type != -1) {
+                // free previous resource if it was allocated
+                ctx->services[i].free_resource(ctx->resources[i]);
+            }
+            ctx->resources[i] = res;
+            found = 1;
+            break;
+        }
+    }
+    if(!found)
+        return; //do nothing if the service type is not found, the producer will not enable the service if it not received the resources back
+    //send resources back to producer
+    struct InputEvent input_event;
+    input_event.type = INPUT_TYPE_RESOURCE;
+    input_event.resource.type = service_type;
+    input_event.resource.fdnum = ctx->resources[i].num;
+    push_input_event_with_fds(ctx, &input_event, ctx->resources[i].fds, ctx->resources[i].num);
+}
+void free_resources(struct display_ctx *ctx){//释放资源，保留服务信息
+    for(int i=0;i<ctx->num_services;i++){
+        if(ctx->resources[i].type != -1){
+            ctx->services[i].free_resource(ctx->resources[i]);
+            ctx->resources[i].type = -1;
+            ctx->resources[i].num = 0;
+            ctx->resources[i].fds = NULL;
+        }
+    }
+}
 static int create_shm(display_ctx *ctx)
 {
     ctx->shm_fd = memfd_create("buf_select", MFD_CLOEXEC);
@@ -142,6 +192,7 @@ static void enter_fallback(display_ctx *ctx)
 {
     if (ctx->fallback)
         return;
+    free_resources(ctx);
     ctx->fallback = true;
     ctx->buffer_pending = false;
 
@@ -225,6 +276,7 @@ void disconnect(display_ctx *ctx)
     if (ctx->buf_ready_efd >= 0)   close(ctx->buf_ready_efd);
     if (ctx->fence_fd >= 0)        close(ctx->fence_fd);
     if (ctx->audio_fd >= 0)        close(ctx->audio_fd);
+    free_resources(ctx);
     free(ctx);
 }
 
@@ -390,7 +442,6 @@ int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_m
 
     if (recv_all(ctx->data_fd, msg_buf, sizeof(struct data_msg) + sizeof(struct OutputEvent)) < 0)
         return -1;
-
     memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
     return 1;
 }
@@ -453,5 +504,17 @@ void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event)
         break;
     default:
         break;
+    }
+}
+
+void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event, int* fds, int fd_count)
+{
+    if (ctx->fallback)
+        return;
+
+    push_input_event(ctx, event);
+    if (fd_count > 0) {
+        struct data_msg hdr = { .type = DATA_MSG_INPUT_EXTEND_FDS, .size = 0 };
+        send_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, fd_count);
     }
 }

@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "anw_hidden.h"
+#include "camera_service.h"
 #include "display_consumer.h"
 #include "native_audio.h"
 #include "protocol.h"
@@ -220,7 +221,12 @@ static void *event_thread_func(void *arg)
         if (ret <= 0)
             continue;
 
-        if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
+        if (ev.type == OUTPUT_TYPE_RESOURCES_REQUEST) {
+            /* Producer is asking for a service's fds (e.g. camera). The display lib
+             * matches the type against the registered services and sends the
+             * pre-created fds back over SCM_RIGHTS. */
+            handle_resource_request(s->ctx, &ev);
+        } else if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
             char *buf = malloc(ev.clipboard.size + 1);
             if (!buf)
                 continue;
@@ -429,6 +435,18 @@ static int do_connect(struct consumer_state *s)
     set_screen_info(s->ctx, s->screen_w, s->screen_h,
                     PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
+
+    /* Register the camera service only when it was initialised (i.e. the user
+     * enabled it in settings and granted CAMERA). allocate_services() stores this
+     * pointer by reference, so it must outlive the ctx -> keep it static. The
+     * producer drives it via RESOURCES_REQUEST (handled on the event thread). */
+    if (camera_service_is_ready()) {
+        static struct service_info camera_svc;
+        camera_svc.type = SERVICE_TYPE_CAMERA;
+        camera_svc.allocate_resource = camera_allocate_resource;
+        camera_svc.free_resource = camera_free_resource;
+        allocate_services(s->ctx, &camera_svc, 1);
+    }
 
     set_fallback_callback(s->ctx, on_fallback, s);
     set_exit_fallback_callback(s->ctx, on_exit_fallback, s);
@@ -876,4 +894,21 @@ Java_com_anland_consumer_MainActivity_nativeSetAudioLatency(
     JNIEnv *env, jobject thiz, jint speakerMs, jint micMs)
 {
     audio_set_latency(speakerMs, micMs);
+}
+
+/* Create the camera service's persistent fds and control thread. Idempotent.
+ * Gated by the settings toggle on the Java side; once ready, do_connect()
+ * registers SERVICE_TYPE_CAMERA so the producer can request it. */
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_MainActivity_nativeInitCameraService(
+    JNIEnv *env, jobject thiz)
+{
+    camera_service_init(env, thiz);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_MainActivity_nativeDestroyCameraService(
+    JNIEnv *env, jobject thiz)
+{
+    camera_service_destroy(env);
 }

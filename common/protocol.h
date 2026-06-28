@@ -14,6 +14,7 @@
 #define DATA_MSG_REFRESH_DONE    101
 #define DATA_MSG_INPUT_EVENT     102
 #define DATA_MSG_OUTPUT_EVENT    103
+#define DATA_MSG_INPUT_EXTEND_FDS  104
 #define DATA_MSG_BUFS_READY      200
 
 #define MAX_BUFS 8
@@ -61,12 +62,20 @@ struct buf_info {
 #define INPUT_TYPE_CLIPBOARD      8
 #define INPUT_TYPE_TEXT_INPUT      9
 #define INPUT_TYPE_ACTION 10
+#define INPUT_TYPE_RESOURCE 11
+
+#define SERVICE_TYPE_CAMERA 1
 
 #define INPUT_ACTION_DOWN    0
 
 #define INPUT_ACTION_DOWN    0
 #define INPUT_ACTION_UP      1
 #define INPUT_ACTION_MOVE    2
+
+#define OUTPUT_TYPE_CLIPBOARD 1
+#define OUTPUT_TYPE_RESOURCES_REQUEST 2
+
+
 
 struct InputEvent {
     uint32_t type;
@@ -110,6 +119,10 @@ struct InputEvent {
             int32_t value;
         } input_action;
         struct {
+            uint32_t type;
+            uint32_t fdnum;//fdnum是fd的数量,后续会有fdnum个fd跟随在这个结构体后面
+        } resource;
+        struct {
             uint32_t padding[4];
         };
     };
@@ -121,6 +134,10 @@ struct OutputEvent{
         struct {
             uint32_t size; //这个packet只是通知包 作为header真正数据会集中发送,这里通知随后数据的大小
         } clipboard;
+        struct {
+            uint32_t type;
+            uint32_t args[3]; //support 3 args
+        } resources_request;
         struct
         {
             uint32_t padding[4];
@@ -128,8 +145,6 @@ struct OutputEvent{
 
     };
 } __attribute__((packed));
-
-#define OUTPUT_TYPE_CLIPBOARD 1
 
 /*
  * Audio runs on its own dedicated bidirectional socketpair (hello fd slot 4),

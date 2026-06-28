@@ -473,3 +473,34 @@ int get_dmabuf_info_at(display_ctx *ctx, int idx, struct buf_info *info)
     *info = ctx->dmabuf_infos[idx];
     return 0;
 }
+
+int poll_input_event_extend_fds(display_ctx *ctx, int* fds, int fd_count, int timeout_ms)
+{
+    if (ctx->fallback)
+        return 0;
+
+    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret <= 0)
+        return 0;
+
+    if (pfd.revents & (POLLHUP | POLLERR)) {
+        enter_fallback(ctx);
+        return -1;
+    }
+    struct data_msg hdr;
+    int n = recv_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, fd_count, &fd_count);
+    if (n < (int)sizeof(struct data_msg) || fd_count < 1)
+        return -1;
+
+    if (hdr.type != DATA_MSG_INPUT_EXTEND_FDS) {
+        for (int i = 0; i < fd_count; i++)
+            close(fds[i]);
+        return -1;
+    }
+    return fd_count;
+}
+
+int get_service_fds(display_ctx *ctx, int *fds, int max_fds, int timeout_ms) {
+    return poll_input_event_extend_fds(ctx, fds, max_fds, timeout_ms);
+}

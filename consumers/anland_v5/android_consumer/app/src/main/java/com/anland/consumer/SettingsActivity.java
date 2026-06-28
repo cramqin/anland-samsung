@@ -36,6 +36,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_SOCKET_PATH = "socket_path";
     private static final String KEY_USE_ROOT = "use_root";
     private static final String KEY_MIC_ENABLED = "mic_enabled";
+    private static final String KEY_CAMERA_ENABLED = "camera_enabled";
     private static final String KEY_SPEAKER_LATENCY_MS = "speaker_latency_ms";
     private static final String KEY_MIC_LATENCY_MS = "mic_latency_ms";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
@@ -295,6 +296,30 @@ public class SettingsActivity extends Activity {
         micHint.setTextColor(Color.GRAY);
         micHint.setPadding(0, dp(4), 0, 0);
         root.addView(micHint);
+
+        // Forward camera: expose the device camera(s) to the Linux desktop. When on,
+        // the app pre-creates the camera service resources at startup (CameraX is only
+        // opened once the desktop actually requests a recording). Requires the CAMERA
+        // permission, which MainActivity requests when this is enabled.
+        Switch cameraSwitch = new Switch(this);
+        cameraSwitch.setText("Forward camera to desktop");
+        cameraSwitch.setTextSize(14);
+        cameraSwitch.setPadding(0, dp(16), 0, 0);
+        cameraSwitch.setChecked(prefs.getBoolean(KEY_CAMERA_ENABLED, false));
+        cameraSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_CAMERA_ENABLED, checked).apply());
+        root.addView(cameraSwitch);
+
+        TextView cameraHint = new TextView(this);
+        cameraHint.setText("Lets the desktop open this device's camera(s) as a video "
+            + "source. The camera only turns on while the desktop is actively "
+            + "recording. Takes effect on next return to the app; first use prompts "
+            + "for the camera permission.");
+        cameraHint.setTextSize(12);
+        cameraHint.setTextColor(Color.GRAY);
+        cameraHint.setPadding(0, dp(4), 0, 0);
+        root.addView(cameraHint);
 
         // Audio latency presets, separately for the speaker (playback) and microphone
         // (capture) paths. The chosen buffer is forwarded to the producer's PipeWire

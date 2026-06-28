@@ -330,6 +330,54 @@ int poll_input_event(display_ctx *ctx, struct InputEvent *event, int timeout_ms)
     memcpy(event, msg_buf + sizeof(struct data_msg), sizeof(*event));
     return 1;
 }
+int poll_input_event_extend_fds(display_ctx *ctx, int *fds, int max_fds,
+                                int *fd_count, int timeout_ms)
+{
+    *fd_count = 0;
+    if (ctx->fallback)
+        return 0;
+
+    struct pollfd pfd = { .fd = ctx->data_fd, .events = POLLIN };
+    int ret = poll(&pfd, 1, timeout_ms);
+    if (ret <= 0)
+        return 0;
+
+    if (pfd.revents & (POLLHUP | POLLERR)) {
+        enter_fallback(ctx);
+        return -1;
+    }
+
+    struct data_msg hdr;
+    int got = 0;
+    int n = recv_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, max_fds, &got);
+    if (n < (int)sizeof(struct data_msg)) {
+        for (int i = 0; i < got; i++)
+            close(fds[i]);
+        return -1;
+    }
+    if (hdr.type != DATA_MSG_INPUT_EXTEND_FDS) {
+        for (int i = 0; i < got; i++)
+            close(fds[i]);
+        return -1;
+    }
+    *fd_count = got;
+    return 1;
+}
+
+int push_resources_request(display_ctx *ctx, uint32_t service_type, const uint32_t *args)
+{
+    struct OutputEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = OUTPUT_TYPE_RESOURCES_REQUEST;
+    ev.resources_request.type = service_type;
+    if (args) {
+        ev.resources_request.args[0] = args[0];
+        ev.resources_request.args[1] = args[1];
+        ev.resources_request.args[2] = args[2];
+    }
+    return push_output_event(ctx, &ev);
+}
+
 int push_output_event(display_ctx *ctx, const struct OutputEvent *event)
 {
     if (ctx->fallback)

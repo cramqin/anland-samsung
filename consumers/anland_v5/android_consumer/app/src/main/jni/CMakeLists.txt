@@ -6,6 +6,7 @@ set(LIBDISPLAY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../..)
 add_library(anland_consumer SHARED
     native_consumer.c
     native_audio.c
+    camera_service.c
     ${LIBDISPLAY_DIR}/libdisplay_consumer/display_consumer.c
     ${LIBDISPLAY_DIR}/common/socket_utils.c
 )

@@ -22,4 +22,22 @@ int  get_data_fd(display_ctx *ctx);
 int  get_audio_fd(display_ctx *ctx);
 void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event);
 
+
+struct resources {
+    uint32_t service_type;
+    int32_t type;
+    uint32_t num;
+    int* fds;
+};
+struct service_info {
+    uint32_t type;
+    //资源分配函数指针
+    struct resources (*allocate_resource)(uint32_t* args);//only support 3 args
+    void (*free_resource)(struct resources res);
+};
+typedef struct service_info service_info;
+typedef struct resources resources;
+void allocate_services(struct display_ctx *ctx, struct service_info *services, int num_services);
+void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event);
+void free_resources(struct display_ctx *ctx);//释放资源，保留服务信息
 #endif

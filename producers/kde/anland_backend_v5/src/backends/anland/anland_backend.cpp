@@ -6,6 +6,7 @@
 */
 #include "anland_backend.h"
 #include "anland_audio.h"
+#include "anland_camera.h"
 #include "anland_egl_backend.h"
 #include "anland_input.h"
 #include "anland_logging.h"
@@ -91,6 +92,8 @@ AnlandBackend::~AnlandBackend()
     teardownNotifiers();
     // Stop the audio engine before disconnect() closes the audio fd it borrows.
     anland_audio_stop();
+    // Stop the camera engine (it owns its own resource fds; closes them itself).
+    anland_camera_stop();
     if (m_reconnectTimer) {
         m_reconnectTimer->stop();
     }
@@ -153,6 +156,12 @@ bool AnlandBackend::initialize()
     if (anland_audio_start() < 0) {
         qCWarning(KWIN_ANLAND) << "failed to start audio engine; continuing without audio";
     }
+
+    // The camera engine is NOT started here: its PipeWire thread-loop is brought up
+    // lazily on the first resource delivery (anland_camera_set_resources), i.e. only
+    // once a consumer with the camera enabled actually hands over its fds. The backend
+    // requests SERVICE_TYPE_CAMERA on every reconnect (onReconnectTimer); a consumer
+    // that has the camera disabled never replies, so the engine never starts.
 
     // connect_to_deamon() only fetched screen info; the context is still in
     // fallback with no consumer fds or dmabufs. Enter fallback explicitly so the
@@ -352,6 +361,32 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
         }
         break;
     }
+    case INPUT_TYPE_RESOURCE: {
+        // The consumer is handing back the fds for a service we requested. The fdnum
+        // fds follow as a separate DATA_MSG_INPUT_EXTEND_FDS message; receive them now
+        // (synchronously, before the next poll_input_event) and route to the engine.
+        const uint32_t service = ev.resource.type;
+        const uint32_t fdnum = ev.resource.fdnum;
+        constexpr int kMaxFds = 1 + 8; // ctrl + up to MAX_CAMERAS streams
+        if (fdnum == 0 || fdnum > kMaxFds)
+            break;
+        int fds[kMaxFds];
+        int got = 0;
+        if (poll_input_event_extend_fds(m_display, fds, static_cast<int>(fdnum), &got, 5000) != 1
+            || got < static_cast<int>(fdnum)) {
+            for (int i = 0; i < got; i++)
+                ::close(fds[i]);
+            break;
+        }
+        if (service == SERVICE_TYPE_CAMERA) {
+            // fds[0] = shared control socket, fds[1..] = per-camera stream sockets.
+            anland_camera_set_resources(fds[0], &fds[1], got - 1);
+        } else {
+            for (int i = 0; i < got; i++)
+                ::close(fds[i]);
+        }
+        break;
+    }
     default:
         break;
     }
@@ -415,6 +450,10 @@ void AnlandBackend::enterFallback()
     // mic Source feeds silence) so PipeWire never perceives the disconnect.
     anland_audio_set_fd(-1);
 
+    // The consumer's camera fds are now dead: stop recording, destroy the virtual
+    // camera nodes and close the fds. New ones arrive on the next reconnect.
+    anland_camera_clear();
+
     if (m_reconnectTimer) {
         m_reconnectTimer->start();
     }
@@ -450,6 +489,12 @@ void AnlandBackend::onReconnectTimer()
     setupNotifiers();
     // Attach the fresh audio socket (a new socketpair was installed by pickup_fds).
     anland_audio_set_fd(get_audio_fd(m_display));
+    // Render loop is resuming and the data channel is live: immediately request the
+    // camera service. The consumer replies asynchronously with an INPUT_TYPE_RESOURCE
+    // event whose fds onInputReadable() hands to the camera engine. If the consumer
+    // has the camera disabled it simply never registers the service and never replies,
+    // so this is a harmless no-op in that case.
+    push_resources_request(m_display, SERVICE_TYPE_CAMERA, nullptr);
     m_outputs[0]->resumeRendering();
     if (layer) {
         layer->scheduleRepaint(nullptr);
@@ -681,4 +726,3 @@ void AnlandBackend::sendTextInputToKWin(const QByteArray &text)
 }
 
 } // namespace KWin
-
