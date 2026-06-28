@@ -55,6 +55,11 @@ public class ExtraKeysBar extends GridLayout {
     private static final int BG_COLOR = 0x00000000;
     private static final int ACTIVE_BG_COLOR = 0xFF7F7F7F;
 
+    // Bar backdrop: nearly opaque in the default (display-resizing) mode; more
+    // translucent in floating mode so the desktop shows through behind the keys.
+    private static final int BAR_BG_COLOR = 0xCC000000;
+    private static final int BAR_BG_FLOATING_COLOR = 0x99000000;
+
     private static final long REPEAT_DELAY_MS = 80;
 
     private static final int TYPE_KEY = 0;       // evdev down+up
@@ -187,12 +192,21 @@ public class ExtraKeysBar extends GridLayout {
 
         setColumnCount(mCols);
         setRowCount(mRows);
-        setBackgroundColor(0xCC000000);
+        setBackgroundColor(BAR_BG_COLOR);
         buildKeys();
     }
 
     /** Number of rows in the active layout, used by the host to size the bar. */
     public int getRowCount() { return mRows; }
+
+    /**
+     * Switch the bar backdrop between the default (nearly opaque) and floating
+     * (translucent) appearance. In floating mode the bar overlays the display
+     * instead of compressing it, so the desktop should remain partly visible.
+     */
+    public void setFloating(boolean floating) {
+        setBackgroundColor(floating ? BAR_BG_FLOATING_COLOR : BAR_BG_COLOR);
+    }
 
     /** The editable default layout template (also used by SettingsActivity). */
     public static String defaultLayoutJson() { return DEFAULT_LAYOUT_JSON; }

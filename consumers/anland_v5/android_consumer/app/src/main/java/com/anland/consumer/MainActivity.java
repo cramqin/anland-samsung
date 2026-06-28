@@ -67,6 +67,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    // When on, the IME and extra-keys bar float over the display instead of
+    // shrinking it: the bar rides up with the keyboard but the surface keeps
+    // its full size. See relayout() and buildExtraKeysBar().
+    private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
+    private boolean mKeyboardFloating = false;
     private EditText hiddenInput;
     private InputMethodManager imm;
     private int mImeBottom = 0;   // last IME bottom inset
@@ -294,6 +299,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // count / height) comes from the user's JSON config; see buildExtraKeysBar.
         mRoot = root;
         mDensity = getResources().getDisplayMetrics().density;
+        mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_KEYBOARD_FLOATING, false);
         buildExtraKeysBar();
 
         setContentView(root);
@@ -351,6 +358,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             .getString(KEY_EXTRA_KEYS_LAYOUT, "");
         if (!layoutJson.equals(mAppliedLayoutJson))
             rebuildExtraKeysBar();
+
+        // Pick up a Keyboard-floating toggle made in Settings: update the bar's
+        // backdrop and re-run the layout so the surface margin tracks the new mode.
+        mKeyboardFloating = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_KEYBOARD_FLOATING, false);
+        if (extraKeysBar != null)
+            extraKeysBar.setFloating(mKeyboardFloating);
+        relayout();
 
         // Sync extra-keys bar visibility with the settings switches. With auto-show
         // ON the bar tracks the keyboard (hidden now if the IME isn't up); with it
@@ -752,7 +767,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void relayout() {
         boolean barVisible = extraKeysBar != null && extraKeysBar.getVisibility() == View.VISIBLE;
         int barH = barVisible ? mBarHeight : 0;
-        int target = mImeBottom + barH;
+        // Floating mode: keyboard + bar overlay the display, so the surface keeps
+        // its full size (target 0). Default mode: shrink the surface above both.
+        int target = mKeyboardFloating ? 0 : (mImeBottom + barH);
 
         FrameLayout.LayoutParams lp =
             (FrameLayout.LayoutParams) surfaceView.getLayoutParams();
@@ -790,6 +807,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         });
         mBarHeight = Math.round(37.5f * mDensity * extraKeysBar.getRowCount());
+        extraKeysBar.setFloating(mKeyboardFloating);
         extraKeysBar.setVisibility(View.GONE);
         mRoot.addView(extraKeysBar, new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, mBarHeight, Gravity.BOTTOM));

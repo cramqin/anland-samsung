@@ -52,6 +52,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
+    private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
     private static final int UNBOUND = -1;
 
@@ -231,6 +232,28 @@ public class SettingsActivity extends Activity {
         backOpensExtraKeysHint.setTextColor(Color.GRAY);
         backOpensExtraKeysHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(backOpensExtraKeysHint);
+
+        // === Keyboard floating ===
+        Switch keyboardFloatingSwitch = new Switch(this);
+        keyboardFloatingSwitch.setText("Keyboard floating (overlay display)");
+        keyboardFloatingSwitch.setTextSize(14);
+        keyboardFloatingSwitch.setPadding(0, dp(16), 0, 0);
+        keyboardFloatingSwitch.setChecked(prefs.getBoolean(KEY_KEYBOARD_FLOATING, false));
+        keyboardFloatingSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_KEYBOARD_FLOATING, checked).apply());
+        root.addView(keyboardFloatingSwitch);
+
+        TextView keyboardFloatingHint = new TextView(this);
+        keyboardFloatingHint.setText("When ON, the soft keyboard and the extra keys bar "
+            + "float over the display area instead of shrinking it; the bar uses a "
+            + "translucent background and rises with the keyboard, but the display is "
+            + "not resized. When OFF, the original behaviour (display shrinks to make "
+            + "room) is kept. Takes effect on next return to the desktop.");
+        keyboardFloatingHint.setTextSize(12);
+        keyboardFloatingHint.setTextColor(Color.GRAY);
+        keyboardFloatingHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(keyboardFloatingHint);
 
         // === Custom extra-keys layout (JSON) ===
         TextView layoutHeader = new TextView(this);
