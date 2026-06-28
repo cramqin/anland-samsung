@@ -276,27 +276,20 @@ public class ExtraKeysBar extends GridLayout {
     private static Key parseKey(JSONObject o) throws JSONException {
         String label = o.optString(J_LABEL, "");
         String type = o.optString(J_TYPE, "key");
+        Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
         switch (type) {
-            case "text": {
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
+            case "text":
                 return new Key(label, TYPE_TEXT, 0, o.optString(J_TEXT, label), false, popup);
-            }
             case "modifier":
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
                 return new Key(label, TYPE_MODIFIER, o.optInt(J_CODE, 0), null, false, popup);
-            case "keyboard": {
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
+            case "keyboard": 
                 return new Key(label, TYPE_KEYBOARD, 0, null, false, popup);
-            }
             case "vkeyboard":
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
                 return new Key(label, TYPE_VKEYBOARD, 0, null, false, popup);
             case "settings":
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
                 return new Key(label, TYPE_SETTINGS, 0, null, false, popup);
             case "key":
             default: {
-                Key popup = o.has(J_POPUP) ? parseKey(o.getJSONObject(J_POPUP)) : null;
                 return new Key(label, TYPE_KEY, o.optInt(J_CODE, 0), null,
                                o.optBoolean(J_REPEAT, false), popup);
             }
