@@ -3,125 +3,133 @@ package com.anland.consumer;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.ImageFormat;
+import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.Image;
+import android.media.ImageReader;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
 import android.util.Size;
-
-import androidx.annotation.NonNull;
-import androidx.camera.core.CameraInfo;
-import androidx.camera.core.CameraSelector;
-import androidx.camera.core.ImageAnalysis;
-import androidx.camera.core.ImageProxy;
-import androidx.camera.lifecycle.ProcessCameraProvider;
-import androidx.lifecycle.Lifecycle;
-import androidx.lifecycle.LifecycleOwner;
-import androidx.lifecycle.LifecycleRegistry;
-
-import com.google.common.util.concurrent.ListenableFuture;
+import android.view.Surface;
 
 import java.nio.ByteBuffer;
-import java.util.Collections;
-import java.util.List;
+import java.util.Arrays;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * CameraX-based capture bridge. Owns its own {@link Lifecycle} so it can bind
- * use-cases without the host Activity being a LifecycleOwner. Driven entirely from
- * the native control thread (camera_service.c) via the {@code startRecording} /
- * {@code stopRecording} JNI calls — when the Linux producer asks to record, we bind
- * an {@link ImageAnalysis} for that camera and stream YUV420 (packed to I420) frames
- * down the per-camera socket fd, each prefixed by a camera_frame_hdr.
+ * Camera2-based capture bridge.  Replaces the previous CameraX implementation with
+ * direct Camera2 APIs so the android.camera.extensions / CameraX dependencies are
+ * no longer needed.
  *
- * Nothing here opens a camera until startRecording is called; init() only discovers
- * the camera count and kicks off the (async) provider initialisation.
+ * Discoveries cameras synchronously at init() and opens them on-demand when
+ * startRecording() is called.  Each opened camera creates an {@link ImageReader}
+ * that delivers YUV_420_888 frames; the per-frame callback passes the three planes
+ * down to camera_service.c via the same {@code nativePackFrame} / nativeFrameReady
+ * handshake used before.
+ *
+ * Owns no lifecycle registry — Camera2 needs none.  Thread-safety is provided by
+ * a ReentrantLock per camera so startRecording / stopRecording can race safely
+ * from the native control thread.
+ *
+ * Protocol (unchanged from the CameraX version):
+ *   1. nativeAwaitSlotFree(cam, slot, 1s) — wait until the producer has consumed
+ *      the slot (DONE) or 1 s elapses.
+ *   2. nativePackFrame(...) — copy Y/U/V ByteBuffers into the shared-memory slot.
+ *   3. nativeFrameReady(cam, slot, w, h, fmt) — signal the producer that a frame
+ *      is ready (READY).
+ *   4. curSlot ^= 1 — advance to the other ping-pong slot.
  */
-public class CameraServices implements LifecycleOwner {
+public class CameraServices {
     private static final String TAG = "AnlandCam";
 
     /* Must match camera_service.h: CAMERA_SLOTS. */
     private static final int SLOTS = 2;
 
-    /* Camera service lifecycle, implemented in camera_service.c. nativeInitCameraService
-     * creates the persistent fds/control thread (idempotent) and constructs the singleton
-     * CameraServices the producer drives, using the given Activity as its Context;
-     * nativeDestroyCameraService tears it all down on app shutdown. The native library is
-     * loaded by MainActivity's static initializer, which runs before any camera path. */
     static native void nativeInitCameraService(Activity activity);
     static native void nativeDestroyCameraService();
 
-    /* Implemented in camera_service.c (same .so, loaded by MainActivity). nativePackFrame
-     * copies the camera's planes straight into the shared-memory slot in their native
-     * layout (no chroma de-interleave) and returns the CAM_FMT_*; the slot is then handed
-     * to the producer via the READY/DONE handshake instead of copying through a socket. */
     private native int nativeAwaitSlotFree(int cam, int slot, int timeoutMs);
     private native int nativePackFrame(int cam, int slot,
-            ByteBuffer y, int yRow, int yPix,
-            ByteBuffer u, int uRow, int uPix,
-            ByteBuffer v, int vRow, int vPix,
-            int w, int h);
+                                       ByteBuffer y, int yRow, int yPix,
+                                       ByteBuffer u, int uRow, int uPix,
+                                       ByteBuffer v, int vRow, int vPix,
+                                       int w, int h);
     private native void nativeFrameReady(int cam, int slot, int w, int h, int fmt);
 
-    private final LifecycleRegistry lifecycle = new LifecycleRegistry(this);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private Context appContext;
+    private CameraManager cameraManager;
+
     private String[] cameraIds = new String[0];
-    // Per-camera max YUV_420_888 output resolution, reported to the producer via
-    // GET_INFO so it can configure each virtual camera at the real sensor max.
     private int[] maxW = new int[0];
     private int[] maxH = new int[0];
 
-    private ListenableFuture<ProcessCameraProvider> providerFuture;
-    private volatile ProcessCameraProvider provider;
-
-    // Per-camera capture state, indexed by camera id (0..cameraIds.length-1).
-    private ImageAnalysis[] analyses;
+    // --- Per-camera Camera2 state, indexed by logical camera index ---
+    private CameraDevice[] devices;
+    private CameraCaptureSession[] sessions;
+    private ImageReader[] readers;
     private ExecutorService[] executors;
-    // The shared-memory slot the next frame will be written into (ping-pong).
-    private int[] curSlot;
+    private HandlerThread[] bgThreads;
+    private Handler[] bgHandlers;
+    private int[] curSlot;                 // next shared-memory slot to fill
+    private ReentrantLock[] locks;   // guard start/stop races
 
-    @NonNull
-    @Override
-    public Lifecycle getLifecycle() {
-        return lifecycle;
+    public CameraServices() {
+        locks = new ReentrantLock[0];
     }
 
-    /** Discover cameras and start provider init. Called once, on the main thread. */
+    /** Discover cameras and compute max YUV_420_888 resolutions. Called once, main thread. */
     public void init(Context context) {
         appContext = context.getApplicationContext();
+        cameraManager = (CameraManager) appContext.getSystemService(Context.CAMERA_SERVICE);
+        if (cameraManager == null) {
+            Log.e(TAG, "init: no CameraManager");
+            cameraIds = new String[0];
+            return;
+        }
         try {
-            CameraManager cm = (CameraManager) appContext.getSystemService(Context.CAMERA_SERVICE);
-            cameraIds = cm.getCameraIdList();
+            cameraIds = cameraManager.getCameraIdList();
         } catch (Exception e) {
             Log.e(TAG, "init: getCameraIdList failed", e);
             cameraIds = new String[0];
         }
         int n = cameraIds.length;
-        analyses = new ImageAnalysis[n];
+        devices = new CameraDevice[n];
+        sessions = new CameraCaptureSession[n];
+        readers = new ImageReader[n];
         executors = new ExecutorService[n];
+        bgThreads = new HandlerThread[n];
+        bgHandlers = new Handler[n];
         curSlot = new int[n];
+        // Grow the lock array if needed; init() is called once so n is final.
+        if (n != locks.length) {
+            ReentrantLock[] grown = new ReentrantLock[n];
+            for (int i = 0; i < n; i++) {
+                grown[i] = (i < locks.length) ? locks[i] : new ReentrantLock();
+            }
+            locks = grown;
+        }
 
-        // Precompute each camera's largest YUV_420_888 output size (by area). Done here
-        // (synchronously, Camera2) so getCameraMaxWidth/Height are answerable the moment
-        // the producer sends GET_INFO.
         maxW = new int[n];
         maxH = new int[n];
         try {
-            CameraManager cm = (CameraManager) appContext.getSystemService(Context.CAMERA_SERVICE);
             for (int i = 0; i < n; i++) {
-                CameraCharacteristics ch = cm.getCameraCharacteristics(cameraIds[i]);
+                CameraCharacteristics ch = cameraManager.getCameraCharacteristics(cameraIds[i]);
                 StreamConfigurationMap map =
                         ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                if (map == null)
-                    continue;
+                if (map == null) continue;
                 Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
-                if (sizes == null)
-                    continue;
+                if (sizes == null) continue;
                 long bestArea = 0;
                 for (Size s : sizes) {
                     long area = (long) s.getWidth() * s.getHeight();
@@ -136,201 +144,331 @@ public class CameraServices implements LifecycleOwner {
             Log.e(TAG, "init: querying max resolutions failed", e);
         }
         StringBuilder sb = new StringBuilder("init: cameras=" + n);
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             sb.append(String.format(" [%d id=%s max=%dx%d]", i, cameraIds[i], maxW[i], maxH[i]));
+        }
         Log.i(TAG, sb.toString());
 
-        // Move our lifecycle to RESUMED so bound use-cases become active, and kick
-        // off the (async) CameraX provider init. Both must happen on the main thread.
-        mainHandler.post(() -> {
-            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE);
-            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START);
-            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME);
-            providerFuture = ProcessCameraProvider.getInstance(appContext);
-            providerFuture.addListener(() -> {
-                try {
-                    provider = providerFuture.get();
-                    Log.i(TAG, "CameraX provider ready");
-                } catch (Exception e) {
-                    Log.e(TAG, "provider init failed", e);
-                }
-            }, command -> mainHandler.post(command));
-        });
         Log.i(TAG, "init: " + n + " camera(s)");
     }
 
-    /** Physical camera count. Synchronous; safe to call from the main thread. */
     public int getCameraCount() {
         return cameraIds == null ? 0 : cameraIds.length;
     }
 
-    /** Largest YUV output width for camera {@code index}, or 0 if unknown. */
     public int getCameraMaxWidth(int index) {
         return (index >= 0 && index < maxW.length) ? maxW[index] : 0;
     }
 
-    /** Largest YUV output height for camera {@code index}, or 0 if unknown. */
     public int getCameraMaxHeight(int index) {
         return (index >= 0 && index < maxH.length) ? maxH[index] : 0;
     }
 
+    // ---------------------------------------------------------------
+    // startRecording / stopRecording — called from the native control
+    // thread (not the main thread).
+    // ---------------------------------------------------------------
+
     /**
-     * Bind ImageAnalysis for the given camera. Frames are written into the camera's two
-     * shared-memory slots (no socket copy). Called on the native control thread, so
-     * blocking to await provider readiness here is fine.
+     * Open the camera and start streaming YUV frames into the shared-memory slots.
+     * Blocks synchronously until the CameraDevice is opened and a capture session
+     * is active (or fails).
      */
     public void startRecording(int cameraId, int width, int height) {
         if (cameraId < 0 || cameraId >= getCameraCount()) {
             Log.e(TAG, "startRecording: bad cameraId " + cameraId);
             return;
         }
+        final int id = cameraId;
+        final int w = (width > 0) ? width : maxW[id];
+        final int h = (height > 0) ? height : maxH[id];
 
-        ProcessCameraProvider p = awaitProvider();
-        if (p == null) {
-            Log.e(TAG, "startRecording: provider unavailable");
-            return;
-        }
+        locks[id].lock();
+        try {
+            // If already running, stop first.
+            stopLocked(id);
 
-        synchronized (this) {
-            stopLocked(cameraId);  // replace any previous binding for this camera
-            curSlot[cameraId] = 0;
-            executors[cameraId] = Executors.newSingleThreadExecutor();
-        }
+            // 1. Create a background thread for this camera.
+            HandlerThread ht = new HandlerThread("camera-" + id);
+            ht.start();
+            bgThreads[id] = ht;
+            Handler bgHandler = new Handler(ht.getLooper());
+            bgHandlers[id] = bgHandler;
 
-        ImageAnalysis.Builder b = new ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888);
-        if (width > 0 && height > 0)
-            b.setTargetResolution(new Size(width, height));
-        ImageAnalysis analysis = b.build();
-        analysis.setAnalyzer(executors[cameraId], img -> onFrame(cameraId, img));
+            // 2. Create the ImageReader at the requested resolution.
+            ImageReader reader = ImageReader.newInstance(
+                    Math.max(w, 1), Math.max(h, 1),
+                    ImageFormat.YUV_420_888,
+                    2 /* maxImages — use 2 for ping-pong */);
+            reader.setOnImageAvailableListener(this::onFrameAvailable, bgHandler);
+            readers[id] = reader;
 
-        CameraSelector selector = selectorForIndex(p, cameraId);
+            // 3. Open the camera device (synchronously, blocking this thread).
+            final CameraDevice[] outDevice = new CameraDevice[1];
+            final boolean[] opened = {false};
+            final boolean[] failed = {false};
 
-        // bindToLifecycle must run on the main thread.
-        runOnMain(() -> {
             try {
-                analyses[cameraId] = analysis;
-                p.bindToLifecycle(this, selector, analysis);
-                Log.i(TAG, "startRecording: bound camera " + cameraId);
+                cameraManager.openCamera(cameraIds[id],
+                        new CameraDevice.StateCallback() {
+                            @Override
+                            public void onOpened(CameraDevice cd) {
+                                synchronized (opened) {
+                                    outDevice[0] = cd;
+                                    opened[0] = true;
+                                    opened.notifyAll();
+                                }
+                            }
+                            @Override
+                            public void onDisconnected(CameraDevice cd) {
+                                Log.w(TAG, "camera " + id + " disconnected");
+                                cd.close();
+                                synchronized (opened) {
+                                    failed[0] = true;
+                                    opened[0] = true;
+                                    opened.notifyAll();
+                                }
+                            }
+                            @Override
+                            public void onError(CameraDevice cd, int error) {
+                                Log.e(TAG, "camera " + id + " onError=" + error);
+                                cd.close();
+                                synchronized (opened) {
+                                    failed[0] = true;
+                                    opened[0] = true;
+                                    opened.notifyAll();
+                                }
+                            }
+                        }, bgHandler);
             } catch (Exception e) {
-                Log.e(TAG, "bindToLifecycle failed for camera " + cameraId, e);
-                synchronized (CameraServices.this) { stopLocked(cameraId); }
+                Log.e(TAG, "openCamera failed for camera " + id, e);
+                return;
             }
-        });
-    }
 
-    /** Stop and unbind the given camera. */
-    public void stopRecording(int cameraId) {
-        if (cameraId < 0 || cameraId >= getCameraCount())
-            return;
-        synchronized (this) {
-            stopLocked(cameraId);
+            // Wait for the camera to open (up to 3 s).
+            synchronized (opened) {
+                long deadline = System.currentTimeMillis() + 3000;
+                while (!opened[0]) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    try {
+                        opened.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+            if (failed[0] || outDevice[0] == null) {
+                Log.e(TAG, "startRecording: camera " + id + " open failed");
+                stopLocked(id);
+                return;
+            }
+            devices[id] = outDevice[0];
+
+            // 4. Create a capture session with only the ImageReader surface.
+            // YUV_420_888 via ImageReader is a valid output target — no preview surface needed.
+            final Surface readerSurface = readers[id].getSurface();
+
+            final CameraCaptureSession[] outSession = new CameraCaptureSession[1];
+            final boolean[] sessionReady = {false};
+
+            try {
+                devices[id].createCaptureSession(
+                        java.util.Collections.singletonList(readerSurface),
+                        new CameraCaptureSession.StateCallback() {
+                            @Override
+                            public void onConfigured(CameraCaptureSession cs) {
+                                synchronized (sessionReady) {
+                                    outSession[0] = cs;
+                                    sessionReady[0] = true;
+                                    sessionReady.notifyAll();
+                                }
+                            }
+                            @Override
+                            public void onConfigureFailed(CameraCaptureSession cs) {
+                                Log.e(TAG, "createCaptureSession failed for camera " + id);
+                                cs.close();
+                                synchronized (sessionReady) {
+                                    sessionReady[0] = true;
+                                    sessionReady.notifyAll();
+                                }
+                            }
+                        }, bgHandler);
+            } catch (Exception e) {
+                Log.e(TAG, "createCaptureSession threw for camera " + id, e);
+                stopLocked(id);
+                return;
+            }
+
+            // Wait for session (up to 3 s).
+            synchronized (sessionReady) {
+                long deadline = System.currentTimeMillis() + 3000;
+                while (!sessionReady[0]) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    try {
+                        sessionReady.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+            if (outSession[0] == null) {
+                Log.e(TAG, "startRecording: session not ready for camera " + id);
+                stopLocked(id);
+                return;
+            }
+            sessions[id] = outSession[0];
+
+            // 5. Build a repeating TEMPLATE_RECORD request targeting our reader surface.
+            try {
+                CaptureRequest.Builder reqBuilder =
+                        devices[id].createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+                reqBuilder.addTarget(readerSurface);
+                // Disable 3A convergence delays for minimal latency.
+                reqBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                        CaptureRequest.CONTROL_AE_MODE_ON);
+                reqBuilder.set(CaptureRequest.CONTROL_AWB_MODE,
+                        CaptureRequest.CONTROL_AWB_MODE_AUTO);
+                reqBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                sessions[id].setRepeatingRequest(reqBuilder.build(), null, bgHandler);
+            } catch (Exception e) {
+                Log.e(TAG, "setRepeatingRequest failed for camera " + id, e);
+                stopLocked(id);
+                return;
+            }
+
+            curSlot[id] = 0;
+            Log.i(TAG, "startRecording: camera " + id + " started " + w + "x" + h);
+        } finally {
+            locks[id].unlock();
         }
     }
 
-    /** Stop every active camera (called on producer disconnect / free_resource). */
-    public synchronized void stopAllRecording() {
-        for (int i = 0; i < getCameraCount(); i++)
-            stopLocked(i);
+    /** Stop the given camera and release all Camera2 resources. */
+    public void stopRecording(int cameraId) {
+        if (cameraId < 0 || cameraId >= getCameraCount()) return;
+        locks[cameraId].lock();
+        try {
+            stopLocked(cameraId);
+        } finally {
+            locks[cameraId].unlock();
+        }
     }
 
-    /** Tear down everything (called from camera_service_destroy on app shutdown). */
+    /** Stop every active camera. */
+    public synchronized void stopAllRecording() {
+        for (int i = 0; i < getCameraCount(); i++) {
+            locks[i].lock();
+            try {
+                stopLocked(i);
+            } finally {
+                locks[i].unlock();
+            }
+        }
+    }
+
+    /** Tear down everything (called on app shutdown). */
     public void release() {
         stopAllRecording();
-        runOnMain(() -> {
-            if (provider != null)
-                provider.unbindAll();
-            lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY);
-        });
     }
 
-    // --- internals ---
+    // ---------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------
 
-    /** Must hold the monitor. Unbinds the camera and shuts its analyzer executor. */
-    private void stopLocked(int cameraId) {
-        final ImageAnalysis analysis = analyses[cameraId];
-        if (analysis != null) {
-            analyses[cameraId] = null;
-            runOnMain(() -> {
-                if (provider != null)
-                    provider.unbind(analysis);
-            });
+    /** Must hold {@link #locks}[cameraId]. */
+    private void stopLocked(int id) {
+        // Stop repeating request first.
+        CameraCaptureSession s = sessions[id];
+        if (s != null) {
+            try {
+                s.stopRepeating();
+            } catch (Exception ignored) {
+            }
+            sessions[id] = null;
+            s.close();
         }
-        if (executors[cameraId] != null) {
-            executors[cameraId].shutdown();
-            executors[cameraId] = null;
+        // Close the reader.
+        ImageReader r = readers[id];
+        if (r != null) {
+            readers[id] = null;
+            r.close();
+        }
+        // Close the camera device.
+        CameraDevice d = devices[id];
+        if (d != null) {
+            devices[id] = null;
+            d.close();
+        }
+        // Quit the background thread.
+        HandlerThread ht = bgThreads[id];
+        if (ht != null) {
+            bgThreads[id] = null;
+            bgHandlers[id] = null;
+            try {
+                ht.quitSafely();
+            } catch (Exception ignored) {
+            }
+        }
+        ExecutorService ex = executors[id];
+        if (ex != null) {
+            executors[id] = null;
+            ex.shutdown();
         }
     }
 
-    private ProcessCameraProvider awaitProvider() {
-        if (provider != null)
-            return provider;
-        try {
-            ListenableFuture<ProcessCameraProvider> f = providerFuture;
-            if (f == null)
-                f = ProcessCameraProvider.getInstance(appContext);
-            provider = f.get();   // safe: not on the main thread
-        } catch (Exception e) {
-            Log.e(TAG, "awaitProvider failed", e);
-        }
-        return provider;
-    }
-
-    /** Build a CameraSelector pinned to the index-th CameraX camera. */
-    private CameraSelector selectorForIndex(ProcessCameraProvider p, int index) {
-        final List<CameraInfo> infos = p.getAvailableCameraInfos();
-        final CameraInfo target =
-                (index < infos.size()) ? infos.get(index) : null;
-        if (target == null) {
-            // Fall back to the default back camera if the index is out of range.
-            return CameraSelector.DEFAULT_BACK_CAMERA;
-        }
-        return new CameraSelector.Builder()
-                .addCameraFilter(list -> {
-                    for (CameraInfo ci : list)
-                        if (ci == target)
-                            return Collections.singletonList(ci);
-                    return Collections.emptyList();
-                })
-                .build();
-    }
-
-    /*
-     * Analyzer callback. Ping-pong over the two shared-memory slots:
-     *   - wait until the producer has released the slot we're about to write (DONE), or
-     *     1s elapses (then we overwrite -- drop semantics so a stalled/absent consumer
-     *     never wedges CameraX);
-     *   - hand the camera planes to native, which copies them into the slot in their
-     *     native layout (I420 / NV12 / NV21 -- no chroma de-interleave);
-     *   - notify the producer (READY, with the format) and advance to the other slot.
+    /**
+     * ImageReader callback.  Runs on per-camera background HandlerThread.
+     * Acquires the latest image, copies its planes into the shared-memory
+     * slot via the native handshake, then closes the image.
      */
-    private void onFrame(int cameraId, ImageProxy image) {
+    private void onFrameAvailable(ImageReader reader) {
+        // Find which camera this reader belongs to.
+        int cameraId = -1;
+        for (int i = 0; i < readers.length; i++) {
+            if (readers[i] == reader) {
+                cameraId = i;
+                break;
+            }
+        }
+        if (cameraId < 0) return;
+
+        Image image = null;
+        try {
+            image = reader.acquireLatestImage();
+        } catch (Exception e) {
+            // ImageReader may have been closed concurrently.
+            return;
+        }
+        if (image == null) return;
+
         try {
             final int slot = curSlot[cameraId];
             final int w = image.getWidth();
             final int h = image.getHeight();
-            ImageProxy.PlaneProxy[] pl = image.getPlanes();
+            Image.Plane[] planes = image.getPlanes();
 
-            nativeAwaitSlotFree(cameraId, slot, 1000);   // wait DONE (or 1s timeout)
+            if (planes.length < 3) {
+                Log.w(TAG, "onFrameAvailable: expected 3 planes, got " + planes.length);
+                return;
+            }
+
+            nativeAwaitSlotFree(cameraId, slot, 1000);
             int fmt = nativePackFrame(cameraId, slot,
-                    pl[0].getBuffer(), pl[0].getRowStride(), pl[0].getPixelStride(),
-                    pl[1].getBuffer(), pl[1].getRowStride(), pl[1].getPixelStride(),
-                    pl[2].getBuffer(), pl[2].getRowStride(), pl[2].getPixelStride(),
+                    planes[0].getBuffer(), planes[0].getRowStride(), planes[0].getPixelStride(),
+                    planes[1].getBuffer(), planes[1].getRowStride(), planes[1].getPixelStride(),
+                    planes[2].getBuffer(), planes[2].getRowStride(), planes[2].getPixelStride(),
                     w, h);
             nativeFrameReady(cameraId, slot, w, h, fmt);
             curSlot[cameraId] = slot ^ 1;
         } catch (Exception e) {
-            // Drop this frame; recording is torn down via the ctrl channel.
+            Log.e(TAG, "onFrameAvailable error for camera " + cameraId, e);
         } finally {
             image.close();
         }
-    }
-
-    private void runOnMain(Runnable r) {
-        if (Looper.myLooper() == Looper.getMainLooper())
-            r.run();
-        else
-            mainHandler.post(r);
     }
 }

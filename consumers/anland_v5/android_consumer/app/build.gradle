@@ -48,10 +48,4 @@ android {
 }
 
 dependencies {
-    // CameraX: used by CameraServices to capture YUV420 frames and stream them to
-    // the Linux producer over the per-camera stream socketpair (see camera_service.c).
-    def camerax_version = "1.4.1"
-    implementation "androidx.camera:camera-core:${camerax_version}"
-    implementation "androidx.camera:camera-camera2:${camerax_version}"
-    implementation "androidx.camera:camera-lifecycle:${camerax_version}"
 }

@@ -326,8 +326,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             FrameLayout.LayoutParams.WRAP_CONTENT,
             Gravity.NO_GRAVITY
         ));
-        // Let the view measure itself first, then position it bottom-center.
-        virtualKeyboardView.post(() -> positionVirtualKeyboard());
+        // Positioning happens lazily the first time the keyboard is shown
+        // (see toggleVirtualKeyboard). Positioning it here would spin forever:
+        // the view starts GONE and a GONE view is never measured.
 
         setContentView(root);
         surfaceView.getHolder().addCallback(this);
@@ -362,7 +363,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int w = virtualKeyboardView.getMeasuredWidth();
         int h = virtualKeyboardView.getMeasuredHeight();
         if (w <= 0 || h <= 0) {
-            virtualKeyboardView.post(this::positionVirtualKeyboard);
+            // Only retry while the keyboard is actually visible. A GONE view is
+            // never measured (width/height stay 0), so reposting unconditionally
+            // would re-queue this Runnable on the main thread every frame forever
+            // and cause global jank/卡顿 even while the keyboard is hidden.
+            if (virtualKeyboardView.getVisibility() == View.VISIBLE) {
+                virtualKeyboardView.post(this::positionVirtualKeyboard);
+            }
             return;
         }
         DisplayMetrics dm = getResources().getDisplayMetrics();

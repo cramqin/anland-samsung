@@ -1,9 +1,8 @@
 <!DOCTYPE html>
-<html lang="zh">
-<head>
+<html lang="zh"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ExtraKeysBar 键位编辑器</title>
+<title>⌨ ExtraKeysBar 键位编辑器</title>
 <style>
   :root {
     --bg: #1b1d22;
@@ -36,6 +35,16 @@
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .hint { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header .lang select {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: inherit;
+  }
   .layout {
     display: grid;
     grid-template-columns: 1fr 340px;
@@ -207,16 +216,23 @@
 </head>
 <body>
 <header>
-  <h1>⌨ ExtraKeysBar 键位编辑器</h1>
-  <span class="hint">可视化编辑底栏键位 → 生成 <code>extra_keys_layout</code> JSON</span>
+  <h1 id="ttTitle">⌨ ExtraKeysBar 键位编辑器</h1>
+  <span class="hint" id="ttHint">可视化编辑底栏键位 → 生成 extra_keys_layout JSON</span>
+  <span class="spacer"></span>
+  <span class="lang">
+    <select id="langSel" title="Language / 语言">
+      <option value="en">English</option>
+      <option value="zh">中文</option>
+    </select>
+  </span>
 </header>
 
 <div class="layout">
   <!-- Left: visual editor + JSON -->
   <div>
     <div class="card">
-      <h2>布局预览（点击键位进行编辑）</h2>
-      <div id="bar" class="bar"></div>
+      <h2 id="ttPreview">布局预览（点击键位进行编辑）</h2>
+      <div id="bar" class="bar"><div class="row-wrap"><div class="bar-row" style="flex: 1 1 0%;"><div class="key"><div class="key-label">ESC</div><div class="key-type">key</div></div><div class="key"><div class="key-label">/</div><div class="key-type">text</div></div><div class="key"><div class="key-label">-</div><div class="key-type">text</div><span class="pop" title="popup: |">▲</span></div><div class="key"><div class="key-label">HOME</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">↑</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">END</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">PGUP</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">⌨</div><div class="key-type">keyboard</div><span class="pop" title="popup: VK">▲</span></div><div class="key add" title="在此行添加键位">＋</div></div><div class="row-tools"><button class="icon-btn" title="上移此行">↑</button><button class="icon-btn" title="下移此行">↓</button><button class="icon-btn danger" title="删除此行">✕</button></div></div><div class="row-wrap"><div class="bar-row" style="flex: 1 1 0%;"><div class="key"><div class="key-label">TAB</div><div class="key-type">key</div></div><div class="key modifier"><div class="key-label">CTRL</div><div class="key-type">modifier</div></div><div class="key modifier"><div class="key-label">ALT</div><div class="key-type">modifier</div></div><div class="key"><div class="key-label">←</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">↓</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">→</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">PGDN</div><div class="key-type">key</div><span class="badge" title="auto-repeat">⟳</span></div><div class="key"><div class="key-label">⚙</div><div class="key-type">settings</div></div><div class="key add" title="在此行添加键位">＋</div></div><div class="row-tools"><button class="icon-btn" title="上移此行">↑</button><button class="icon-btn" title="下移此行">↓</button><button class="icon-btn danger" title="删除此行">✕</button></div></div></div>
       <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
         <button class="btn" id="addRow">＋ 添加一行</button>
         <button class="btn ghost" id="loadDefault">恢复默认布局</button>
@@ -224,23 +240,22 @@
     </div>
 
     <div class="card">
-      <h2>JSON 输出</h2>
+      <h2 id="ttJson">JSON 输出</h2>
       <textarea id="json" spellcheck="false"></textarea>
       <div class="json-tools">
         <button class="btn primary" id="copyJson">复制 JSON</button>
         <button class="btn" id="downloadJson">下载 .json</button>
         <button class="btn" id="applyJson">从文本框载入 ↑</button>
       </div>
-      <div class="status" id="jsonStatus"></div>
-      <p class="kv">提示：把 JSON 粘贴到 App 设置的「Extra keys layout」中即可生效。
-      格式与 <code>ExtraKeysBar.DEFAULT_LAYOUT_JSON</code> 完全一致。</p>
+      <div class="status " id="jsonStatus"></div>
+      <p class="kv" id="ttJsonNote">提示：把 JSON 粘贴到 App 设置的「<b>Extra keys layout</b>」中即可生效。格式与 <code>ExtraKeysBar.DEFAULT_LAYOUT_JSON</code> 完全一致。</p>
     </div>
   </div>
 
   <!-- Right: property panel -->
   <div>
     <div class="card" id="panel">
-      <h2>键位属性</h2>
+      <h2 id="ttProps">键位属性</h2>
       <div id="panelBody"><p class="empty-note">在左侧选择一个键位进行编辑。</p></div>
     </div>
   </div>
@@ -249,7 +264,146 @@
 <script>
 "use strict";
 
-// ---- evdev keycodes (linux/input-event-codes.h), curated common subset ----
+// ---------------------------------------------------------------------------
+// i18n
+// ---------------------------------------------------------------------------
+const STRINGS = {
+  en: {
+    title: "⌨ ExtraKeysBar Layout Editor",
+    hint: "Visually edit the bottom key bar → generate the extra_keys_layout JSON",
+    previewTitle: "Layout preview (click a key to edit)",
+    addRow: "＋ Add row",
+    loadDefault: "Reset to default",
+    jsonTitle: "JSON output",
+    copyJson: "Copy JSON",
+    downloadJson: "Download .json",
+    applyJson: "Load from text ↑",
+    jsonNote: 'Paste this JSON into the app’s <b>Extra keys layout</b> setting to apply it. Format matches <code>ExtraKeysBar.DEFAULT_LAYOUT_JSON</code> exactly.',
+    propsTitle: "Key properties",
+    selectPrompt: "Select a key on the left to edit it.",
+    type_key: "Normal key (evdev code)",
+    type_text: "Text (send characters)",
+    type_modifier: "Modifier (CTRL / ALT / SHIFT)",
+    type_keyboard: "Toggle system IME",
+    type_vkeyboard: "Toggle floating virtual keyboard",
+    type_settings: "Open settings",
+    fLabel: "Display text (label)",
+    fType: "Type",
+    fCode: "Scancode (code, evdev)",
+    codePick: "— pick a common key —",
+    fRepeat: "Auto-repeat on hold (repeat)",
+    fText: "Text to send (text)",
+    fPopup: "Swipe-up popup key (popup)",
+    moveLeft: "← Move left",
+    moveRight: "Move right →",
+    delKey: "Delete key",
+    addKeyHere: "Add a key to this row",
+    rowUp: "Move row up",
+    rowDown: "Move row down",
+    rowDel: "Delete this row",
+    confirmDefault: "Reset to the built-in default layout? Current edits will be lost.",
+    stEmpty: "The text box is empty.",
+    stParseFail: (m) => "JSON parse failed: " + m,
+    stLoaded: "Loaded.",
+    stCopied: "Copied to clipboard.",
+    vTop: "Top level must be an object.",
+    vNoRows: "Missing the rows array.",
+    vEmptyRows: "rows is empty (the app falls back to the built-in default).",
+    vRowNotArr: (r) => `Row ${r} is not an array.`,
+    vKeyNotObj: (r, c) => `Row ${r}, key ${c} is not an object.`,
+    vBadType: (r, c, t) => `Row ${r}, key ${c} has an invalid type "${t}".`,
+    newKey: "NEW",
+  },
+  zh: {
+    title: "⌨ ExtraKeysBar 键位编辑器",
+    hint: "可视化编辑底栏键位 → 生成 extra_keys_layout JSON",
+    previewTitle: "布局预览（点击键位进行编辑）",
+    addRow: "＋ 添加一行",
+    loadDefault: "恢复默认布局",
+    jsonTitle: "JSON 输出",
+    copyJson: "复制 JSON",
+    downloadJson: "下载 .json",
+    applyJson: "从文本框载入 ↑",
+    jsonNote: '提示：把 JSON 粘贴到 App 设置的「<b>Extra keys layout</b>」中即可生效。格式与 <code>ExtraKeysBar.DEFAULT_LAYOUT_JSON</code> 完全一致。',
+    propsTitle: "键位属性",
+    selectPrompt: "在左侧选择一个键位进行编辑。",
+    type_key: "普通键 (evdev code)",
+    type_text: "文本 (发送字符)",
+    type_modifier: "修饰键 (CTRL/ALT/SHIFT)",
+    type_keyboard: "切换系统输入法",
+    type_vkeyboard: "切换悬浮虚拟键盘",
+    type_settings: "打开设置",
+    fLabel: "显示文字 (label)",
+    fType: "类型 (type)",
+    fCode: "扫描码 (code, evdev)",
+    codePick: "— 选择常用键 —",
+    fRepeat: "长按自动重复 (repeat)",
+    fText: "发送的文本 (text)",
+    fPopup: "上滑弹出键 (popup)",
+    moveLeft: "← 左移",
+    moveRight: "右移 →",
+    delKey: "删除键位",
+    addKeyHere: "在此行添加键位",
+    rowUp: "上移此行",
+    rowDown: "下移此行",
+    rowDel: "删除此行",
+    confirmDefault: "恢复为内置默认布局？当前编辑将丢失。",
+    stEmpty: "文本框为空。",
+    stParseFail: (m) => "JSON 解析失败：" + m,
+    stLoaded: "已载入。",
+    stCopied: "已复制到剪贴板。",
+    vTop: "顶层必须是对象。",
+    vNoRows: "缺少 rows 数组。",
+    vEmptyRows: "rows 为空（App 会回退到内置默认布局）。",
+    vRowNotArr: (r) => `第 ${r} 行不是数组。`,
+    vKeyNotObj: (r, c) => `第 ${r} 行第 ${c} 个键不是对象。`,
+    vBadType: (r, c, t) => `第 ${r} 行第 ${c} 个键的 type "${t}" 无效。`,
+    newKey: "NEW",
+  },
+};
+
+const LANG_KEY = "extra_keys_editor_lang";
+
+function pickInitialLang() {
+  const saved = localStorage.getItem(LANG_KEY);
+  if (saved && STRINGS[saved]) return saved;
+  const nav = (navigator.language || "en").toLowerCase();
+  return nav.startsWith("zh") ? "zh" : "en";
+}
+
+let lang = pickInitialLang();
+
+// t(key, ...args): looks up the current language, falls back to English.
+function t(key, ...args) {
+  const tbl = STRINGS[lang] || STRINGS.en;
+  let v = tbl[key];
+  if (v == null) v = STRINGS.en[key];
+  return typeof v === "function" ? v(...args) : v;
+}
+
+// Apply translations to the static (non-rebuilt) chrome.
+function applyStaticI18n() {
+  document.documentElement.lang = lang;
+  document.title = t("title");
+  document.getElementById("ttTitle").textContent = t("title");
+  document.getElementById("ttHint").textContent = t("hint");
+  document.getElementById("ttPreview").textContent = t("previewTitle");
+  document.getElementById("addRow").textContent = t("addRow");
+  document.getElementById("loadDefault").textContent = t("loadDefault");
+  document.getElementById("ttJson").textContent = t("jsonTitle");
+  document.getElementById("copyJson").textContent = t("copyJson");
+  document.getElementById("downloadJson").textContent = t("downloadJson");
+  document.getElementById("applyJson").textContent = t("applyJson");
+  document.getElementById("ttJsonNote").innerHTML = t("jsonNote");
+  document.getElementById("ttProps").textContent = t("propsTitle");
+  document.getElementById("langSel").value = lang;
+}
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
+// evdev keycodes (linux/input-event-codes.h), curated common subset.
 const EVDEV = [
   ["ESC",1],["1",2],["2",3],["3",4],["4",5],["5",6],["6",7],["7",8],["8",9],["9",10],["0",11],
   ["MINUS -",12],["EQUAL =",13],["BACKSPACE",14],["TAB",15],
@@ -268,14 +422,6 @@ const EVDEV = [
 ];
 
 const TYPES = ["key","text","modifier","keyboard","vkeyboard","settings"];
-const TYPE_LABEL = {
-  key: "普通键 (evdev code)",
-  text: "文本 (发送字符)",
-  modifier: "修饰键 (CTRL/ALT/SHIFT)",
-  keyboard: "切换系统输入法",
-  vkeyboard: "切换悬浮虚拟键盘",
-  settings: "打开设置",
-};
 
 const DEFAULT_LAYOUT = {
   rows: [
@@ -336,9 +482,9 @@ function renderBar() {
     const add = document.createElement("div");
     add.className = "key add";
     add.textContent = "＋";
-    add.title = "在此行添加键位";
+    add.title = t("addKeyHere");
     add.onclick = () => {
-      row.push({label:"NEW", type:"key", code:0});
+      row.push({label: t("newKey"), type:"key", code:0});
       sel = {r, c: row.length - 1};
       render();
     };
@@ -347,9 +493,9 @@ function renderBar() {
     // per-row tools (move up/down, delete row)
     const tools = document.createElement("div");
     tools.className = "row-tools";
-    tools.appendChild(iconBtn("↑", "上移此行", () => { moveRow(r, -1); }));
-    tools.appendChild(iconBtn("↓", "下移此行", () => { moveRow(r, +1); }));
-    tools.appendChild(iconBtn("✕", "删除此行", () => { deleteRow(r); }, true));
+    tools.appendChild(iconBtn("↑", t("rowUp"), () => { moveRow(r, -1); }));
+    tools.appendChild(iconBtn("↓", t("rowDown"), () => { moveRow(r, +1); }));
+    tools.appendChild(iconBtn("✕", t("rowDel"), () => { deleteRow(r); }, true));
 
     wrap.appendChild(rowEl);
     wrap.appendChild(tools);
@@ -392,7 +538,11 @@ function iconBtn(txt, title, fn, danger) {
 function renderPanel() {
   if (!sel || !layout.rows[sel.r] || !layout.rows[sel.r][sel.c]) {
     sel = null;
-    panelBody.innerHTML = '<p class="empty-note">在左侧选择一个键位进行编辑。</p>';
+    panelBody.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "empty-note";
+    p.textContent = t("selectPrompt");
+    panelBody.appendChild(p);
     return;
   }
   const key = layout.rows[sel.r][sel.c];
@@ -400,15 +550,14 @@ function renderPanel() {
   panelBody.appendChild(keyForm(key, false));
 
   // key actions
-  const hr = document.createElement("hr");
-  panelBody.appendChild(hr);
+  panelBody.appendChild(document.createElement("hr"));
   const actions = document.createElement("div");
   actions.style.display = "flex";
   actions.style.gap = "8px";
   actions.style.flexWrap = "wrap";
-  actions.appendChild(mkBtn("← 左移", "btn", () => moveKey(-1)));
-  actions.appendChild(mkBtn("右移 →", "btn", () => moveKey(+1)));
-  actions.appendChild(mkBtn("删除键位", "btn ghost", () => deleteKey()));
+  actions.appendChild(mkBtn(t("moveLeft"), "btn", () => moveKey(-1)));
+  actions.appendChild(mkBtn(t("moveRight"), "btn", () => moveKey(+1)));
+  actions.appendChild(mkBtn(t("delKey"), "btn ghost", () => deleteKey()));
   panelBody.appendChild(actions);
 }
 
@@ -416,10 +565,10 @@ function renderPanel() {
 function keyForm(key, isPopup) {
   const box = document.createElement("div");
 
-  box.appendChild(textField("显示文字 (label)", key.label || "", v => { key.label = v; renderBarOnly(); syncJsonFromLayout(); }));
+  box.appendChild(textField(t("fLabel"), key.label || "", v => { key.label = v; renderBarOnly(); syncJsonFromLayout(); }));
 
-  box.appendChild(selectField("类型 (type)", TYPES, key.type || "key",
-    TYPES.map(t => TYPE_LABEL[t]), v => {
+  box.appendChild(selectField(t("fType"), TYPES, key.type || "key",
+    TYPES.map(ty => t("type_" + ty)), v => {
       key.type = v;
       normalizeKey(key);
       render();
@@ -430,13 +579,13 @@ function keyForm(key, isPopup) {
     box.appendChild(codeField(key));
   }
   if (key.type === "key") {
-    box.appendChild(checkField("长按自动重复 (repeat)", !!key.repeat, v => {
+    box.appendChild(checkField(t("fRepeat"), !!key.repeat, v => {
       if (v) key.repeat = true; else delete key.repeat;
       renderBarOnly(); syncJsonFromLayout();
     }));
   }
   if (key.type === "text") {
-    box.appendChild(textField("发送的文本 (text)", key.text != null ? key.text : "", v => {
+    box.appendChild(textField(t("fText"), key.text != null ? key.text : "", v => {
       key.text = v; syncJsonFromLayout();
     }));
   }
@@ -445,7 +594,7 @@ function keyForm(key, isPopup) {
   if (!isPopup) {
     const sec = document.createElement("div");
     const has = !!key.popup;
-    sec.appendChild(checkField("上滑弹出键 (popup)", has, v => {
+    sec.appendChild(checkField(t("fPopup"), has, v => {
       if (v && !key.popup) key.popup = {label:"", type:"text", text:""};
       else if (!v) delete key.popup;
       render();
@@ -466,7 +615,7 @@ function codeField(key) {
   const wrap = document.createElement("div");
   wrap.className = "field";
   const lab = document.createElement("label");
-  lab.textContent = "扫描码 (code, evdev)";
+  lab.textContent = t("fCode");
   wrap.appendChild(lab);
 
   const row = document.createElement("div");
@@ -474,7 +623,7 @@ function codeField(key) {
 
   const sel2 = document.createElement("select");
   const none = document.createElement("option");
-  none.value = ""; none.textContent = "— 选择常用键 —";
+  none.value = ""; none.textContent = t("codePick");
   sel2.appendChild(none);
   EVDEV.forEach(([name, code]) => {
     const o = document.createElement("option");
@@ -617,31 +766,31 @@ function serialize(lay) {
 
 function applyJson() {
   const txt = jsonEl.value.trim();
-  if (!txt) { setStatus("文本框为空。", "err"); return; }
+  if (!txt) { setStatus(t("stEmpty"), "err"); return; }
   let parsed;
   try { parsed = JSON.parse(txt); }
-  catch (e) { setStatus("JSON 解析失败：" + e.message, "err"); return; }
+  catch (e) { setStatus(t("stParseFail", e.message), "err"); return; }
   const err = validate(parsed);
   if (err) { setStatus(err, "err"); return; }
   layout = normalizeLayout(parsed);
   sel = null;
   render();
-  setStatus("已载入。", "ok");
+  setStatus(t("stLoaded"), "ok");
 }
 
 // Light validation mirroring ExtraKeysBar.parseLayout expectations.
 function validate(obj) {
-  if (!obj || typeof obj !== "object") return "顶层必须是对象。";
-  if (!Array.isArray(obj.rows)) return "缺少 rows 数组。";
-  if (obj.rows.length === 0) return "rows 为空（App 会回退到内置默认布局）。";
+  if (!obj || typeof obj !== "object") return t("vTop");
+  if (!Array.isArray(obj.rows)) return t("vNoRows");
+  if (obj.rows.length === 0) return t("vEmptyRows");
   for (let r = 0; r < obj.rows.length; r++) {
-    if (!Array.isArray(obj.rows[r])) return `第 ${r+1} 行不是数组。`;
+    if (!Array.isArray(obj.rows[r])) return t("vRowNotArr", r + 1);
     for (let c = 0; c < obj.rows[r].length; c++) {
       const k = obj.rows[r][c];
       if (!k || typeof k !== "object" || Array.isArray(k))
-        return `第 ${r+1} 行第 ${c+1} 个键不是对象。`;
+        return t("vKeyNotObj", r + 1, c + 1);
       if (k.type && TYPES.indexOf(k.type) < 0)
-        return `第 ${r+1} 行第 ${c+1} 个键的 type "${k.type}" 无效。`;
+        return t("vBadType", r + 1, c + 1, k.type);
     }
   }
   return null;
@@ -669,20 +818,22 @@ function setStatus(msg, kind) {
   jsonStatus.className = "status " + (kind || "");
 }
 
-// ---- toolbar wiring ----
+// ---------------------------------------------------------------------------
+// toolbar wiring
+// ---------------------------------------------------------------------------
 document.getElementById("addRow").onclick = () => {
-  layout.rows.push([{label:"NEW", type:"key", code:0}]);
+  layout.rows.push([{label: t("newKey"), type:"key", code:0}]);
   sel = {r: layout.rows.length - 1, c: 0};
   render();
 };
 document.getElementById("loadDefault").onclick = () => {
-  if (!confirm("恢复为内置默认布局？当前编辑将丢失。")) return;
+  if (!confirm(t("confirmDefault"))) return;
   layout = clone(DEFAULT_LAYOUT); sel = null; render();
 };
 document.getElementById("applyJson").onclick = applyJson;
 document.getElementById("copyJson").onclick = async () => {
-  try { await navigator.clipboard.writeText(jsonEl.value); setStatus("已复制到剪贴板。", "ok"); }
-  catch (e) { jsonEl.select(); document.execCommand("copy"); setStatus("已复制。", "ok"); }
+  try { await navigator.clipboard.writeText(jsonEl.value); setStatus(t("stCopied"), "ok"); }
+  catch (e) { jsonEl.select(); document.execCommand("copy"); setStatus(t("stCopied"), "ok"); }
 };
 document.getElementById("downloadJson").onclick = () => {
   const blob = new Blob([jsonEl.value], {type: "application/json"});
@@ -692,10 +843,18 @@ document.getElementById("downloadJson").onclick = () => {
   a.click();
   URL.revokeObjectURL(a.href);
 };
+document.getElementById("langSel").onchange = (e) => {
+  lang = STRINGS[e.target.value] ? e.target.value : "en";
+  localStorage.setItem(LANG_KEY, lang);
+  applyStaticI18n();
+  render();
+};
 
 // ---- go ----
+applyStaticI18n();
 render();
 </script>
-</body>
-</html>
+
+
+</body></html>
 

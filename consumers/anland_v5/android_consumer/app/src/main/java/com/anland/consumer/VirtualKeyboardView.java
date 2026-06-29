@@ -80,18 +80,24 @@ package com.anland.consumer;
      private Paint keyBgPaint = new Paint(Paint.ANTI_ALIAS_FLAG); 
      private Paint pressedPaint = new Paint(Paint.ANTI_ALIAS_FLAG); 
      private Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG); 
-     private Paint modActivePaint = new Paint(Paint.ANTI_ALIAS_FLAG); 
-     private Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG); 
-  
-     private int keyHeight; 
+     private Paint modActivePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+     private Paint handlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+     private Paint keyStrokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+     private int keyHeight;
      private int padding = 4; 
      private int cornerRadius = 6; 
   
      private int keyColor = Color.parseColor("#88E8E8E8"); 
      private int pressedColor = Color.parseColor("#88B0B0B0"); 
      private int modActiveColor = Color.parseColor("#8866B0FF"); 
-     private int textColor = Color.WHITE; 
-     private int bgColor = Color.parseColor("#33000000"); 
+     private int textColor = Color.WHITE;
+     private int bgColor = Color.parseColor("#33000000");
+
+     // Precomputed colors used per-frame in onDraw. Parsing these strings on
+     // every frame (and once per key) was a source of jank while typing/dragging.
+     private static final int HANDLE_COLOR     = 0x66FFFFFF;
+     private static final int KEY_STROKE_COLOR = 0x44FFFFFF;
   
      public interface OnKeyEventListener { 
          void onKeyDown(int scanCode); 
@@ -192,9 +198,13 @@ package com.anland.consumer;
          pressedPaint.setAntiAlias(true); 
          modActivePaint.setAntiAlias(true); 
          modActivePaint.setColor(modActiveColor); 
-         handlePaint.setColor(Color.parseColor("#66FFFFFF")); 
-         handlePaint.setAntiAlias(true); 
-     } 
+         handlePaint.setColor(HANDLE_COLOR);
+         handlePaint.setAntiAlias(true);
+         keyBgPaint.setStyle(Paint.Style.FILL);
+         keyStrokePaint.setStyle(Paint.Style.STROKE);
+         keyStrokePaint.setStrokeWidth(1);
+         keyStrokePaint.setColor(KEY_STROKE_COLOR);
+     }
   
      // ========== 初始化按键 ========== 
      private void initKeys() { 
@@ -649,10 +659,9 @@ package com.anland.consumer;
                          float dy = event.getRawY() - lastRawY; 
                          float newX = getTranslationX() + dx; 
                          float newY = getTranslationY() + dy; 
-                         setTranslationX(newX); 
-                         setTranslationY(newY); 
-                         bringToFront(); 
-                         lastRawX = event.getRawX(); 
+                         setTranslationX(newX);
+                         setTranslationY(newY);
+                         lastRawX = event.getRawX();
                          lastRawY = event.getRawY(); 
                          return true; 
                      case MotionEvent.ACTION_UP: 
@@ -815,9 +824,9 @@ package com.anland.consumer;
              bgPaint.setColor(bgColor); 
              canvas.drawRoundRect(0, 0, getWidth(), getHeight(), cornerRadius, cornerRadius, bgPaint); 
   
-             canvas.drawRoundRect(0, 0, getWidth(), dragHandleHeight, cornerRadius, cornerRadius, handlePaint); 
-             handlePaint.setColor(Color.parseColor("#66FFFFFF")); 
-             float dotY = dragHandleHeight / 2f; 
+             handlePaint.setColor(HANDLE_COLOR);
+             canvas.drawRoundRect(0, 0, getWidth(), dragHandleHeight, cornerRadius, cornerRadius, handlePaint);
+             float dotY = dragHandleHeight / 2f;
              float dotSpacing = dpToPx(8); 
              float startX = getWidth() / 2f - dotSpacing; 
              for (int i = 0; i < 3; i++) { 
@@ -834,15 +843,10 @@ package com.anland.consumer;
                  } else { 
                      bg = keyColor; 
                  } 
-                 keyBgPaint.setColor(bg); 
-                 canvas.drawRoundRect(r.left, r.top, r.right, r.bottom, cornerRadius, cornerRadius, keyBgPaint); 
-  
-                 keyBgPaint.setColor(Color.parseColor("#44FFFFFF")); 
-                 keyBgPaint.setStyle(Paint.Style.STROKE); 
-                 keyBgPaint.setStrokeWidth(1); 
-                 canvas.drawRoundRect(r.left, r.top, r.right, r.bottom, cornerRadius, cornerRadius, keyBgPaint); 
-                 keyBgPaint.setStyle(Paint.Style.FILL); 
-  
+                 keyBgPaint.setColor(bg);
+                 canvas.drawRoundRect(r.left, r.top, r.right, r.bottom, cornerRadius, cornerRadius, keyBgPaint);
+                 canvas.drawRoundRect(r.left, r.top, r.right, r.bottom, cornerRadius, cornerRadius, keyStrokePaint);
+
                  textPaint.setColor(textColor); 
                  float textSize = keyHeight * 0.4f; 
                  if (textSize <= 0) textSize = 20; 
