@@ -28,11 +28,15 @@
  *
  * The fd order handed to the producer is: { ctrl, stream_0, .., stream_{N-1} }.
  *
+ * The camera is driven entirely in C via the Camera2 NDK (libcamera2ndk /
+ * libmediandk): discovery, device open, capture session, and per-frame YUV delivery
+ * all happen natively. The Java side only triggers init/destroy.
+ *
  * Frame transport (shared memory, zero socket copy):
  *   Each camera owns one ashmem region of CAMERA_SLOTS * slot_bytes, created once at
  *   init and sized for the camera's max resolution (slot_bytes = maxW*maxH*3/2). The
- *   consumer's CameraX analyzer writes I420 straight into a slot, then notifies the
- *   producer over stream_fd. The two ends ping-pong the two slots:
+ *   AImageReader callback packs each frame as NV21 straight into a slot, then notifies
+ *   the producer over stream_fd. The two ends ping-pong the two slots:
  *     0. consumer writes slot s, sends READY(s, w, h)
  *     1. consumer advances to the other slot for the next frame
  *     2. producer copies slot s out, sends DONE(s)
@@ -85,15 +89,15 @@ void             camera_free_resource(struct resources res);
 /* ---- lifecycle, driven from JNI (MainActivity) ---- */
 
 /*
- * Create the control + per-camera stream socketpairs, instantiate the Java
- * CameraServices object (which discovers the camera count), and start the control
- * thread. Idempotent: a second call while already initialised is a no-op. Returns
- * 0 on success, -1 on failure. activity_obj must be a Context (the Activity).
+ * Discover cameras via the Camera2 NDK, create the control + per-camera stream
+ * socketpairs and ashmem buffers, and start the control thread. Idempotent: a second
+ * call while already initialised is a no-op. Returns 0 on success, -1 on failure.
+ * Needs no Context -- the NDK camera manager is process-global.
  */
-int  camera_service_init(JNIEnv *env, jobject activity_obj);
+int  camera_service_init(void);
 
 /* Stop the control thread, stop all recording, and close every fd. */
-void camera_service_destroy(JNIEnv *env);
+void camera_service_destroy(void);
 
 /*
  * True once init() succeeded and the fds are live. do_connect() registers the

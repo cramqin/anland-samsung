@@ -24,6 +24,8 @@ target_link_libraries(anland_consumer
     log
     dl
     aaudio
+    camera2ndk
+    mediandk
 )
 
 # Root helper for "connect with root" mode. Built as an executable but named
