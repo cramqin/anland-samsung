@@ -264,7 +264,11 @@ static void stop_event_thread(struct consumer_state *s)
     if (!s->event_running)
         return;
     s->event_running = false;
-    //pthread_join(s->event_thread, NULL);
+}
+
+static void join_event_thread(struct consumer_state *s)
+{
+    pthread_join(s->event_thread, NULL);
 }
 
 /*
@@ -372,6 +376,8 @@ static int do_connect(struct consumer_state *s)
 
     if (s->ctx) {
         audio_set_ctx(NULL);   /* detach audio before the old ctx (and its fd) dies */
+        stop_event_thread(s);
+        join_event_thread(s);
         disconnect(s->ctx);
         s->ctx = NULL;
     }
