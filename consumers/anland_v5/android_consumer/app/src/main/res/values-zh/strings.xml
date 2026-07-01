@@ -10,6 +10,7 @@
     <string name="section_touchpad">触摸板设置</string>
     <string name="section_connection">连接</string>
     <string name="section_resolution">显示分辨率</string>
+    <string name="section_notification">设置通知</string>
 
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ 返回</string>
@@ -19,6 +20,8 @@
     <string name="cat_touchpad_subtitle">触摸板模式与指针灵敏度</string>
     <string name="cat_connection_subtitle">套接字、root、麦克风、摄像头与音频延迟</string>
     <string name="cat_resolution_subtitle">输出分辨率与预设</string>
+    <string name="cat_general_title">通用</string>
+    <string name="cat_general_subtitle">设置通知</string>
 
     <!-- Bind key -->
     <string name="bind_key_button">绑定虚拟键盘按键</string>
@@ -72,6 +75,14 @@
     <string name="width_hint">宽度（例如 1920）</string>
     <string name="height_hint">高度（例如 1080）</string>
     <string name="resolution_hint">选择预设或手动输入数值。填 0 表示原生分辨率。\"Screen ×\" 会按本设备面板（横向）缩放。下次连接时生效。</string>
+
+    <!-- Settings notification -->
+    <string name="notification_switch">显示设置通知</string>
+    <string name="notification_hint">应用打开时显示一条常驻通知，点击可直接进入设置。关闭后不再显示。下次返回应用时生效。</string>
+    <string name="notification_channel_name">Anland</string>
+    <string name="notification_channel_desc">Anland 快速访问</string>
+    <string name="notification_title">Anland</string>
+    <string name="notification_text">点击进入设置</string>
 
     <!-- Toasts -->
     <string name="toast_no_picker">没有可用的文件选择器</string>

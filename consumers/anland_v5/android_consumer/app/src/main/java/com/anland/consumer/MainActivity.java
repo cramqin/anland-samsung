@@ -78,6 +78,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // its full size. See relayout() and buildExtraKeysBar().
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private boolean mKeyboardFloating = false;
+    // Persistent "tap to open Settings" notification, toggleable in Settings > General.
+    private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
     private EditText hiddenInput;
     private InputMethodManager imm;
     private int mImeBottom = 0;   // last IME bottom inset
@@ -370,8 +372,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (nm == null) return;
 
         NotificationChannel channel = new NotificationChannel(
-                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_LOW);
-        channel.setDescription("Anland quick access");
+                NOTIFICATION_CHANNEL, getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription(getString(R.string.notification_channel_desc));
         channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
         nm.createNotificationChannel(channel);
 
@@ -381,8 +384,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
         Notification notification = new Notification.Builder(this, NOTIFICATION_CHANNEL)
-                .setContentTitle("Anland")
-                .setContentText("点击进入设置")
+                .setContentTitle(getString(R.string.notification_title))
+                .setContentText(getString(R.string.notification_text))
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -437,13 +440,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onResume() {
         super.onResume();
 
-        // Show settings notification while in foreground
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                        != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+        // Show settings notification while in foreground, unless disabled in Settings.
+        if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_NOTIFICATION_ENABLED, true)) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                            != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+            } else {
+                showSettingsNotification();
+            }
         } else {
-            showSettingsNotification();
+            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(NOTIFICATION_ID);
         }
 
         // Re-check accessibility service state on resume
@@ -586,7 +595,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 cameraInited = true;
             }
         } else if (requestCode == 1003) {
-            showSettingsNotification();
+            if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(KEY_NOTIFICATION_ENABLED, true)) {
+                showSettingsNotification();
+            }
         }
     }
 

@@ -54,6 +54,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_BACK_OPENS_EXTRA_KEYS = "back_opens_extra_keys";
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
+    private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
     private static final String DEFAULT_SOCKET_PATH = "/data/local/tmp/display_daemon.sock";
     private static final int UNBOUND = -1;
 
@@ -66,7 +67,7 @@ public class SettingsActivity extends Activity {
     private static final int[] LATENCY_MS = {0, 1, 3, 5, 10, 20};
 
     // Which secondary page is on screen. Back returns HOME -> exits the activity.
-    private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION }
+    private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL }
     private Page currentPage = Page.HOME;
 
     private Button bindButton;
@@ -154,6 +155,8 @@ public class SettingsActivity extends Activity {
             R.string.cat_connection_subtitle, this::showConnectionPage);
         addCategoryRow(root, R.string.section_resolution,
             R.string.cat_resolution_subtitle, this::showResolutionPage);
+        addCategoryRow(root, R.string.cat_general_title,
+            R.string.cat_general_subtitle, this::showGeneralPage);
 
         // Build version, injected from git at build time (see app/build.gradle).
         TextView version = new TextView(this);
@@ -272,6 +275,13 @@ public class SettingsActivity extends Activity {
         currentPage = Page.RESOLUTION;
         LinearLayout root = newPage(R.string.section_resolution);
         addResolutionSection(root);
+        setContent(root);
+    }
+
+    private void showGeneralPage() {
+        currentPage = Page.GENERAL;
+        LinearLayout root = newPage(R.string.cat_general_title);
+        buildNotificationSection(root);
         setContent(root);
     }
 
@@ -483,6 +493,37 @@ public class SettingsActivity extends Activity {
         layoutHint.setTextColor(Color.GRAY);
         layoutHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(layoutHint);
+    }
+
+    // ============================================================
+    // General page sections
+    // ============================================================
+    private void buildNotificationSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        TextView header = new TextView(this);
+        header.setText(R.string.section_notification);
+        header.setTextSize(16);
+        header.setTypeface(null, Typeface.BOLD);
+        header.setPadding(0, 0, 0, dp(8));
+        root.addView(header);
+
+        Switch notificationSwitch = new Switch(this);
+        notificationSwitch.setText(R.string.notification_switch);
+        notificationSwitch.setTextSize(14);
+        notificationSwitch.setPadding(0, dp(8), 0, 0);
+        notificationSwitch.setChecked(prefs.getBoolean(KEY_NOTIFICATION_ENABLED, true));
+        notificationSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_NOTIFICATION_ENABLED, checked).apply());
+        root.addView(notificationSwitch);
+
+        TextView notificationHint = new TextView(this);
+        notificationHint.setText(R.string.notification_hint);
+        notificationHint.setTextSize(12);
+        notificationHint.setTextColor(Color.GRAY);
+        notificationHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(notificationHint);
     }
 
     // ============================================================

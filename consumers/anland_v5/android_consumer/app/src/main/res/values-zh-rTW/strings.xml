@@ -10,6 +10,7 @@
     <string name="section_touchpad">觸控板設定</string>
     <string name="section_connection">連線</string>
     <string name="section_resolution">顯示解析度</string>
+    <string name="section_notification">設定通知</string>
 
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ 返回</string>
@@ -19,6 +20,8 @@
     <string name="cat_touchpad_subtitle">觸控板模式與指標靈敏度</string>
     <string name="cat_connection_subtitle">socket、root、麥克風、相機與音訊延遲</string>
     <string name="cat_resolution_subtitle">輸出解析度與預設</string>
+    <string name="cat_general_title">一般</string>
+    <string name="cat_general_subtitle">設定通知</string>
 
     <!-- Bind key -->
     <string name="bind_key_button">綁定虛擬鍵盤按鍵</string>
@@ -72,6 +75,14 @@
     <string name="width_hint">寬度（例如 1920）</string>
     <string name="height_hint">高度（例如 1080）</string>
     <string name="resolution_hint">選擇預設或手動輸入數值。填 0 表示原生解析度。\"Screen ×\" 會依本裝置面板（橫向）縮放。下次連線時生效。</string>
+
+    <!-- Settings notification -->
+    <string name="notification_switch">顯示設定通知</string>
+    <string name="notification_hint">應用程式開啟時顯示一則常駐通知，點按可直接進入設定。關閉後不再顯示。下次返回應用程式時生效。</string>
+    <string name="notification_channel_name">Anland</string>
+    <string name="notification_channel_desc">Anland 快速存取</string>
+    <string name="notification_title">Anland</string>
+    <string name="notification_text">點按進入設定</string>
 
     <!-- Toasts -->
     <string name="toast_no_picker">沒有可用的檔案選擇器</string>
