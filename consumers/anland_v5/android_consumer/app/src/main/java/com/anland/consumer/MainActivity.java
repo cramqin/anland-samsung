@@ -605,12 +605,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             | android.text.InputType.TYPE_TEXT_VARIATION_NORMAL);
     }
 
+    // Mirror of the text we have pushed to the remote via the IME path, with the
+    // cursor implicitly at its end (we only ever append text or backspace from the
+    // tail). Maintained at the sendText/tapKey choke points so it stays accurate no
+    // matter which InputConnection method drove the change. Used to re-seed the
+    // composing tracker when the IME reclaims already-sent text as a composing
+    // region (see ForwardingInputConnection.setComposingRegion).
+    private final StringBuilder mMirror = new StringBuilder();
+    // Only the trailing text is ever needed (a composing region is at most a word);
+    // drop the head past this bound so a long session can't grow the buffer forever.
+    private static final int MIRROR_CAP = 4096;
+
     private void sendText(String text) {
         if (text.isEmpty()) return;
+        mMirror.append(text);
+        if (mMirror.length() > MIRROR_CAP) {
+            mMirror.delete(0, mMirror.length() - MIRROR_CAP);
+        }
         nativeSendTextInput(text.getBytes(StandardCharsets.UTF_8));
     }
 
     private void tapKey(int evdevCode) {
+        // Keep the mirror in step with what the tap does to the remote text. A
+        // backspace pops the trailing code point; forward-delete removes text after
+        // the cursor, of which there is none (cursor sits at the tail), so it is a
+        // no-op here. Other keys don't touch the mirror.
+        if (evdevCode == EVDEV_BACKSPACE && mMirror.length() > 0) {
+            mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+        }
         nativeSendKey(0, evdevCode);
         nativeSendKey(1, evdevCode);
     }
@@ -738,6 +760,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         @Override
+        public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+            for (int i = 0; i < beforeLength; i++) {
+                tapKey(EVDEV_BACKSPACE);
+            }
+            for (int i = 0; i < afterLength; i++) {
+                tapKey(EVDEV_DELETE);
+            }
+            return true;
+        }
+
+        // The IME reclaims text it previously committed as a fresh composing region
+        // (e.g. backspacing into a finished word: it deletes a char, then re-composes
+        // the remainder before replacing it). We keep no Editable, so the base class
+        // can't honour this — and because our composing tracker is empty at this
+        // point, the follow-up setComposingText would diff against "" and *append*
+        // the replacement instead of overwriting, turning "shado"+"shad" into
+        // "shadoshad". Re-seed the tracker with the region's text so replaceComposing()
+        // backspaces the difference. The cursor always sits at the tail of what we've
+        // sent, so the region is the last (end - start) chars of the mirror — reading
+        // it as a length keeps us correct whether the IME's indices are document- or
+        // word-relative.
+        @Override
+        public boolean setComposingRegion(int start, int end) {
+            final int len = end - start;
+            if (len >= 0 && len <= mMirror.length()) {
+                composing.setLength(0);
+                composing.append(mMirror, mMirror.length() - len, mMirror.length());
+            }
+            return true;
+        }
+
+        @Override
         public boolean sendKeyEvent(KeyEvent event) {
             final int evdev = toEvdevKey(event.getKeyCode());
             if (evdev == 0) {
@@ -747,6 +801,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 nativeSendKey(0, evdev);
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
                 nativeSendKey(1, evdev);
+                // Keep the mirror consistent with a raw key edit. A backspace pops the
+                // tail; anything else (Enter, Tab, arrows, ...) moves the cursor or
+                // inserts content our tail-only model can't track, so drop the mirror
+                // and composing tracker rather than risk seeding a bad region later.
+                if (evdev == EVDEV_BACKSPACE) {
+                    if (mMirror.length() > 0)
+                        mMirror.setLength(mMirror.offsetByCodePoints(mMirror.length(), -1));
+                } else {
+                    mMirror.setLength(0);
+                    composing.setLength(0);
+                }
             }
             return true;
         }
