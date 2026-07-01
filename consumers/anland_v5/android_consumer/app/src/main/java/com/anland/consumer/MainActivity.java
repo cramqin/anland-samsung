@@ -2,6 +2,10 @@ package com.anland.consumer;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
@@ -355,6 +359,46 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateScreenSize();
         mouseX = screenWidth / 2f;
         mouseY = screenHeight / 2f;
+
+        // Show persistent notification — click opens Settings
+        showSettingsNotification();
+    }
+
+    private static final String NOTIFICATION_CHANNEL = "anland_channel";
+    private static final int NOTIFICATION_ID = 1;
+
+    private void showSettingsNotification() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null) return;
+
+        NotificationChannel channel = new NotificationChannel(
+                NOTIFICATION_CHANNEL, "Anland", NotificationManager.IMPORTANCE_LOW);
+        channel.setDescription("Anland quick access");
+        channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        nm.createNotificationChannel(channel);
+
+        Intent intent = new Intent(this, SettingsActivity.class);
+        intent.setAction(Intent.ACTION_MAIN);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        Notification notification = new Notification.Builder(this, NOTIFICATION_CHANNEL)
+                .setContentTitle("Anland")
+                .setContentText("点击进入设置")
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentIntent(pi)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .build();
+
+        nm.notify(NOTIFICATION_ID, notification);
+    }
+
+    @Override
+    protected void onDestroy() {
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm != null) nm.cancel(NOTIFICATION_ID);
+        super.onDestroy();
     }
 
     // ADDED: Helper to position virtual keyboard at bottom-center
