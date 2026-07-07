@@ -1073,13 +1073,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setExtraKeysBarVisible(!visible);
     }
 
-    // Tracks whether we have requested the IME to show.  In freeform mode the
-    // floating IME does NOT affect WindowInsets so isImeVisible() would always
-    // return false; this flag lets toggleSystemKeyboard() know the real state.
-    private boolean imeRequested = false;
-
     private boolean isImeVisible() {
-        if (imeRequested) return true;
+        // Prefer InputMethodManager.isActive() which returns true when the IME
+        // is connected to this window, even in freeform mode where a floating
+        // IME does NOT affect WindowInsets.
+        if (imm != null && imm.isActive()) return true;
         WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
         return insets != null && insets.isVisible(WindowInsets.Type.ime());
     }
@@ -1099,7 +1097,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (isImeVisible()) {
             imm.hideSoftInputFromWindow(hiddenInput.getWindowToken(), 0);
             releaseHiddenInput();
-            imeRequested = false;
             // In freeform mode the inset callback may not fire; hide the bar
             // explicitly so it tracks the IME state in all modes.
             setExtraKeysBarVisible(shouldShowBar(false));
@@ -1109,7 +1106,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             hiddenInput.setFocusableInTouchMode(true);
             hiddenInput.requestFocus();
             imm.showSoftInput(hiddenInput, InputMethodManager.SHOW_IMPLICIT);
-            imeRequested = true;
             // In freeform / small-window mode the IME appears as a floating
             // window that does NOT trigger window insets, so applyImeInset()
             // is never called and the extra-keys bar stays hidden.  Show it
