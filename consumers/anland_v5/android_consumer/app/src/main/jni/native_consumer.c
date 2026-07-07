@@ -680,7 +680,7 @@ Java_com_anland_consumer_Native_nativeStart(
     }
     /* Static natives have no `thiz`; the Java layer passes the object whose
      * nativeSetClipboardText / nativeClipListening / nativeClipboardSync the
-     * event thread calls back into (the MainActivity). */
+     * event thread calls back into (the Clipboard instance). */
     g_activity_obj = (*env)->NewGlobalRef(env, callbackTarget);
 
     g_state.running = true;
