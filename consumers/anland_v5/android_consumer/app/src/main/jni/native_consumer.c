@@ -601,8 +601,8 @@ static void copy_jstring(JNIEnv *env, jstring js, char *dst, size_t dstsz)
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeConfigure(
-    JNIEnv *env, jobject thiz, jstring socketPath, jboolean useRoot,
+Java_com_anland_consumer_Native_nativeConfigure(
+    JNIEnv *env, jclass clazz, jstring socketPath, jboolean useRoot,
     jstring helperPath, jstring bridgePath)
 {
     pthread_mutex_lock(&cfg_lock);
@@ -620,8 +620,8 @@ Java_com_anland_consumer_MainActivity_nativeConfigure(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSetCustomResolution(
-    JNIEnv* env, jobject thiz, jint width, jint height)
+Java_com_anland_consumer_Native_nativeSetCustomResolution(
+    JNIEnv* env, jclass clazz, jint width, jint height)
 {
     pthread_mutex_lock(&cfg_lock);
     cfg_custom_width = width;
@@ -631,8 +631,8 @@ Java_com_anland_consumer_MainActivity_nativeSetCustomResolution(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeStart(
-    JNIEnv *env, jobject thiz, jobject surface)
+Java_com_anland_consumer_Native_nativeStart(
+    JNIEnv *env, jclass clazz, jobject surface, jobject callbackTarget)
 {
     if (!api_loaded) {
         if (anw_api_load(&api) < 0) {
@@ -678,7 +678,10 @@ Java_com_anland_consumer_MainActivity_nativeStart(
     if (g_activity_obj) {
         (*env)->DeleteGlobalRef(env, g_activity_obj);
     }
-    g_activity_obj = (*env)->NewGlobalRef(env, thiz);
+    /* Static natives have no `thiz`; the Java layer passes the object whose
+     * nativeSetClipboardText / nativeClipListening / nativeClipboardSync the
+     * event thread calls back into (the MainActivity). */
+    g_activity_obj = (*env)->NewGlobalRef(env, callbackTarget);
 
     g_state.running = true;
     g_state.need_reconnect = true;
@@ -692,8 +695,8 @@ Java_com_anland_consumer_MainActivity_nativeStart(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeStop(
-    JNIEnv *env, jobject thiz)
+Java_com_anland_consumer_Native_nativeStop(
+    JNIEnv *env, jclass clazz)
 {
     pthread_mutex_lock(&g_state.lock);
 
@@ -743,8 +746,8 @@ Java_com_anland_consumer_MainActivity_nativeStop(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSetRefreshRate(
-    JNIEnv *env, jobject thiz, jfloat hz)
+Java_com_anland_consumer_Native_nativeSetRefreshRate(
+    JNIEnv *env, jclass clazz, jfloat hz)
 {
     if (hz <= 0.0f)
         return;
@@ -754,8 +757,8 @@ Java_com_anland_consumer_MainActivity_nativeSetRefreshRate(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendTouch(
-    JNIEnv *env, jobject thiz, jint action, jfloat x, jfloat y, jint pointer_id)
+Java_com_anland_consumer_Native_nativeSendTouch(
+    JNIEnv *env, jclass clazz, jint action, jfloat x, jfloat y, jint pointer_id)
 {
     if (!g_state.ctx)
         return;
@@ -767,8 +770,8 @@ Java_com_anland_consumer_MainActivity_nativeSendTouch(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendTouchFrame(
-    JNIEnv *env, jobject thiz)
+Java_com_anland_consumer_Native_nativeSendTouchFrame(
+    JNIEnv *env, jclass clazz)
 {
     if (!g_state.ctx)
         return;
@@ -779,8 +782,8 @@ Java_com_anland_consumer_MainActivity_nativeSendTouchFrame(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendKey(
-    JNIEnv *env, jobject thiz, jint action, jint keycode)
+Java_com_anland_consumer_Native_nativeSendKey(
+    JNIEnv *env, jclass clazz, jint action, jint keycode)
 {
     if (!g_state.ctx)
         return;
@@ -792,8 +795,8 @@ Java_com_anland_consumer_MainActivity_nativeSendKey(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendMouseMotion(
-    JNIEnv *env, jobject thiz, jfloat x, jfloat y, jfloat dx, jfloat dy)
+Java_com_anland_consumer_Native_nativeSendMouseMotion(
+    JNIEnv *env, jclass clazz, jfloat x, jfloat y, jfloat dx, jfloat dy)
 {
     if (!g_state.ctx)
         return;
@@ -815,8 +818,8 @@ Java_com_anland_consumer_MainActivity_nativeSendMouseMotion(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendMouseButton(
-    JNIEnv *env, jobject thiz, jint button, jboolean pressed)
+Java_com_anland_consumer_Native_nativeSendMouseButton(
+    JNIEnv *env, jclass clazz, jint button, jboolean pressed)
 {
     if (!g_state.ctx)
         return;
@@ -828,8 +831,8 @@ Java_com_anland_consumer_MainActivity_nativeSendMouseButton(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendMouseScroll(
-    JNIEnv *env, jobject thiz, jint axis, jfloat value)
+Java_com_anland_consumer_Native_nativeSendMouseScroll(
+    JNIEnv *env, jclass clazz, jint axis, jfloat value)
 {
     if (!g_state.ctx)
         return;
@@ -841,8 +844,8 @@ Java_com_anland_consumer_MainActivity_nativeSendMouseScroll(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendClipboard(
-    JNIEnv *env, jobject thiz, jbyteArray data)
+Java_com_anland_consumer_Native_nativeSendClipboard(
+    JNIEnv *env, jclass clazz, jbyteArray data)
 {
     if (!g_state.ctx)
         return;
@@ -865,8 +868,8 @@ Java_com_anland_consumer_MainActivity_nativeSendClipboard(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSendTextInput(
-    JNIEnv *env, jobject thiz, jbyteArray data)
+Java_com_anland_consumer_Native_nativeSendTextInput(
+    JNIEnv *env, jclass clazz, jbyteArray data)
 {
     if (!g_state.ctx)
         return;
@@ -889,15 +892,15 @@ Java_com_anland_consumer_MainActivity_nativeSendTextInput(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSetMicEnabled(
-    JNIEnv *env, jobject thiz, jboolean enabled)
+Java_com_anland_consumer_Native_nativeSetMicEnabled(
+    JNIEnv *env, jclass clazz, jboolean enabled)
 {
     audio_set_mic_enabled(enabled == JNI_TRUE);
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_MainActivity_nativeSetAudioLatency(
-    JNIEnv *env, jobject thiz, jint speakerMs, jint micMs)
+Java_com_anland_consumer_Native_nativeSetAudioLatency(
+    JNIEnv *env, jclass clazz, jint speakerMs, jint micMs)
 {
     audio_set_latency(speakerMs, micMs);
 }

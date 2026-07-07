@@ -158,24 +158,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean smoothInitialized = false;
 
     static {
+        // Loads the single shared .so backing MainActivity, Native and
+        // CameraServices; the last two only declare their natives.
         System.loadLibrary("anland_consumer");
     }
 
-    private native void nativeConfigure(String socketPath, boolean useRoot,
-                                        String helperPath, String bridgePath);
-    private native void nativeStart(Surface surface);
-    private native void nativeStop();
-    private native void nativeSendTouch(int action, float x, float y, int pointerId);
-    private native void nativeSendTouchFrame();
-    private native void nativeSendKey(int action, int keycode);
-    private native void nativeSendMouseMotion(float x, float y, float dx, float dy);
-    private native void nativeSendMouseButton(int button, boolean pressed);
-    private native void nativeSendMouseScroll(int axis, float value);
-    private native void nativeSetRefreshRate(float hz);
-    private native void nativeSendClipboard(byte[] data);
-    private native void nativeSendTextInput(byte[] data);
-    private native void nativeSetMicEnabled(boolean enabled);
-    private native void nativeSetAudioLatency(int speakerMs, int micMs);
+    // Native transport methods now live in Native (bound to
+    // Java_com_anland_consumer_Native_*); call sites use the Native. prefix.
+
     // Called from native event thread to set clipboard text on Android
     public void nativeSetClipboardText(String text) {
         ClipboardManager cm = getSystemService(ClipboardManager.class);
@@ -193,7 +183,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             CharSequence text = clip.getItemAt(0).getText();
             if (text != null) {
                 mLastSentClip = text.toString();
-                nativeSendClipboard(text.toString().getBytes(StandardCharsets.UTF_8));
+                Native.nativeSendClipboard(text.toString().getBytes(StandardCharsets.UTF_8));
             }
         }
     }
@@ -227,7 +217,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 String clipText = text.toString();
                 if (!clipText.equals(mLastSentClip)) {
                     mLastSentClip = clipText;
-                    nativeSendClipboard(clipText.getBytes(StandardCharsets.UTF_8));
+                    Native.nativeSendClipboard(clipText.getBytes(StandardCharsets.UTF_8));
                 }
             }
         }
@@ -257,7 +247,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void pushRefreshRate() {
         Display d = getDisplay();
         if (d != null)
-            nativeSetRefreshRate(d.getRefreshRate());
+            Native.nativeSetRefreshRate(d.getRefreshRate());
     }
 
     // Push the current connection settings (socket path / root mode) to native
@@ -272,16 +262,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         boolean useRoot = prefs.getBoolean(KEY_USE_ROOT, true);
         String helperPath = getApplicationInfo().nativeLibraryDir + "/libfdhelper.so";
         String bridgePath = getCacheDir().getAbsolutePath() + "/anland_fdbridge.sock";
-        nativeConfigure(sock.trim(), useRoot, helperPath, bridgePath);
+        Native.nativeConfigure(sock.trim(), useRoot, helperPath, bridgePath);
         int customW = prefs.getInt("custom_width", 0);
         int customH = prefs.getInt("custom_height", 0);
         customScreenWidth = prefs.getInt("custom_width", 0);
         customScreenHeight = prefs.getInt("custom_height", 0);
-        nativeSetCustomResolution(customW, customH);
+        Native.nativeSetCustomResolution(customW, customH);
     }
-    
-    private native void nativeSetCustomResolution(int width, int height);
-    
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -320,11 +308,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         virtualKeyboardView.setOnKeyEventListener(new VirtualKeyboardView.OnKeyEventListener() {
             @Override
             public void onKeyDown(int scanCode) {
-                nativeSendKey(0, scanCode);
+                Native.nativeSendKey(0, scanCode);
             }
             @Override
             public void onKeyUp(int scanCode) {
-                nativeSendKey(1, scanCode);
+                Native.nativeSendKey(1, scanCode);
             }
         });
         // Add to root with no gravity – we will position manually.
@@ -520,9 +508,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
         if (surfaceReady) {
-            nativeStop();
+            Native.nativeStop();
             applyConnectionConfig();
-            nativeStart(surfaceView.getHolder().getSurface());
+            Native.nativeStart(surfaceView.getHolder().getSurface(), this);
             pushRefreshRate();
             applyMicState();
             applyAudioLatency();
@@ -543,7 +531,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
-        nativeStop();
+        Native.nativeStop();
     }
 
     @Override
@@ -591,19 +579,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         int speakerMs = prefs.getInt(KEY_SPEAKER_LATENCY_MS, 0);
         int micMs = prefs.getInt(KEY_MIC_LATENCY_MS, 0);
-        nativeSetAudioLatency(speakerMs, micMs);
+        Native.nativeSetAudioLatency(speakerMs, micMs);
     }
 
     private void applyMicState() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         boolean want = prefs.getBoolean(KEY_MIC_ENABLED, false);
         if (!want) {
-            nativeSetMicEnabled(false);
+            Native.nativeSetMicEnabled(false);
             return;
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 == PackageManager.PERMISSION_GRANTED) {
-            nativeSetMicEnabled(true);
+            Native.nativeSetMicEnabled(true);
         } else {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
                                REQ_RECORD_AUDIO);
@@ -617,7 +605,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (requestCode == REQ_RECORD_AUDIO) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            nativeSetMicEnabled(granted);
+            Native.nativeSetMicEnabled(granted);
         } else if (requestCode == REQ_CAMERA) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -646,9 +634,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceReady = true;
         // Same ordering guarantee as onResume: camera service settled before connect.
         applyCameraState();
-        nativeStop();
+        Native.nativeStop();
         applyConnectionConfig();
-        nativeStart(holder.getSurface());
+        Native.nativeStart(holder.getSurface(), this);
         pushRefreshRate();
         applyMicState();
         applyAudioLatency();
@@ -663,7 +651,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
-        nativeStop();
+        Native.nativeStop();
     }
 
     private void initHiddenInput() {
@@ -716,12 +704,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mMirror.length() > MIRROR_CAP) {
             mMirror.delete(0, mMirror.length() - MIRROR_CAP);
         }
-        nativeSendTextInput(text.getBytes(StandardCharsets.UTF_8));
+        Native.nativeSendTextInput(text.getBytes(StandardCharsets.UTF_8));
     }
 
     private void tapKey(int evdevCode) {
-        nativeSendKey(0, evdevCode);
-        nativeSendKey(1, evdevCode);
+        Native.nativeSendKey(0, evdevCode);
+        Native.nativeSendKey(1, evdevCode);
     }
 
     // Maps soft-keyboard characters to Android key codes so a bar modifier can be
@@ -891,9 +879,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return super.sendKeyEvent(event);
             }
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                nativeSendKey(0, evdev);
+                Native.nativeSendKey(0, evdev);
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                nativeSendKey(1, evdev);
+                Native.nativeSendKey(1, evdev);
                 // Keep the mirror consistent with a raw key edit. A backspace pops the
                 // tail; anything else (Enter, Tab, arrows, ...) moves the cursor or
                 // inserts content our tail-only model can't track, so drop the mirror
@@ -1014,9 +1002,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // scales with the parsed row count. Records the layout JSON it was built from.
     private void buildExtraKeysBar() {
         extraKeysBar = new ExtraKeysBar(this, new ExtraKeysBar.Sender() {
-            @Override public void key(int action, int evdev) { nativeSendKey(action, evdev); }
+            @Override public void key(int action, int evdev) { Native.nativeSendKey(action, evdev); }
             @Override public void text(String s) {
-                if (!s.isEmpty()) nativeSendTextInput(s.getBytes(StandardCharsets.UTF_8));
+                if (!s.isEmpty()) Native.nativeSendTextInput(s.getBytes(StandardCharsets.UTF_8));
             }
             // Tapping the ⌨ key keeps the original behaviour: toggle the system IME.
             @Override public void toggleKeyboard() { toggleSystemKeyboard(); }
@@ -1144,7 +1132,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                         (float)customScreenHeight / viewHeight : 1.0f;
         
-                nativeSendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
+                Native.nativeSendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
                                       event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
                                       event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
                 return true;
@@ -1153,9 +1141,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 float vScroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
                 float hScroll = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
                 if (vScroll != 0)
-                    nativeSendMouseScroll(0, -vScroll * 10);
+                    Native.nativeSendMouseScroll(0, -vScroll * 10);
                 if (hScroll != 0)
-                    nativeSendMouseScroll(1, hScroll * 10);
+                    Native.nativeSendMouseScroll(1, hScroll * 10);
                 return true;
             }
         }
@@ -1184,14 +1172,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         int scanCode = event.getScanCode();
         if (scanCode != 0) {
-            nativeSendKey(0, scanCode);
+            Native.nativeSendKey(0, scanCode);
             return true;
         }
 
         // fallback: when scancode is 0 (e.g. Fn key combos), map via KeyCodeMapper
         int evdev = KeyCodeMapper.getScanCode(keyCode);
         if (evdev != -1) {
-            nativeSendKey(0, evdev);
+            Native.nativeSendKey(0, evdev);
             return true;
         }
         return true;
@@ -1216,19 +1204,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int scanCode = event.getScanCode();
         if (scanCode != 0 && event.getKeyCode() == KeyEvent.KEYCODE_UNKNOWN) {
             // Some Fn combos deliver KEYCODE_UNKNOWN with a valid scancode
-            nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, scanCode);
+            Native.nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, scanCode);
             return true;
         }
 
         int evdev = KeyCodeMapper.getScanCode(event.getKeyCode());
         if (evdev != -1) {
-            nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, evdev);
+            Native.nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, evdev);
             return true;
         }
 
         // If both keyCode and scancode are unknown, store/replay raw scancode anyway
         if (scanCode != 0) {
-            nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, scanCode);
+            Native.nativeSendKey(event.getAction() == KeyEvent.ACTION_DOWN ? 0 : 1, scanCode);
             return true;
         }
         return true;
@@ -1243,14 +1231,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         int scanCode = event.getScanCode();
         if (scanCode != 0) {
-            nativeSendKey(1, scanCode);
+            Native.nativeSendKey(1, scanCode);
             return true;
         }
 
         // fallback: when scancode is 0, map via KeyCodeMapper
         int evdev = KeyCodeMapper.getScanCode(keyCode);
         if (evdev != -1) {
-            nativeSendKey(1, evdev);
+            Native.nativeSendKey(1, evdev);
             return true;
         }
         return true;
@@ -1296,14 +1284,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
             dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
         }
-        nativeSendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
+        Native.nativeSendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
 
         int currentBS = event.getButtonState();
         for (int[] btn : BUTTON_MAP) {
             boolean wasDown = (savedBS & btn[0]) != 0;
             boolean isDown  = (currentBS & btn[0]) != 0;
             if (wasDown != isDown)
-                nativeSendMouseButton(btn[1], isDown);
+                Native.nativeSendMouseButton(btn[1], isDown);
         }
         savedBS = currentBS;
         return true;
@@ -1314,9 +1302,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             float scrollX = event.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_X_DISTANCE);
             float scrollY = event.getAxisValue(MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE);
             if (scrollY != 0)
-                nativeSendMouseScroll(0, scrollY);
+                Native.nativeSendMouseScroll(0, scrollY);
             if (scrollX != 0)
-                nativeSendMouseScroll(1, -scrollX);
+                Native.nativeSendMouseScroll(1, -scrollX);
         }
         return true;
     }
@@ -1336,40 +1324,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         switch (action) {
             case MotionEvent.ACTION_DOWN:
             case MotionEvent.ACTION_POINTER_DOWN:
-                nativeSendTouch(0, 
+                Native.nativeSendTouch(0, 
                     event.getX(pointerIdx) * scaleX, 
                     event.getY(pointerIdx) * scaleY, 
                     pointerId);
-                nativeSendTouchFrame();
+                Native.nativeSendTouchFrame();
                 return true;
             
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_POINTER_UP:
-                nativeSendTouch(1, 
+                Native.nativeSendTouch(1, 
                     event.getX(pointerIdx) * scaleX, 
                     event.getY(pointerIdx) * scaleY, 
                     pointerId);
-                nativeSendTouchFrame();
+                Native.nativeSendTouchFrame();
                 return true;
             
             case MotionEvent.ACTION_MOVE:
                 for (int i = 0; i < event.getPointerCount(); i++) {
-                    nativeSendTouch(2, 
+                    Native.nativeSendTouch(2, 
                         event.getX(i) * scaleX, 
                         event.getY(i) * scaleY, 
                         event.getPointerId(i));
                 }
-                nativeSendTouchFrame();
+                Native.nativeSendTouchFrame();
                 return true;
             
             case MotionEvent.ACTION_CANCEL:
                 for (int i = 0; i < event.getPointerCount(); i++) {
-                    nativeSendTouch(1, 
+                    Native.nativeSendTouch(1, 
                         event.getX(i) * scaleX, 
                         event.getY(i) * scaleY, 
                         event.getPointerId(i));
                 }
-                nativeSendTouchFrame();
+                Native.nativeSendTouchFrame();
                 return true;
         }
         return false;
@@ -1402,7 +1390,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 isSingleTapCandidate = false;
                 isLongPressPossible = false;
                 if (currentState == STATE_DRAGGING) {
-                    nativeSendMouseButton(0x110, false);
+                    Native.nativeSendMouseButton(0x110, false);
                     isDraggingActive = false;
                 }
                 if (pointerCount == 2) {
@@ -1433,10 +1421,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         hasLongPressed = true;
                         currentState = STATE_DRAGGING;
                         isDraggingActive = true;
-                        nativeSendMouseButton(0x110, true);
+                        Native.nativeSendMouseButton(0x110, true);
                         mouseX = clamp(mouseX, 0, screenWidth);
                         mouseY = clamp(mouseY, 0, screenHeight);
-                        nativeSendMouseMotion(mouseX, mouseY, 0f, 0f);
+                        Native.nativeSendMouseMotion(mouseX, mouseY, 0f, 0f);
                         resetSmoothing();
                         break;
                     }
@@ -1460,7 +1448,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         float moveY = smoothDy * dynamicScale;
                         mouseX = clamp(mouseX + moveX, 0, screenWidth);
                         mouseY = clamp(mouseY + moveY, 0, screenHeight);
-                        nativeSendMouseMotion(mouseX, mouseY, 0f, 0f);
+                        Native.nativeSendMouseMotion(mouseX, mouseY, 0f, 0f);
                     }
 
                     lastX1 = x;
@@ -1478,10 +1466,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         if (Math.abs(avgDx) > 1 || Math.abs(avgDy) > 1) {
                             isTwoFingerTapCandidate = false;
                             if (Math.abs(avgDy) > Math.abs(avgDx) * 0.5) {
-                                nativeSendMouseScroll(0, -avgDy * 0.5f);
+                                Native.nativeSendMouseScroll(0, -avgDy * 0.5f);
                             }
                             if (Math.abs(avgDx) > Math.abs(avgDy) * 0.5) {
-                                nativeSendMouseScroll(1, avgDx * 0.5f);
+                                Native.nativeSendMouseScroll(1, avgDx * 0.5f);
                             }
                             lastX1 = x1;
                             lastY1 = y1;
@@ -1515,7 +1503,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 boolean isQuickTap = duration < 300;
 
                 if (isDraggingActive) {
-                    nativeSendMouseButton(0x110, false);
+                    Native.nativeSendMouseButton(0x110, false);
                     isDraggingActive = false;
                     resetTouchpadState();
                     resetSmoothing();
@@ -1523,8 +1511,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
 
                 if (isTwoFingerTapCandidate && isQuickTap) {
-                    nativeSendMouseButton(0x111, true);
-                    nativeSendMouseButton(0x111, false);
+                    Native.nativeSendMouseButton(0x111, true);
+                    Native.nativeSendMouseButton(0x111, false);
                     resetTouchpadState();
                     resetSmoothing();
                     return true;
@@ -1535,15 +1523,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     float dist = (float) Math.hypot(lastX1 - lastTapX, lastY1 - lastTapY);
                     if (gap < 300 && dist < touchSlop && !isDoubleTapPending) {
                         isDoubleTapPending = true;
-                        nativeSendMouseButton(0x110, true);
-                        nativeSendMouseButton(0x110, false);
-                        nativeSendMouseButton(0x110, true);
-                        nativeSendMouseButton(0x110, false);
+                        Native.nativeSendMouseButton(0x110, true);
+                        Native.nativeSendMouseButton(0x110, false);
+                        Native.nativeSendMouseButton(0x110, true);
+                        Native.nativeSendMouseButton(0x110, false);
                         isDoubleTapPending = false;
                         lastTapTime = 0;
                     } else {
-                        nativeSendMouseButton(0x110, true);
-                        nativeSendMouseButton(0x110, false);
+                        Native.nativeSendMouseButton(0x110, true);
+                        Native.nativeSendMouseButton(0x110, false);
                         lastTapTime = event.getEventTime();
                         lastTapX = lastX1;
                         lastTapY = lastY1;
@@ -1559,7 +1547,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             case MotionEvent.ACTION_CANCEL: {
                 if (isDraggingActive) {
-                    nativeSendMouseButton(0x110, false);
+                    Native.nativeSendMouseButton(0x110, false);
                     isDraggingActive = false;
                 }
                 resetTouchpadState();
