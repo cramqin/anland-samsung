@@ -32,7 +32,7 @@
 
 /* Saved JVM reference for event-thread JNI callbacks. Process-global (the JVM is);
  * the per-thread env is attached as needed. The activity callback target is
- * per-instance -> consumer_state.activity_obj. */
+ * per-instance -> consumer_state.clipboard_obj. */
 static JavaVM *g_jvm = NULL;
 
 /* ANativeWindow hidden-API function pointers: loaded once, read-only afterwards, so
@@ -85,6 +85,11 @@ struct consumer_state {
 
     /* Clipboard callback target: the Java object whose nativeSetClipboardText /
      * nativeClipListening / nativeClipboardSync the event thread calls (per-instance). */
+    jobject clipboard_obj;
+
+    /* Owning MainActivity: on_fallback() calls its onFallback() when the display lib
+     * drops the connection, so Java can probe the daemon socket and close the window
+     * if the daemon is gone (per-instance global ref). */
     jobject activity_obj;
 
     /* Per-instance audio bridge (own AAudio streams, own producer). */
@@ -211,7 +216,7 @@ static void *event_thread_func(void *arg)
     }
 
     /* Find classes/methods once */
-    jclass ctxClass = (*env)->GetObjectClass(env, s->activity_obj);
+    jclass ctxClass = (*env)->GetObjectClass(env, s->clipboard_obj);
     jmethodID setClipMethod = (*env)->GetMethodID(env, ctxClass, "nativeSetClipboardText", "(Ljava/lang/String;)V");
     if (!setClipMethod) {
         LOGE("event thread: nativeSetClipboardText not found");
@@ -244,7 +249,7 @@ static void *event_thread_func(void *arg)
                 buf[ev.clipboard.size] = '\0';
                 jstring jstr = (*env)->NewStringUTF(env, buf);
                 if (jstr) {
-                    (*env)->CallVoidMethod(env, s->activity_obj, setClipMethod, jstr);
+                    (*env)->CallVoidMethod(env, s->clipboard_obj, setClipMethod, jstr);
                     (*env)->DeleteLocalRef(env, jstr);
                 }
             }
@@ -481,7 +486,8 @@ static void on_fallback(void *userdata)
 
     audio_set_ctx(s->audio, NULL);   /* the lib has closed the audio fd; stop touching it */
 
-    // Disable clip listener on Java side before stopping event thread
+    /* Let the owning MainActivity probe the daemon socket and close the window if the
+     * daemon is gone. onFallback() marshals itself to the UI thread on the Java side. */
     if (g_jvm && s->activity_obj) {
         JNIEnv *env = NULL;
         bool attached = false;
@@ -491,9 +497,27 @@ static void on_fallback(void *userdata)
         }
         if (env) {
             jclass cls = (*env)->GetObjectClass(env, s->activity_obj);
+            jmethodID mid = (*env)->GetMethodID(env, cls, "onFallback", "()V");
+            if (mid)
+                (*env)->CallVoidMethod(env, s->activity_obj, mid);
+        }
+        if (attached)
+            (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+
+    // Disable clip listener on Java side before stopping event thread
+    if (g_jvm && s->clipboard_obj) {
+        JNIEnv *env = NULL;
+        bool attached = false;
+        if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+            if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == 0)
+                attached = true;
+        }
+        if (env) {
+            jclass cls = (*env)->GetObjectClass(env, s->clipboard_obj);
             jmethodID mid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
             if (mid)
-                (*env)->CallVoidMethod(env, s->activity_obj, mid, JNI_FALSE);
+                (*env)->CallVoidMethod(env, s->clipboard_obj, mid, JNI_FALSE);
         }
         if (attached)
             (*g_jvm)->DetachCurrentThread(g_jvm);
@@ -516,17 +540,17 @@ static void on_exit_fallback(void *userdata)
     }
 
     // Enable clip listener on Java side
-    jclass cls = (*env)->GetObjectClass(env, s->activity_obj);
+    jclass cls = (*env)->GetObjectClass(env, s->clipboard_obj);
     jmethodID listenMid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
     if (listenMid)
-        (*env)->CallVoidMethod(env, s->activity_obj, listenMid, JNI_TRUE);
+        (*env)->CallVoidMethod(env, s->clipboard_obj, listenMid, JNI_TRUE);
 
     start_event_thread(s);
 
     // Initial clipboard sync: read current system clipboard and send to producer
     jmethodID syncMethod = (*env)->GetMethodID(env, cls, "nativeClipboardSync", "()V");
     if (syncMethod)
-        (*env)->CallVoidMethod(env, s->activity_obj, syncMethod);
+        (*env)->CallVoidMethod(env, s->clipboard_obj, syncMethod);
 
     (*g_jvm)->DetachCurrentThread(g_jvm);
 }
@@ -662,16 +686,20 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
     s->audio = NULL;
     camera_release_client(s);   /* window gone: tear down its camera channels */
 
-    if (s->activity_obj && g_jvm) {
+    if (s->clipboard_obj && g_jvm) {
         JNIEnv *e = NULL;
         bool attached = false;
         if ((*g_jvm)->GetEnv(g_jvm, (void **)&e, JNI_VERSION_1_6) == JNI_EDETACHED)
             attached = ((*g_jvm)->AttachCurrentThread(g_jvm, &e, NULL) == 0);
-        if (e)
-            (*e)->DeleteGlobalRef(e, s->activity_obj);
+        if (e) {
+            (*e)->DeleteGlobalRef(e, s->clipboard_obj);
+            if (s->activity_obj)
+                (*e)->DeleteGlobalRef(e, s->activity_obj);
+        }
         if (attached)
             (*g_jvm)->DetachCurrentThread(g_jvm);
     }
+    s->activity_obj = NULL;
     pthread_mutex_destroy(&s->cfg_lock);
     pthread_mutex_destroy(&s->lock);
     LOGI("instance %p destroyed", (void *)s);
@@ -728,7 +756,8 @@ Java_com_anland_consumer_Native_nativeSetCustomResolution(
 
 JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeStart(
-    JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject callbackTarget)
+    JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
+    jobject activityTarget)
 {
     struct consumer_state *s = STATE(handle);
     if (!s)
@@ -774,13 +803,19 @@ Java_com_anland_consumer_Native_nativeStart(
     if (!g_jvm) {
         (*env)->GetJavaVM(env, &g_jvm);
     }
-    if (s->activity_obj) {
-        (*env)->DeleteGlobalRef(env, s->activity_obj);
+    if (s->clipboard_obj) {
+        (*env)->DeleteGlobalRef(env, s->clipboard_obj);
     }
     /* Static natives have no `thiz`; the Java layer passes the object whose
      * nativeSetClipboardText / nativeClipListening / nativeClipboardSync the
      * event thread calls back into (the Clipboard instance). */
-    s->activity_obj = (*env)->NewGlobalRef(env, callbackTarget);
+    s->clipboard_obj = (*env)->NewGlobalRef(env, clipboardTarget);
+
+    /* Owning MainActivity for the fallback callback (see on_fallback). */
+    if (s->activity_obj) {
+        (*env)->DeleteGlobalRef(env, s->activity_obj);
+    }
+    s->activity_obj = activityTarget ? (*env)->NewGlobalRef(env, activityTarget) : NULL;
 
     s->running = true;
     s->need_reconnect = true;
@@ -821,7 +856,7 @@ Java_com_anland_consumer_Native_nativeStop(
     }
 
     // Disable clip listener on Java side
-    if (g_jvm && s->activity_obj) {
+    if (g_jvm && s->clipboard_obj) {
         JNIEnv *env2 = NULL;
         bool attached = false;
         if ((*g_jvm)->GetEnv(g_jvm, (void **)&env2, JNI_VERSION_1_6) == JNI_EDETACHED) {
@@ -829,10 +864,10 @@ Java_com_anland_consumer_Native_nativeStop(
                 attached = true;
         }
         if (env2) {
-            jclass cls = (*env2)->GetObjectClass(env2, s->activity_obj);
+            jclass cls = (*env2)->GetObjectClass(env2, s->clipboard_obj);
             jmethodID mid = (*env2)->GetMethodID(env2, cls, "nativeClipListening", "(Z)V");
             if (mid)
-                (*env2)->CallVoidMethod(env2, s->activity_obj, mid, JNI_FALSE);
+                (*env2)->CallVoidMethod(env2, s->clipboard_obj, mid, JNI_FALSE);
         }
         if (attached)
             (*g_jvm)->DetachCurrentThread(g_jvm);

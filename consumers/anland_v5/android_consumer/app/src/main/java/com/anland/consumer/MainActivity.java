@@ -136,9 +136,29 @@ public class MainActivity extends Activity
             }
         };
 
+    // Called from native on_fallback (display lib dropped the connection). Runs on a
+    // native worker thread, so hop to the UI thread before touching the toast/finish.
+    // If the daemon socket is gone the daemon really went down, so close this window.
+    public void onFallback(){
+        runOnUiThread(() -> {
+            if (!isSocketFile(resolveSocketPath())) {
+                //exit
+                android.widget.Toast.makeText(this, "Deamon Down",
+                        android.widget.Toast.LENGTH_SHORT).show();
+                finish();
+            }
+        });
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (!isSocketFile(resolveSocketPath())) {
+            //exit
+            android.widget.Toast.makeText(this, "Deamon Down",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            finish();
+        }
         if (hasFocus) {
             // Become the accessibility-key target and the focused instance, so real
             // camera frames route to this window (others get blank frames).
@@ -187,15 +207,59 @@ public class MainActivity extends Activity
         return sock.trim();
     }
 
-    // True only when `path` exists and is a unix-domain socket. stat(2) both
-    // resolves existence and reports the file type, so a stale regular file / dir
-    // (or an unreadable / missing path -> ErrnoException) counts as "no socket".
-    private static boolean isSocketFile(String path) {
+    // Start (or restart) this window's native pipeline, but only if the daemon
+    // socket is still a live socket. The daemon can go down after launch, so
+    // re-check on every (re)connect; if it is gone, report it and exit the window.
+    private void startNative(android.view.Surface surface) {
+        if (!isSocketFile(resolveSocketPath())) {
+            android.widget.Toast.makeText(this, "Deamon Down",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            finish();
+            return;
+        }
+        mNative.start(surface, clipboard, this);
+    }
+
+    // True only when `path` exists and is a unix-domain socket. In root mode the
+    // daemon socket usually lives in a root-only location (e.g. /data/local/tmp),
+    // which this untrusted_app process cannot stat() directly -- a direct stat
+    // would EACCES and wrongly report "no socket". So when root mode is on we run
+    // the bundled helper as root (`su -c "<helper> <path> test"`) and read its
+    // exit code instead; otherwise we stat() locally.
+    private boolean isSocketFile(String path) {
+        boolean useRoot = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_USE_ROOT, true);
+        return useRoot ? isSocketFileRoot(path) : isSocketFileLocal(path);
+    }
+
+    // stat(2) both resolves existence and reports the file type, so a stale
+    // regular file / dir (or an unreadable / missing path -> ErrnoException)
+    // counts as "no socket".
+    private static boolean isSocketFileLocal(String path) {
         try {
             android.system.StructStat st = android.system.Os.stat(path);
             return android.system.OsConstants.S_ISSOCK(st.st_mode);
         } catch (android.system.ErrnoException e) {
             return false;
+        }
+    }
+
+    // Probe the socket from root context via the bundled helper's "test" mode.
+    // Exit 0 means the path exists and is a unix socket; anything else (including
+    // su being unavailable / denied, which throws) counts as "no socket".
+    private boolean isSocketFileRoot(String path) {
+        String helperPath = getApplicationInfo().nativeLibraryDir + "/libfdhelper.so";
+        Process p = null;
+        try {
+            p = new ProcessBuilder("su", "-c", helperPath + " " + path + " test")
+                    .redirectErrorStream(true)
+                    .start();
+            return p.waitFor() == 0;
+        } catch (Exception e) {
+            Log.w(TAG, "root socket probe failed: " + e);
+            return false;
+        } finally {
+            if (p != null) p.destroy();
         }
     }
 
@@ -501,7 +565,7 @@ public class MainActivity extends Activity
         if (surfaceReady) {
             mNative.stop();
             applyConnectionConfig();
-            mNative.start(surfaceView.getHolder().getSurface(), clipboard);
+            startNative(surfaceView.getHolder().getSurface());
             pushRefreshRate();
             applyMicState();
             applyAudioLatency();
@@ -641,7 +705,7 @@ public class MainActivity extends Activity
         applyCameraState();
         mNative.stop();
         applyConnectionConfig();
-        mNative.start(holder.getSurface(), clipboard);
+        startNative(holder.getSurface());
         pushRefreshRate();
         applyMicState();
         applyAudioLatency();

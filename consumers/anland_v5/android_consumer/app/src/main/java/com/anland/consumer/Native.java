@@ -35,7 +35,7 @@ public final class Native {
     public void configure(String socketPath, boolean useRoot, String helperPath, String bridgePath) {
         nativeConfigure(handle, socketPath, useRoot, helperPath, bridgePath);
     }
-    public void start(Surface surface, Object callbackTarget) { nativeStart(handle, surface, callbackTarget); }
+    public void start(Surface surface, Object clipboardTarget, Object activityTarget) { nativeStart(handle, surface, clipboardTarget, activityTarget); }
     public void stop() { nativeStop(handle); }
     /** Mark this instance focused: its camera client receives real frames, others blank. */
     public void setFocused(boolean focused) { nativeSetFocused(handle, focused); }
@@ -65,7 +65,10 @@ public final class Native {
     // calls back into (the Clipboard hosting nativeSetClipboardText /
     // nativeClipListening / nativeClipboardSync). It is stored per-instance as the
     // global ref used by the event thread's clipboard callbacks.
-    private static native void nativeStart(long handle, Surface surface, Object callbackTarget);
+    // activityTarget is the owning MainActivity; native calls its onFallback() when the
+    // display lib drops the connection (see on_fallback in native_consumer.c).
+    private static native void nativeStart(long handle, Surface surface, Object clipboardTarget,
+                                           Object activityTarget);
     private static native void nativeStop(long handle);
     private static native void nativeSetCustomResolution(long handle, int width, int height);
     private static native void nativeSendTouch(long handle, int action, float x, float y, int pointerId);
