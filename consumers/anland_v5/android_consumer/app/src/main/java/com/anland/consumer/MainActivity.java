@@ -187,6 +187,18 @@ public class MainActivity extends Activity
         return sock.trim();
     }
 
+    // True only when `path` exists and is a unix-domain socket. stat(2) both
+    // resolves existence and reports the file type, so a stale regular file / dir
+    // (or an unreadable / missing path -> ErrnoException) counts as "no socket".
+    private static boolean isSocketFile(String path) {
+        try {
+            android.system.StructStat st = android.system.Os.stat(path);
+            return android.system.OsConstants.S_ISSOCK(st.st_mode);
+        } catch (android.system.ErrnoException e) {
+            return false;
+        }
+    }
+
     // (Re)register this window under its current socket in sWindowsBySocket. A
     // window with no Intent override resolves its socket from the saved pref, which
     // the user can change in Settings, so re-key whenever it may have moved.
@@ -226,10 +238,11 @@ public class MainActivity extends Activity
             return;
         }
 
-        // The target socket must exist before we bring up any pipeline. If it does
-        // not: a parameter launch has nowhere to fall back to (toast and quit); a
-        // plain launcher start bounces to Settings so the user can fix the path.
-        if (!new java.io.File(resolveSocketPath()).exists()) {
+        // The target must exist AND be a unix-domain socket before we bring up any
+        // pipeline. If it is not: a parameter launch has nowhere to fall back to
+        // (toast and quit); a plain launcher start bounces to Settings so the user
+        // can fix the path.
+        if (!isSocketFile(resolveSocketPath())) {
             if (mSocketOverride != null) {
                 android.widget.Toast.makeText(this, "Socket Not Found",
                         android.widget.Toast.LENGTH_SHORT).show();
