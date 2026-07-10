@@ -86,9 +86,9 @@ static AAudioStream *open_stream(aaudio_direction_t dir, int channels)
         return NULL;
     }
     
-    // Fix crackling: Google recommends setting buffer size to 2 * burst size for low latency
-    int32_t burst = AAudioStream_getFramesPerBurst(stream);
-    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
+    // Fix crackling: Maximize the buffer size to absorb large PulseAudio packets without dropping frames!
+    int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
+    AAudioStream_setBufferSizeInFrames(stream, capacity);
 
     return stream;
 }
@@ -130,6 +130,7 @@ static void *play_thread_func(void *arg)
     LOGI("playback thread started");
 
     bool had_fd = false;   /* drives a one-shot format handshake per connection */
+    bool stream_paused = false;
 
     while (b->running) {
         int fd = current_fd(b);
@@ -153,15 +154,10 @@ static void *play_thread_func(void *arg)
 
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         if (poll(&pfd, 1, 200) <= 0) {
-            if (b->play) {
-                int16_t silence[1024 * 2] = {0};
-                aaudio_result_t res = AAudioStream_write(b->play, silence, 1024, 0);
-                if (res < 0 && res != -896 /* AAUDIO_ERROR_TIMEOUT */) {
-                    LOGI("AAudio playback stream died during silence (error %d), recovering...", (int)res);
-                    AAudioStream_close(b->play);
-                    b->play = open_stream(AAUDIO_DIRECTION_OUTPUT, b->play_channels);
-                    if (b->play) AAudioStream_requestStart(b->play);
-                }
+            if (b->play && !stream_paused) {
+                LOGI("No audio data, pausing AAudio stream to prevent underrun");
+                AAudioStream_requestPause(b->play);
+                stream_paused = true;
             }
             continue;
         }
@@ -186,15 +182,23 @@ static void *play_thread_func(void *arg)
             continue;
 
         if (!b->play) continue;
-        /* Blocking write with a short timeout: on underrun/overrun AAudio paces us;
-         * we never stall the loop longer than the timeout. */
+        if (stream_paused) {
+            LOGI("Audio data received, resuming AAudio stream");
+            AAudioStream_requestStart(b->play);
+            stream_paused = false;
+        }
+        
+        /* Blocking write with a larger timeout to absorb large PulseAudio chunks */
         aaudio_result_t res = AAudioStream_write(b->play, b->rx + sizeof(struct audio_msg), frames,
-                           20 * 1000 * 1000L);
+                           200 * 1000 * 1000L);
         if (res < 0 && res != -896 /* AAUDIO_ERROR_TIMEOUT */) {
             LOGI("AAudio playback stream died (error %d), recovering...", (int)res);
             AAudioStream_close(b->play);
             b->play = open_stream(AAUDIO_DIRECTION_OUTPUT, b->play_channels);
-            if (b->play) AAudioStream_requestStart(b->play);
+            if (b->play) {
+                AAudioStream_requestStart(b->play);
+                stream_paused = false;
+            }
         }
     }
 
