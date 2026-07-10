@@ -174,8 +174,8 @@ static void *play_thread_func(void *arg)
          * we never stall the loop longer than the timeout. */
         aaudio_result_t res = AAudioStream_write(b->play, b->rx + sizeof(struct audio_msg), frames,
                            20 * 1000 * 1000L);
-        if (res < 0 && res == AAUDIO_ERROR_DISCONNECTED) {
-            LOGI("AAudio playback disconnected, recovering...");
+        if (res < 0 && res != -896 /* AAUDIO_ERROR_TIMEOUT */) {
+            LOGI("AAudio playback stream died (error %d), recovering...", (int)res);
             AAudioStream_close(b->play);
             b->play = open_stream(AAUDIO_DIRECTION_OUTPUT, b->play_channels);
             if (b->play) AAudioStream_requestStart(b->play);
@@ -226,8 +226,8 @@ static void *cap_thread_func(void *arg)
 
         int32_t got = AAudioStream_read(b->rec, buf, mic_frames, 100 * 1000 * 1000L);
         if (got < 0) {
-            if (got == AAUDIO_ERROR_DISCONNECTED) {
-                LOGI("AAudio capture disconnected, recovering...");
+            if (got != -896 /* AAUDIO_ERROR_TIMEOUT */) {
+                LOGI("AAudio capture stream died (error %d), recovering...", (int)got);
                 AAudioStream_close(b->rec);
                 b->rec = open_stream(AAUDIO_DIRECTION_INPUT, b->cap_channels);
                 if (b->rec) {
