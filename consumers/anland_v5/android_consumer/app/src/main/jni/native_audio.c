@@ -85,6 +85,11 @@ static AAudioStream *open_stream(aaudio_direction_t dir, int channels)
              AAudio_convertResultToText(r));
         return NULL;
     }
+    
+    // Fix crackling: Google recommends setting buffer size to 2 * burst size for low latency
+    int32_t burst = AAudioStream_getFramesPerBurst(stream);
+    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
+
     return stream;
 }
 
