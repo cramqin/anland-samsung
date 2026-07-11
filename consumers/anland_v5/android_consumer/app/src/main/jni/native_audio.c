@@ -86,9 +86,11 @@ static AAudioStream *open_stream(aaudio_direction_t dir, int channels)
         return NULL;
     }
     
-    // Fix crackling: Maximize the buffer size to absorb large PulseAudio packets without dropping frames!
-    int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
-    AAudioStream_setBufferSizeInFrames(stream, capacity);
+    if (dir == AAUDIO_DIRECTION_OUTPUT) {
+        // Fix crackling: Maximize the buffer size to absorb large PulseAudio packets without dropping frames!
+        int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
+        AAudioStream_setBufferSizeInFrames(stream, capacity);
+    }
 
     return stream;
 }
