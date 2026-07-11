@@ -143,7 +143,7 @@ public class MainActivity extends Activity
         runOnUiThread(() -> {
             if (!isSocketFile(resolveSocketPath())) {
                 //exit
-                android.widget.Toast.makeText(this, "Deamon Down",
+                android.widget.Toast.makeText(this, "Daemon Down",
                         android.widget.Toast.LENGTH_SHORT).show();
                 finish();
             }
@@ -155,7 +155,7 @@ public class MainActivity extends Activity
         super.onWindowFocusChanged(hasFocus);
         if (!isSocketFile(resolveSocketPath())) {
             //exit
-            android.widget.Toast.makeText(this, "Deamon Down",
+            android.widget.Toast.makeText(this, "Daemon Down",
                     android.widget.Toast.LENGTH_SHORT).show();
             finish();
         }
@@ -212,7 +212,7 @@ public class MainActivity extends Activity
     // re-check on every (re)connect; if it is gone, report it and exit the window.
     private void startNative(android.view.Surface surface) {
         if (!isSocketFile(resolveSocketPath())) {
-            android.widget.Toast.makeText(this, "Deamon Down",
+            android.widget.Toast.makeText(this, "Daemon Down",
                     android.widget.Toast.LENGTH_SHORT).show();
             finish();
             return;
@@ -240,6 +240,11 @@ public class MainActivity extends Activity
             android.system.StructStat st = android.system.Os.stat(path);
             return android.system.OsConstants.S_ISSOCK(st.st_mode);
         } catch (android.system.ErrnoException e) {
+            // 权限不足（EACCES）时，假定 socket 存在（常见于容器/root 环境）
+            if (e.errno == android.system.OsConstants.EACCES) {
+                return true;
+            }
+            // 其他错误（如 ENOENT 文件不存在）按实际情况返回 false
             return false;
         }
     }
@@ -1125,5 +1130,4 @@ public class MainActivity extends Activity
         }
         return false;
     }
-
 }
