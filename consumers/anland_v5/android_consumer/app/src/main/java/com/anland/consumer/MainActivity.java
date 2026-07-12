@@ -703,17 +703,28 @@ public class MainActivity extends Activity
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i(TAG, "surfaceChanged: " + width + "x" + height);
+        
+        boolean wasReady = surfaceReady;
         viewWidth = width;
         viewHeight = height;
         surfaceReady = true;
+
         // Same ordering guarantee as onResume: camera service settled before connect.
         applyCameraState();
-        mNative.stop();
-        applyConnectionConfig();
-        startNative(holder.getSurface());
-        pushRefreshRate();
-        applyMicState();
-        applyAudioLatency();
+
+        if (wasReady) {
+            // If the surface was already ready, we are just resizing (e.g. Samsung DeX window resize).
+            // Update the resolution dynamically instead of doing a full stop/start.
+            mNative.updateResolution(width, height);
+        } else {
+            // First time setup or after surfaceDestroyed
+            mNative.stop();
+            applyConnectionConfig();
+            startNative(holder.getSurface());
+            pushRefreshRate();
+            applyMicState();
+            applyAudioLatency();
+        }
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         virtualTouchpad.onSurfaceChanged();
