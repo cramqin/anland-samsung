@@ -755,53 +755,6 @@ Java_com_anland_consumer_Native_nativeSetCustomResolution(
 }
 
 JNIEXPORT void JNICALL
-Java_com_anland_consumer_Native_nativeUpdateResolution(
-    JNIEnv* env, jclass clazz, jlong handle, jint width, jint height)
-{
-    struct consumer_state *s = STATE(handle);
-    if (!s)
-        return;
-
-    pthread_mutex_lock(&s->lock);
-    pthread_mutex_lock(&s->cfg_lock);
-    s->cfg_custom_width = width;
-    s->cfg_custom_height = height;
-    pthread_mutex_unlock(&s->cfg_lock);
-
-    if (s->running && s->ctx && s->window) {
-        // 1. Stop the render thread temporarily
-        s->running = false;
-        pthread_mutex_unlock(&s->lock);
-        pthread_join(s->render_thread, NULL);
-        pthread_mutex_lock(&s->lock);
-
-        s->screen_w = width;
-        s->screen_h = height;
-
-        // 2. Update buffers geometry
-        ANativeWindow_setBuffersGeometry(s->window, s->screen_w, s->screen_h,
-                                         AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
-        
-        // 3. Re-collect dmabufs at the new size
-        cleanup_dmabufs(s);
-        if (collect_dmabufs(s) == 0) {
-            // 4. Send new screen info and dmabufs to the compositor
-            set_screen_info(s->ctx, s->screen_w, s->screen_h,
-                            PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
-            push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
-            LOGI("dynamically updated resolution to %dx%d", width, height);
-        } else {
-            LOGE("failed to collect dmabufs after resize");
-        }
-
-        // 5. Restart the render thread
-        s->running = true;
-        pthread_create(&s->render_thread, NULL, render_thread_func, s);
-    }
-    pthread_mutex_unlock(&s->lock);
-}
-
-JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeStart(
     JNIEnv *env, jclass clazz, jlong handle, jobject surface, jobject clipboardTarget,
     jobject activityTarget)
