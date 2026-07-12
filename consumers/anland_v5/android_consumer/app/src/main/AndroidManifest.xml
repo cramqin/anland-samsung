@@ -38,6 +38,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:enableOnBackInvokedCallback="false"
+            android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:launchMode="singleTask"
             android:resizeableActivity="true">
@@ -57,6 +58,7 @@
             android:name=".SecondaryActivity"
             android:exported="true"
             android:enableOnBackInvokedCallback="false"
+            android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:launchMode="standard"
             android:documentLaunchMode="always"

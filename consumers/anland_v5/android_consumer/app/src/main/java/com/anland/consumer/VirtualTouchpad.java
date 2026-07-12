@@ -1,8 +1,10 @@
 package com.anland.consumer;
 
+import android.app.Activity;
 import android.content.Context;
 import android.graphics.Point;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
 
@@ -340,13 +342,38 @@ public final class VirtualTouchpad {
         return Math.max(min, Math.min(max, value));
     }
 
+    /**
+     * 更新屏幕尺寸：优先从 DecorView 获取实际可用尺寸，
+     * 若获取失败则回退到 Display 尺寸。
+     */
     private void updateScreenSize() {
-        Point size = new Point();
-        WindowManager wm = context.getSystemService(WindowManager.class);
-        if (wm != null) {
-            wm.getDefaultDisplay().getSize(size);
-            screenWidth = size.x;
-            screenHeight = size.y;
+        int w = 0, h = 0;
+
+        // 尝试从 Activity 的 DecorView 获取实际尺寸
+        if (context instanceof Activity) {
+            Activity activity = (Activity) context;
+            View decorView = activity.getWindow().getDecorView();
+            if (decorView != null) {
+                w = decorView.getWidth();
+                h = decorView.getHeight();
+            }
+        }
+
+        // 如果 DecorView 尚未测量（尺寸为 0），回退到 DisplayMetrics
+        if (w <= 0 || h <= 0) {
+            Point size = new Point();
+            WindowManager wm = context.getSystemService(WindowManager.class);
+            if (wm != null) {
+                wm.getDefaultDisplay().getSize(size);
+                w = size.x;
+                h = size.y;
+            }
+        }
+
+        // 若仍无效，保留上次值（或默认值）
+        if (w > 0 && h > 0) {
+            screenWidth = w;
+            screenHeight = h;
         }
     }
 }
