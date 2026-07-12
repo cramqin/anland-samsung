@@ -900,9 +900,19 @@ public class MainActivity extends Activity
                 float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                         (float)customScreenHeight / viewHeight : 1.0f;
         
-                mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
+                float dx = 0f;
+                float dy = 0f;
+                if (event.getHistorySize() > 0) {
+                    int last = event.getHistorySize() - 1;
+                    dx = (event.getX() - event.getHistoricalX(last))*scaleX;
+                    dy = (event.getY() - event.getHistoricalY(last))*scaleY;
+                } else {
+                    // If no history, we can't calculate delta here, so pass 0 and let native calculate it
+                    dx = 0f;
+                    dy = 0f;
+                }
+
+                mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY, dx, dy);
                 return true;
             }
             if (action == MotionEvent.ACTION_SCROLL) {
@@ -1048,8 +1058,12 @@ public class MainActivity extends Activity
         
         if (event.getHistorySize() > 0) {
             int last = event.getHistorySize() - 1;
-            dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
-            dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
+            dx = (event.getX() - event.getHistoricalX(last))*scaleX;
+            dy = (event.getY() - event.getHistoricalY(last))*scaleY;
+        } else {
+            // If no history, we can't calculate delta here, so pass 0 and let native calculate it
+            dx = 0f;
+            dy = 0f;
         }
         mNative.sendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
 
