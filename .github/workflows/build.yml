@@ -90,8 +90,28 @@ jobs:
           cp build_daemon_android/display_daemon magisk_module/
           chmod 755 magisk_module/display_daemon
 
+      - name: Zip Magisk module
+        run: |
+          cd magisk_module
+          zip -r ../anland-daemon.zip .
+
       - name: Upload Magisk module
         uses: actions/upload-artifact@v7
         with:
           name: anland-daemon
           path: magisk_module/
+
+      - name: Create Release and Upload Assets
+        if: github.ref == 'refs/heads/main'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: latest
+          name: "Latest Build"
+          body: "Automated build of the latest commit on main branch."
+          prerelease: true
+          artifacts: |
+            consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5.apk
+            consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5-landscape.apk
+            anland-daemon.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
