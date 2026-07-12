@@ -900,17 +900,9 @@ public class MainActivity extends Activity
                 float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                         (float)customScreenHeight / viewHeight : 1.0f;
         
-                float dx = 0f;
-                float dy = 0f;
-                if (event.getHistorySize() > 0) {
-                    int last = event.getHistorySize() - 1;
-                    dx = (event.getX() - event.getHistoricalX(last))*scaleX;
-                    dy = (event.getY() - event.getHistoricalY(last))*scaleY;
-                } else {
-                    // If no history, we can't calculate delta here, so pass 0 and let native calculate it
-                    dx = 0f;
-                    dy = 0f;
-                }
+                // Use AXIS_RELATIVE_X/Y for unaccelerated physical mouse movement
+                float dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX;
+                float dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY;
 
                 mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY, dx, dy);
                 return true;
@@ -1047,24 +1039,23 @@ public class MainActivity extends Activity
     }
 
     private boolean handleMouseEvent(MotionEvent event) {
-        float dx = 0f;
-        float dy = 0f;
-        
         // Масштабирование
         float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
                    (float)customScreenWidth / viewWidth : 1.0f;
         float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                    (float)customScreenHeight / viewHeight : 1.0f;
         
-        if (event.getHistorySize() > 0) {
+        // Use AXIS_RELATIVE_X/Y for unaccelerated physical mouse movement
+        float dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX;
+        float dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY;
+
+        // Fallback to history if AXIS_RELATIVE_X/Y are not populated (some older Android versions or virtual mice)
+        if (dx == 0f && dy == 0f && event.getHistorySize() > 0) {
             int last = event.getHistorySize() - 1;
-            dx = (event.getX() - event.getHistoricalX(last))*scaleX;
-            dy = (event.getY() - event.getHistoricalY(last))*scaleY;
-        } else {
-            // If no history, we can't calculate delta here, so pass 0 and let native calculate it
-            dx = 0f;
-            dy = 0f;
+            dx = (event.getX() - event.getHistoricalX(0, last)) * scaleX;
+            dy = (event.getY() - event.getHistoricalY(0, last)) * scaleY;
         }
+
         mNative.sendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
 
         int currentBS = event.getButtonState();
