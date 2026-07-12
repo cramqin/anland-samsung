@@ -944,6 +944,7 @@ Java_com_anland_consumer_Native_nativeSendMouseMotion(
     if (!s || !s->ctx)
         return;
 
+    // If dx/dy are not provided, calculate them from the last position
     if (dx == 0.0f && dy == 0.0f && s->motion_has_last) {
         dx = x - s->motion_last_x;
         dy = y - s->motion_last_y;

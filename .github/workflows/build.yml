@@ -5,6 +5,9 @@ on:
     branches: [ '**' ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,47 +29,57 @@ jobs:
       - name: Set NDK_DIR environment variable
         run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
 
-      - name: Generate debug keystore
+      - name: Setup Android Signing
         run: |
           mkdir -p $HOME/.android
-          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug, O=Android, C=US" -noprompt
-
-      - name: Inject debug signing for release
-        working-directory: consumers/anland_v5/android_consumer
-        run: |
-          echo "android.injected.signing.store.file=$HOME/.android/debug.keystore" >> gradle.properties
-          echo "android.injected.signing.store.password=android" >> gradle.properties
-          echo "android.injected.signing.key.alias=androiddebugkey" >> gradle.properties
-          echo "android.injected.signing.key.password=android" >> gradle.properties
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "Using repository release secrets for signing"
+            echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/release.keystore
+            echo "android.injected.signing.store.file=$HOME/.android/release.keystore" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.store.password=${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.key.alias=${{ secrets.RELEASE_KEY_ALIAS }}" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.key.password=${{ secrets.RELEASE_KEY_PASSWORD }}" >> consumers/anland_v5/android_consumer/gradle.properties
+          else
+            echo "No release secrets found, generating debug keystore"
+            keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug, O=Android, C=US" -noprompt
+            echo "android.injected.signing.store.file=$HOME/.android/debug.keystore" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.store.password=android" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.key.alias=androiddebugkey" >> consumers/anland_v5/android_consumer/gradle.properties
+            echo "android.injected.signing.key.password=android" >> consumers/anland_v5/android_consumer/gradle.properties
+          fi
 
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease
-          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/anland-v5.apk
+          cp app/build/outputs/apk/release/app-release.apk ../../../anland-v5.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
           name: anland-v5
-          path: consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5.apk
+          path: anland-v5.apk
 
       - name: Build APK (Landscape)
         working-directory: consumers/anland_v5/android_consumer
         run: |
+          # Save a copy of the original manifest
+          cp app/src/main/AndroidManifest.xml app/src/main/AndroidManifest.xml.bak
           sed -i 's/android:screenOrientation="fullSensor"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
           ./gradlew clean assembleRelease
-          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/anland-v5-landscape.apk
+          cp app/build/outputs/apk/release/app-release.apk ../../../anland-v5-landscape.apk
+          # Restore the original manifest so the build directory has the correct state
+          mv app/src/main/AndroidManifest.xml.bak app/src/main/AndroidManifest.xml
 
       - name: Upload APK (Landscape)
         uses: actions/upload-artifact@v7
         with:
           name: anland-v5-landscape
-          path: consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5-landscape.apk
+          path: anland-v5-landscape.apk
 
       - name: Configure CMake for Android
         run: |
@@ -84,8 +97,25 @@ jobs:
           cp build_daemon_android/display_daemon magisk_module/
           chmod 755 magisk_module/display_daemon
 
+      - name: Zip Magisk module
+        run: |
+          cd magisk_module
+          zip -r ../anland-daemon.zip .
+
       - name: Upload Magisk module
         uses: actions/upload-artifact@v7
         with:
           name: anland-daemon
           path: magisk_module/
+
+      - name: Create Release and Upload Assets
+        if: github.ref == 'refs/heads/main'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: latest
+          name: "Latest Build"
+          body: "Automated build of the latest commit on main branch."
+          prerelease: true
+          artifacts: "anland-v5.apk,anland-v5-landscape.apk,anland-daemon.zip"
+          token: ${{ secrets.GITHUB_TOKEN }}

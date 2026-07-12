@@ -85,6 +85,13 @@ static AAudioStream *open_stream(aaudio_direction_t dir, int channels)
              AAudio_convertResultToText(r));
         return NULL;
     }
+    
+    if (dir == AAUDIO_DIRECTION_OUTPUT) {
+        // Fix crackling: Maximize the buffer size to absorb large PulseAudio packets without dropping frames!
+        int32_t capacity = AAudioStream_getBufferCapacityInFrames(stream);
+        AAudioStream_setBufferSizeInFrames(stream, capacity);
+    }
+
     return stream;
 }
 
@@ -125,6 +132,7 @@ static void *play_thread_func(void *arg)
     LOGI("playback thread started");
 
     bool had_fd = false;   /* drives a one-shot format handshake per connection */
+    bool stream_paused = false;
 
     while (b->running) {
         int fd = current_fd(b);
@@ -147,8 +155,14 @@ static void *play_thread_func(void *arg)
         }
 
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
-        if (poll(&pfd, 1, 200) <= 0)
+        if (poll(&pfd, 1, 200) <= 0) {
+            if (b->play && !stream_paused) {
+                LOGI("No audio data, pausing AAudio stream to prevent underrun");
+                AAudioStream_requestPause(b->play);
+                stream_paused = true;
+            }
             continue;
+        }
         if (pfd.revents & (POLLHUP | POLLERR)) {
             usleep(20000);
             continue;
@@ -169,10 +183,25 @@ static void *play_thread_func(void *arg)
         if (frames <= 0)
             continue;
 
-        /* Blocking write with a short timeout: on underrun/overrun AAudio paces us;
-         * we never stall the loop longer than the timeout. */
-        AAudioStream_write(b->play, b->rx + sizeof(struct audio_msg), frames,
-                           20 * 1000 * 1000L);
+        if (!b->play) continue;
+        if (stream_paused) {
+            LOGI("Audio data received, resuming AAudio stream");
+            AAudioStream_requestStart(b->play);
+            stream_paused = false;
+        }
+        
+        /* Blocking write with a larger timeout to absorb large PulseAudio chunks */
+        aaudio_result_t res = AAudioStream_write(b->play, b->rx + sizeof(struct audio_msg), frames,
+                           200 * 1000 * 1000L);
+        if (res < 0 && res != -896 /* AAUDIO_ERROR_TIMEOUT */) {
+            LOGI("AAudio playback stream died (error %d), recovering...", (int)res);
+            AAudioStream_close(b->play);
+            b->play = open_stream(AAUDIO_DIRECTION_OUTPUT, b->play_channels);
+            if (b->play) {
+                AAudioStream_requestStart(b->play);
+                stream_paused = false;
+            }
+        }
     }
 
     LOGI("playback thread stopped");
@@ -218,7 +247,19 @@ static void *cap_thread_func(void *arg)
         }
 
         int32_t got = AAudioStream_read(b->rec, buf, mic_frames, 100 * 1000 * 1000L);
-        if (got <= 0)
+        if (got < 0) {
+            if (got != -896 /* AAUDIO_ERROR_TIMEOUT */) {
+                LOGI("AAudio capture stream died (error %d), recovering...", (int)got);
+                AAudioStream_close(b->rec);
+                b->rec = open_stream(AAUDIO_DIRECTION_INPUT, b->cap_channels);
+                if (b->rec) {
+                    AAudioStream_requestStart(b->rec);
+                    started = true;
+                }
+            }
+            continue;
+        }
+        if (got == 0)
             continue;
 
         uint32_t bytes = (uint32_t)got * sizeof(int16_t) * b->cap_channels;

@@ -164,6 +164,7 @@ public class MainActivity extends Activity
             // camera frames route to this window (others get blank frames).
             sInstance = this;
             if (mNative != null) mNative.setFocused(true);
+            savedBS = 0; // Reset button state when window gains focus
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
@@ -411,13 +412,14 @@ public class MainActivity extends Activity
         });
 
         setupFullscreen();
-        setupCursorHiding();
 
         // ===== 加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         virtualTouchpad = new VirtualTouchpad(this, mNative);
         virtualTouchpad.setAccelStrength(prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f));
+
+        setupCursorHiding();
 
         registerWindow();
     }
@@ -580,6 +582,7 @@ public class MainActivity extends Activity
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         virtualTouchpad.setAccelStrength(prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f));
+        savedBS = 0; // Reset button state to prevent stuck buttons
 
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
@@ -900,9 +903,29 @@ public class MainActivity extends Activity
                 float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                         (float)customScreenHeight / viewHeight : 1.0f;
         
-                mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
+                // Send historical points for smooth movement
+                int historySize = event.getHistorySize();
+                for (int h = 0; h < historySize; h++) {
+                    float hx = event.getHistoricalX(h) * scaleX;
+                    float hy = event.getHistoricalY(h) * scaleY;
+                    float hdx = 0.0f;
+                    float hdy = 0.0f;
+                    // Approximate historical relative movement
+                    if (h == 0) {
+                        hdx = hx - (event.getX() * scaleX - event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX);
+                        hdy = hy - (event.getY() * scaleY - event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY);
+                    } else {
+                        hdx = hx - (event.getHistoricalX(h - 1) * scaleX);
+                        hdy = hy - (event.getHistoricalY(h - 1) * scaleY);
+                    }
+                    mNative.sendMouseMotion(hx, hy, hdx, hdy);
+                }
+
+                // Use AXIS_RELATIVE_X/Y for unaccelerated physical mouse movement
+                float dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX;
+                float dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY;
+
+                mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY, dx, dy);
                 return true;
             }
             if (action == MotionEvent.ACTION_SCROLL) {
@@ -1027,31 +1050,50 @@ public class MainActivity extends Activity
     };
 
     private boolean isMouseEvent(MotionEvent event) {
-        int source = event.getSource();
-        if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
-            return false;
-        if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
-            return false;
         int toolType = event.getToolType(event.getActionIndex());
-        return toolType == MotionEvent.TOOL_TYPE_MOUSE
-            || toolType == MotionEvent.TOOL_TYPE_FINGER;
+        if (toolType == MotionEvent.TOOL_TYPE_MOUSE) return true;
+        
+        int source = event.getSource();
+        if ((source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) return true;
+        
+        return false;
     }
 
     private boolean handleMouseEvent(MotionEvent event) {
-        float dx = 0f;
-        float dy = 0f;
-        
         // Масштабирование
         float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
                    (float)customScreenWidth / viewWidth : 1.0f;
         float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                    (float)customScreenHeight / viewHeight : 1.0f;
         
-        if (event.getHistorySize() > 0) {
-            int last = event.getHistorySize() - 1;
-            dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
-            dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
+        // Send historical points for smooth movement
+        int historySize = event.getHistorySize();
+        for (int h = 0; h < historySize; h++) {
+            float hx = event.getHistoricalX(h) * scaleX;
+            float hy = event.getHistoricalY(h) * scaleY;
+            float hdx = 0.0f;
+            float hdy = 0.0f;
+            if (h == 0) {
+                hdx = hx - (event.getX() * scaleX - event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX);
+                hdy = hy - (event.getY() * scaleY - event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY);
+            } else {
+                hdx = hx - (event.getHistoricalX(h - 1) * scaleX);
+                hdy = hy - (event.getHistoricalY(h - 1) * scaleY);
+            }
+            mNative.sendMouseMotion(hx, hy, hdx, hdy);
         }
+
+        // Use AXIS_RELATIVE_X/Y for unaccelerated physical mouse movement
+        float dx = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X) * scaleX;
+        float dy = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) * scaleY;
+
+        // Fallback to history if AXIS_RELATIVE_X/Y are not populated (some older Android versions or virtual mice)
+        if (dx == 0f && dy == 0f && historySize > 0) {
+            int last = historySize - 1;
+            dx = (event.getX() - event.getHistoricalX(0, last)) * scaleX;
+            dy = (event.getY() - event.getHistoricalY(0, last)) * scaleY;
+        }
+
         mNative.sendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
 
         int currentBS = event.getButtonState();
