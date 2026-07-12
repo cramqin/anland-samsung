@@ -28,6 +28,7 @@ jobs:
 
       - name: Setup Android Signing
         run: |
+          mkdir -p $HOME/.android
           if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
             echo "Using repository release secrets for signing"
             echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/release.keystore
@@ -37,7 +38,6 @@ jobs:
             echo "android.injected.signing.key.password=${{ secrets.RELEASE_KEY_PASSWORD }}" >> consumers/anland_v5/android_consumer/gradle.properties
           else
             echo "No release secrets found, generating debug keystore"
-            mkdir -p $HOME/.android
             keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
               -storepass android -alias androiddebugkey -keypass android \
               -keyalg RSA -keysize 2048 -validity 10000 \
