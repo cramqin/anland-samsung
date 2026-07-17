@@ -55,19 +55,6 @@ jobs:
           name: anland-v5
           path: consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5.apk
 
-      - name: Build APK (Landscape)
-        working-directory: consumers/anland_v5/android_consumer
-        run: |
-          sed -i 's/android:screenOrientation="fullSensor"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
-          ./gradlew clean assembleRelease
-          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/anland-v5-landscape.apk
-
-      - name: Upload APK (Landscape)
-        uses: actions/upload-artifact@v7
-        with:
-          name: anland-v5-landscape
-          path: consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5-landscape.apk
-
       - name: Configure CMake for Android
         run: |
           cmake -S . -B build_daemon_android \
