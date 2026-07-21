@@ -68,6 +68,11 @@ struct consumer_state {
     // Event (output) thread
     pthread_t event_thread;
     volatile bool event_running;
+    /* True while event_thread holds a started-but-not-yet-joined thread. stop only
+     * signals (never joins -- on_fallback can run ON the event thread); the join is
+     * deferred to the next start_event_thread() (create time), which runs on the
+     * render thread and so cannot self-join. */
+    bool event_thread_joinable;
 
     /* Connection config, set from Java via nativeConfigure() and read on each
      * (re)connect in do_connect(). Guarded by cfg_lock. Per-instance. */
@@ -265,24 +270,38 @@ static void *event_thread_func(void *arg)
     return NULL;
 }
 
+static void join_event_thread(struct consumer_state *s)
+{
+    /* Idempotent. MUST be called only from a non-event thread (render / JNI teardown);
+     * never from on_fallback (which may run on the event thread). */
+    if (s->event_thread_joinable) {
+        pthread_join(s->event_thread, NULL);
+        s->event_thread_joinable = false;
+    }
+}
+
 static void start_event_thread(struct consumer_state *s)
 {
     if (s->event_running)
         return;
+    /* Reap the previous stopped-but-unjoined thread before spawning a new one. Runs on
+     * the render thread (on_exit_fallback), so this join can't self-deadlock. */
+    join_event_thread(s);
     s->event_running = true;
-    pthread_create(&s->event_thread, NULL, event_thread_func, s);
+    if (pthread_create(&s->event_thread, NULL, event_thread_func, s) == 0)
+        s->event_thread_joinable = true;
+    else
+        s->event_running = false;
 }
 
 static void stop_event_thread(struct consumer_state *s)
 {
-    if (!s->event_running)
-        return;
+    /* Signal only -- do NOT join here. enter_fallback()->on_fallback() can execute on
+     * the event thread itself, so joining would self-deadlock. The handle stays in
+     * event_thread (event_thread_joinable) and is reaped at create time by the next
+     * start_event_thread() (or do_connect's reconnect path, both on the render
+     * thread). */
     s->event_running = false;
-}
-
-static void join_event_thread(struct consumer_state *s)
-{
-    pthread_join(s->event_thread, NULL);
 }
 
 /*
@@ -851,6 +870,7 @@ Java_com_anland_consumer_Native_nativeStop(
 
     if (s->ctx) {
         stop_event_thread(s);
+        join_event_thread(s);
         disconnect(s->ctx);
         s->ctx = NULL;
     }

@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,27 @@ struct display_ctx {
     bool     fallback;
     bool     buffer_pending;
 
+    /* The display lib is called concurrently: the render thread (select_dmabuf /
+     * refresh_done / push_dmabufs), the event thread (poll_output_event /
+     * handle_resource_request) and JNI input threads (push_input_event*). Two locks
+     * with a fixed order (state_lock -> data_lock) tame the resulting races:
+     *   - state_lock guards `fallback`, every fd field, `shm_ptr` and `buffer_pending`
+     *     (i.e. the whole connection lifecycle mutated by enter_fallback).
+     *   - data_lock serialises concurrent WRITES to data_fd.
+     * Invariant: never call enter_fallback() or a user callback while holding either
+     * lock (they re-acquire / re-enter). */
+    pthread_mutex_t state_lock;
+    pthread_mutex_t data_lock;
+
+    /* Hot-path gate: data_fd writes only need data_lock while the producer may still
+     * request service fds (the two-part push_input_event_with_fds send is the only
+     * writer that can interleave with input events). Once every registered service's
+     * fds have gone out, no fd-carrying writer remains and input events go lockless.
+     * Monotonic true->false per session; a stale `true` read just takes a harmless
+     * extra lock, a `false` read is only reachable after the last fd write finished. */
+    volatile bool data_needs_lock;
+    uint32_t      services_sent_mask;
+
     int              stored_fds[MAX_BUFS];
     struct buf_info  stored_infos[MAX_BUFS];
     int              stored_count;
@@ -37,6 +59,17 @@ struct display_ctx {
     int             num_services;
     struct resources *resources;
 };
+
+/* (Re)arm the data_fd write gate for a fresh connected session: writers take
+ * data_lock until every service's fds have been sent. Callers either hold data_lock
+ * (enter_fallback) or run single-threaded at (re)connect (allocate_services,
+ * try_exit_fallback), so this needs no locking of its own. */
+static void arm_data_lock(struct display_ctx *ctx)
+{
+    ctx->services_sent_mask = 0;
+    ctx->data_needs_lock = (ctx->num_services > 0);
+}
+
 void allocate_services(struct display_ctx *ctx, struct service_info *services, int num_services){
     ctx->services = services;
     ctx->num_services = num_services;
@@ -51,6 +84,7 @@ void allocate_services(struct display_ctx *ctx, struct service_info *services, i
         ctx->resources[i].num = 0;
         ctx->resources[i].fds = NULL;
     }
+    arm_data_lock(ctx);
 }
 void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event, int* fds, int fd_count);
 void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event){
@@ -78,6 +112,18 @@ void handle_resource_request(struct display_ctx *ctx, struct OutputEvent *event)
     input_event.resource.type = service_type;
     input_event.resource.fdnum = ctx->resources[i].num;
     push_input_event_with_fds(ctx, &input_event, ctx->resources[i].fds, ctx->resources[i].num);
+
+    /* This service's fds are out. Once every service has been sent, no fd-carrying
+     * writer remains, so drop the data_fd write lock (input goes lockless). Update
+     * under data_lock so the flip-to-false lands after the fd send released it. */
+    if (!ctx->fallback && ctx->num_services > 0 && ctx->num_services < 32) {
+        pthread_mutex_lock(&ctx->data_lock);
+        ctx->services_sent_mask |= (1u << i);
+        uint32_t all = (1u << ctx->num_services) - 1u;
+        if ((ctx->services_sent_mask & all) == all)
+            ctx->data_needs_lock = false;
+        pthread_mutex_unlock(&ctx->data_lock);
+    }
 }
 void free_resources(struct display_ctx *ctx){//释放资源，保留服务信息
     for(int i=0;i<ctx->num_services;i++){
@@ -174,49 +220,78 @@ static int push_dmabufs_internal(display_ctx *ctx)
     return 0;
 }
 
+/* Self-contained fallback->active transition: safe to call from any thread/site (the
+ * state flip is under state_lock; only one caller wins). Currently driven by the
+ * render thread via select_dmabuf, but the locking keeps future call sites correct. */
 static bool try_exit_fallback(display_ctx *ctx)
 {
+    if (!ctx->fallback)
+        return false;
+
     struct pollfd pfd = { .fd = ctx->ctrl_fd, .events = POLLIN };
-    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-        struct ctrl_msg hdr;
-        if (recv_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) == 0 &&
-            hdr.type == CTRL_MSG_FDS_READY) {
-            ctx->fallback = false;
-            push_dmabufs_internal(ctx);
-            if (ctx->exit_fallback_cb){
-                ctx->exit_fallback_cb(ctx->exit_fallback_userdata);
-            }
-            return true;
-        }
+    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+        return false;
+
+    struct ctrl_msg hdr;
+    if (recv_all(ctx->ctrl_fd, &hdr, sizeof(hdr)) != 0 ||
+        hdr.type != CTRL_MSG_FDS_READY)
+        return false;
+
+    /* Publish the up-transition under state_lock so a concurrent enter_fallback (or a
+     * future try_exit_fallback from another site) sees a consistent fallback/arm state.
+     * The event thread is stopped while in fallback and only restarts in
+     * exit_fallback_cb below, so no handle_resource_request races the re-arm. */
+    pthread_mutex_lock(&ctx->state_lock);
+    bool won = ctx->fallback;
+    if (won) {
+        ctx->fallback = false;
+        arm_data_lock(ctx);
     }
-    return false;
+    pthread_mutex_unlock(&ctx->state_lock);
+    if (!won)
+        return false;
+
+    push_dmabufs_internal(ctx);   /* outside the lock: may enter_fallback on failure */
+    if (ctx->exit_fallback_cb)
+        ctx->exit_fallback_cb(ctx->exit_fallback_userdata);
+    return true;
 }
 
 static void enter_fallback(display_ctx *ctx)
 {
-    if (ctx->fallback)
+    /* Atomic test-and-set of `fallback` so two threads (render timeout + event/input
+     * send failure) can't both tear the connection down (double close/munmap/cb). */
+    pthread_mutex_lock(&ctx->state_lock);
+    if (ctx->fallback) {
+        pthread_mutex_unlock(&ctx->state_lock);
         return;
+    }
+    ctx->fallback = true;          /* set first: lockless hot-path writers bail early */
     free_resources(ctx);
-    ctx->fallback = true;
     ctx->buffer_pending = false;
 
-    if (ctx->data_fd >= 0)         { close(ctx->data_fd);         ctx->data_fd = -1; }
+    /* Fence out data_fd writers while the fds are closed and replaced. Null each
+     * pointer/fd before closing so a racing lockless writer reads -1 / NULL and fails
+     * benignly (EBADF) rather than writing into a reused fd. */
+    pthread_mutex_lock(&ctx->data_lock);
+    if (ctx->data_fd >= 0)         { int fd = ctx->data_fd; ctx->data_fd = -1; close(fd); }
     if (ctx->buf_ready_efd >= 0)   { close(ctx->buf_ready_efd);   ctx->buf_ready_efd = -1; }
     if (ctx->fence_fd >= 0)        { close(ctx->fence_fd);        ctx->fence_fd = -1; }
     if (ctx->audio_fd >= 0)        { close(ctx->audio_fd);        ctx->audio_fd = -1; }
-    if (ctx->shm_ptr) { munmap((void *)ctx->shm_ptr, sizeof(uint32_t)); ctx->shm_ptr = NULL; }
+    if (ctx->shm_ptr) { volatile uint32_t *p = ctx->shm_ptr; ctx->shm_ptr = NULL; munmap((void *)p, sizeof(uint32_t)); }
     if (ctx->shm_fd >= 0)         { close(ctx->shm_fd);           ctx->shm_fd = -1; }
 
     /* buf_ready_efd stays an eventfd (consumer->producer pacing signal); fence_fd is
      * (re)created as a socketpair inside send_hello_fds(). */
     ctx->buf_ready_efd = eventfd(0, EFD_CLOEXEC);
-    if (create_shm(ctx) < 0) {
-        if (ctx->fallback_cb)
-            ctx->fallback_cb(ctx->fallback_userdata);
-        return;
-    }
-    send_hello_fds(ctx);
+    bool shm_ok = (create_shm(ctx) == 0);
+    if (shm_ok)
+        send_hello_fds(ctx);
+    arm_data_lock(ctx);
+    pthread_mutex_unlock(&ctx->data_lock);
+    pthread_mutex_unlock(&ctx->state_lock);
 
+    /* User callback (JNI, stops the event thread) runs OUTSIDE both locks. */
     if (ctx->fallback_cb)
         ctx->fallback_cb(ctx->fallback_userdata);
 }
@@ -228,6 +303,9 @@ int connect_to_deamon_with_fd(display_ctx **out, int ctrl_fd)
     display_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         return -1;
+
+    pthread_mutex_init(&ctx->state_lock, NULL);
+    pthread_mutex_init(&ctx->data_lock, NULL);
 
     ctx->ctrl_fd = -1;
     ctx->data_fd = -1;
@@ -265,6 +343,8 @@ fail:
     if (ctx->buf_ready_efd >= 0)   close(ctx->buf_ready_efd);
     if (ctx->fence_fd >= 0)        close(ctx->fence_fd);
     if (ctx->audio_fd >= 0)        close(ctx->audio_fd);
+    pthread_mutex_destroy(&ctx->state_lock);
+    pthread_mutex_destroy(&ctx->data_lock);
     free(ctx);
     return -1;
 }
@@ -281,6 +361,8 @@ void disconnect(display_ctx *ctx)
     if (ctx->fence_fd >= 0)        close(ctx->fence_fd);
     if (ctx->audio_fd >= 0)        close(ctx->audio_fd);
     free_resources(ctx);
+    pthread_mutex_destroy(&ctx->state_lock);
+    pthread_mutex_destroy(&ctx->data_lock);
     free(ctx);
 }
 
@@ -316,7 +398,7 @@ int push_dmabufs(display_ctx *ctx, const int *fds, const struct buf_info *infos,
 int select_dmabuf(display_ctx *ctx, int idx)
 {
     if (ctx->fallback) {
-        try_exit_fallback(ctx);
+        try_exit_fallback(ctx);   /* holds state_lock internally for the transition */
         if (ctx->fallback)
             return 0;
     }
@@ -395,7 +477,18 @@ int push_input_event(display_ctx *ctx, const struct InputEvent *event)
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
 
-    if (send_all(ctx->data_fd, msg, sizeof(msg)) < 0) {
+    /* While the producer may still request service fds, serialise against the event
+     * thread's two-part fd send (push_input_event_with_fds); once all services are
+     * out, data_needs_lock clears and input goes lock-free (hot path). */
+    bool locked = ctx->data_needs_lock;
+    if (locked)
+        pthread_mutex_lock(&ctx->data_lock);
+    int fd = ctx->data_fd;
+    int r = (fd >= 0) ? send_all(fd, msg, sizeof(msg)) : -1;
+    if (locked)
+        pthread_mutex_unlock(&ctx->data_lock);
+
+    if (r < 0) {
         enter_fallback(ctx);
         return -1;
     }
@@ -407,17 +500,27 @@ int push_input_event_with_length(display_ctx *ctx, const struct InputEvent *even
         return 0;
 
     struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
-    uint8_t *msg = (uint8_t *)malloc(sizeof(struct data_msg) + sizeof(struct InputEvent) + size);
+    size_t total = sizeof(struct data_msg) + sizeof(struct InputEvent) + size;
+    uint8_t *msg = (uint8_t *)malloc(total);
+    if (!msg)
+        return -1;
     memcpy(msg, &hdr, sizeof(hdr));
     memcpy(msg + sizeof(hdr), event, sizeof(*event));
     memcpy(msg + sizeof(hdr) + sizeof(struct InputEvent), payload, size);
 
-    if (send_all(ctx->data_fd, msg, sizeof(struct data_msg) + sizeof(struct InputEvent) + size) < 0) {
-        free(msg);
+    bool locked = ctx->data_needs_lock;
+    if (locked)
+        pthread_mutex_lock(&ctx->data_lock);
+    int fd = ctx->data_fd;
+    int r = (fd >= 0) ? send_all(fd, msg, total) : -1;
+    if (locked)
+        pthread_mutex_unlock(&ctx->data_lock);
+
+    free(msg);
+    if (r < 0) {
         enter_fallback(ctx);
         return -1;
     }
-    free(msg);
     return 0;
 }
 int poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_ms)
@@ -517,9 +620,24 @@ void push_input_event_with_fds(display_ctx *ctx, const struct InputEvent *event,
     if (ctx->fallback)
         return;
 
-    push_input_event(ctx, event);
-    if (fd_count > 0) {
-        struct data_msg hdr = { .type = DATA_MSG_INPUT_EXTEND_FDS, .size = 0 };
-        send_fds(ctx->data_fd, &hdr, sizeof(hdr), fds, fd_count);
+    /* This is the ONLY fd-carrying writer, and it is two framed sends (RESOURCE event
+     * + EXTEND_FDS ancillary). Hold data_lock across BOTH so a concurrent input write
+     * can't wedge between them and desync the producer's framed stream. Sent inline
+     * here (not via push_input_event) to avoid re-locking data_lock. */
+    struct data_msg hdr = { .type = DATA_MSG_INPUT_EVENT, .size = sizeof(struct InputEvent) };
+    uint8_t msg[sizeof(struct data_msg) + sizeof(struct InputEvent)];
+    memcpy(msg, &hdr, sizeof(hdr));
+    memcpy(msg + sizeof(hdr), event, sizeof(*event));
+
+    pthread_mutex_lock(&ctx->data_lock);
+    int fd = ctx->data_fd;
+    bool ok = (fd >= 0) && send_all(fd, msg, sizeof(msg)) == 0;
+    if (ok && fd_count > 0) {
+        struct data_msg fhdr = { .type = DATA_MSG_INPUT_EXTEND_FDS, .size = 0 };
+        ok = send_fds(fd, &fhdr, sizeof(fhdr), fds, fd_count) >= 0;
     }
+    pthread_mutex_unlock(&ctx->data_lock);
+
+    if (!ok)
+        enter_fallback(ctx);   /* outside the lock */
 }

@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history so `git rev-list --count HEAD` yields the real commit
+          # count for versionCode (shallow checkout would make it always 1).
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -35,27 +39,31 @@ jobs:
           if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
             echo "Using repository release secrets for signing"
             echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/release.keystore
-            echo "android.injected.signing.store.file=$HOME/.android/release.keystore" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.store.password=${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.key.alias=${{ secrets.RELEASE_KEY_ALIAS }}" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.key.password=${{ secrets.RELEASE_KEY_PASSWORD }}" >> consumers/anland_v5/android_consumer/gradle.properties
           else
             echo "No release secrets found, generating debug keystore"
             keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
               -storepass android -alias androiddebugkey -keypass android \
               -keyalg RSA -keysize 2048 -validity 10000 \
               -dname "CN=Android Debug, O=Android, C=US" -noprompt
-            echo "android.injected.signing.store.file=$HOME/.android/debug.keystore" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.store.password=android" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.key.alias=androiddebugkey" >> consumers/anland_v5/android_consumer/gradle.properties
-            echo "android.injected.signing.key.password=android" >> consumers/anland_v5/android_consumer/gradle.properties
           fi
 
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/release.keystore" \
+              -Pandroid.injected.signing.store.password="${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" \
+              -Pandroid.injected.signing.key.alias="${{ secrets.RELEASE_KEY_ALIAS }}" \
+              -Pandroid.injected.signing.key.password="${{ secrets.RELEASE_KEY_PASSWORD }}"
+          else
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+              -Pandroid.injected.signing.store.password=android \
+              -Pandroid.injected.signing.key.alias=androiddebugkey \
+              -Pandroid.injected.signing.key.password=android
+          fi
           cp app/build/outputs/apk/release/app-release.apk ../../../anland-v5.apk
 
       - name: Upload APK

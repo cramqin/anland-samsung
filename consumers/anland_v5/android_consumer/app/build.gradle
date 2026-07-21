@@ -40,7 +40,7 @@ android {
         minSdk 30
         targetSdk 36
         versionCode gitCommitCount
-        versionName "5.14-${gitCommitId}${gitDirty}"
+        versionName "5.15-${gitCommitId}${gitDirty}"
 
         ndk {
             abiFilters 'arm64-v8a'
