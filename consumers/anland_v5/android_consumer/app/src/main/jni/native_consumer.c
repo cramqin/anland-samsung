@@ -870,6 +870,7 @@ Java_com_anland_consumer_Native_nativeStop(
 
     if (s->ctx) {
         stop_event_thread(s);
+        join_event_thread(s);
         disconnect(s->ctx);
         s->ctx = NULL;
     }
