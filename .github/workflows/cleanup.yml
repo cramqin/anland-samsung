@@ -1,0 +1,65 @@
+name: Cleanup Old Runs and Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      retain_runs:
+        description: 'Number of workflow runs to retain (0 or blank to delete all)'
+        required: false
+        default: '1'
+      retain_releases:
+        description: 'Number of releases to retain (0 or blank to delete all)'
+        required: false
+        default: '1'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cleanup Workflow Runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RETAIN: ${{ github.event.inputs.retain_runs }}
+        run: |
+          # Get all run IDs, excluding the current one
+          current_run_id=${{ github.run_id }}
+          runs=$(gh run list --limit 100 --json databaseId -q '.[].databaseId' | grep -v "$current_run_id")
+          
+          retain=${RETAIN:-1}
+          if [ "$retain" -le 0 ]; then
+            to_delete=$runs
+          else
+            to_delete=$(echo "$runs" | tail -n +$((retain + 1)))
+          fi
+          
+          for id in $to_delete; do
+            echo "Deleting run $id"
+            gh run delete "$id"
+          done
+
+      - name: Cleanup Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RETAIN: ${{ github.event.inputs.retain_releases }}
+        run: |
+          # Get all release tags
+          releases=$(gh release list --limit 100 --json tagName -q '.[].tagName')
+          
+          retain=${RETAIN:-1}
+          if [ "$retain" -le 0 ]; then
+            to_delete=$releases
+          else
+            to_delete=$(echo "$releases" | tail -n +$((retain + 1)))
+          fi
+          
+          for tag in $to_delete; do
+            echo "Deleting release $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done

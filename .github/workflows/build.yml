@@ -5,18 +5,21 @@ on:
     branches: [ '**' ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           # Full history so `git rev-list --count HEAD` yields the real commit
           # count for versionCode (shallow checkout would make it always 1).
           fetch-depth: 0
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -30,33 +33,63 @@ jobs:
       - name: Set NDK_DIR environment variable
         run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
 
-      - name: Generate debug keystore
+      - name: Setup Android Signing
         run: |
           mkdir -p $HOME/.android
-          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug, O=Android, C=US" -noprompt
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "Using repository release secrets for signing"
+            echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/release.keystore
+          else
+            echo "No release secrets found, generating debug keystore"
+            keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug, O=Android, C=US" -noprompt
+          fi
 
       - name: Build APK
         working-directory: consumers/anland_v5/android_consumer
         run: |
           chmod +x gradlew
-          # Pass debug signing as project properties on the command line instead of
-          # appending to the tracked gradle.properties, which would dirty the working
-          # tree and make the git-derived versionName ("...-dirty") wrong on CI.
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
-            -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
-          cp app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/anland-v5.apk
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/release.keystore" \
+              -Pandroid.injected.signing.store.password="${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" \
+              -Pandroid.injected.signing.key.alias="${{ secrets.RELEASE_KEY_ALIAS }}" \
+              -Pandroid.injected.signing.key.password="${{ secrets.RELEASE_KEY_PASSWORD }}"
+          else
+            ./gradlew assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+              -Pandroid.injected.signing.store.password=android \
+              -Pandroid.injected.signing.key.alias=androiddebugkey \
+              -Pandroid.injected.signing.key.password=android
+          fi
+          APK_FILE=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          cp "$APK_FILE" ../../../anland-v5.apk
 
       - name: Upload APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: anland-v5
-          path: consumers/anland_v5/android_consumer/app/build/outputs/apk/release/anland-v5.apk
+          path: anland-v5.apk
+
+      - name: Build APK (Landscape)
+        working-directory: consumers/anland_v5/android_consumer
+        run: |
+          # Save a copy of the original manifest
+          cp app/src/main/AndroidManifest.xml app/src/main/AndroidManifest.xml.bak
+          sed -i 's/android:screenOrientation="fullSensor"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
+          ./gradlew clean assembleRelease
+          APK_FILE=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          cp "$APK_FILE" ../../../anland-v5-landscape.apk
+          # Restore the original manifest so the build directory has the correct state
+          mv app/src/main/AndroidManifest.xml.bak app/src/main/AndroidManifest.xml
+
+      - name: Upload APK (Landscape)
+        uses: actions/upload-artifact@v4
+        with:
+          name: anland-v5-landscape
+          path: anland-v5-landscape.apk
 
       - name: Configure CMake for Android
         run: |
@@ -74,8 +107,25 @@ jobs:
           cp build_daemon_android/display_daemon magisk_module/
           chmod 755 magisk_module/display_daemon
 
+      - name: Zip Magisk module
+        run: |
+          cd magisk_module
+          zip -r ../anland-daemon.zip .
+
       - name: Upload Magisk module
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: anland-daemon
           path: magisk_module/
+
+      - name: Create Release and Upload Assets
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: latest
+          name: "Latest Build"
+          body: "Automated build of the latest commit on main branch."
+          prerelease: true
+          artifacts: "anland-v5.apk,anland-v5-landscape.apk,anland-daemon.zip"
+          token: ${{ secrets.GITHUB_TOKEN }}

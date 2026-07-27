@@ -1,22 +1,10 @@
 name: Build Daemon and Magisk Module
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-        - '.github/workflows/build_daemon.yml'
-        - 'daemon/**'
-        - 'magisk_module/**'
-  pull_request:
-    branches: [ main ]
-    paths:
-        - '.github/workflows/build_daemon.yml'
-        - 'daemon/**'
-        - 'magisk_module/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -24,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
@@ -51,8 +39,24 @@ jobs:
           cp build_daemon_android/display_daemon magisk_module/
           chmod 755 magisk_module/display_daemon
 
+      - name: Zip Magisk module
+        run: |
+          cd magisk_module
+          zip -r ../anland-daemon.zip .
+
       - name: Upload Magisk module
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: anland-daemon
-          path: magisk_module/
+          path: anland-daemon.zip
+
+      - name: Create Release and Upload Daemon Module
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: latest
+          name: "Latest Build"
+          body: "Automated build of Daemon and Magisk Module."
+          prerelease: true
+          artifacts: "anland-daemon.zip"
+          token: ${{ secrets.GITHUB_TOKEN }}

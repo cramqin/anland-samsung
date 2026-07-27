@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -14,7 +14,6 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        # Full history so versionCode (git commit count) isn't stuck at 1.
         fetch-depth: 0
 
     - name: Set up JDK 17
@@ -23,15 +22,58 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
         
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
-      
-    - name: Build with Gradle
-      run: ./gradlew assembleDebug
+    - name: Setup Android SDK and NDK
+      uses: android-actions/setup-android@v4
+      with:
+        packages: "platform-tools build-tools;34.0.0 ndk;29.0.13113456"
+        accept-android-sdk-licenses: true
+
+    - name: Setup Android Signing
+      run: |
+        mkdir -p $HOME/.android
+        if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+          echo "Using repository release secrets for signing"
+          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > $HOME/.android/release.keystore
+        else
+          echo "No release secrets found, generating debug keystore"
+          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug, O=Android, C=US" -noprompt
+        fi
+
+    - name: Build APK
       working-directory: consumers/anland_v5/android_consumer
-      
+      run: |
+        chmod +x gradlew
+        if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$HOME/.android/release.keystore" \
+            -Pandroid.injected.signing.store.password="${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.RELEASE_KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.RELEASE_KEY_PASSWORD }}"
+        else
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android
+        fi
+        cp app/build/outputs/apk/release/app-release.apk ../../../anland-v5.apk || cp $(find app/build/outputs/apk/ -name "*.apk" | head -n 1) ../../../anland-v5.apk
+
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: app-debug
-        path: consumers/anland_v5/android_consumer/app/build/outputs/apk/debug/app-debug.apk
+        name: anland-v5
+        path: anland-v5.apk
+
+    - name: Create Release and Upload APK
+      uses: ncipollo/release-action@v1
+      with:
+        allowUpdates: true
+        tag: latest
+        name: "Latest Build"
+        body: "Automated build of Android APK."
+        prerelease: true
+        artifacts: "anland-v5.apk"
+        token: ${{ secrets.GITHUB_TOKEN }}
