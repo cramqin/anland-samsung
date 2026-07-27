@@ -68,6 +68,7 @@
     <string name="touchpad_mode_switch">Touchpad Mode (relative movement)</string>
     <string name="touchpad_hint">ON: finger slides move mouse cursor (relative). OFF: touch maps directly to screen (absolute).</string>
     <string name="mouse_sensitivity_label">Mouse Sensitivity (Acceleration)</string>
+    <string name="mouse_sensitivity_hint">Applies to Touchpad / Touch Gesture Mode only. Physical hardware mouse speed is controlled by Samsung system pointer settings / mouse DPI.</string>
     <string name="mouse_accel_value">%1$.1fx</string>
 
     <!-- Connection -->

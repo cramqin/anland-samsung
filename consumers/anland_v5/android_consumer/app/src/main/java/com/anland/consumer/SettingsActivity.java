@@ -629,6 +629,14 @@ public class SettingsActivity extends Activity {
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
         accelLayout.addView(accelSeek);
+
+        TextView accelHint = new TextView(this);
+        accelHint.setText(R.string.mouse_sensitivity_hint);
+        accelHint.setTextSize(12);
+        accelHint.setTextColor(Color.GRAY);
+        accelHint.setPadding(0, dp(4), 0, dp(8));
+        accelLayout.addView(accelHint);
+
         root.addView(accelLayout);
     }
 

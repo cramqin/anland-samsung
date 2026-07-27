@@ -9,6 +9,7 @@
    - Implemented direct hover event handling (`ACTION_HOVER_MOVE`) in Samsung DeX mode, allowing free physical mouse movement without requiring touch long-presses to drag.
    - Integrated an Exponential Moving Average (EMA) smoothing filter into physical mouse event processing to eliminate hand micro-vibrations and VSYNC frame jitter.
    - Synchronized floating-point relative deltas `(dx, dy)` directly with absolute screen coordinates `(x, y)`, ensuring KWin / Wayland input engines receive 100% harmonious pointer movement without velocity conflicts.
+   - *Note on Mouse Sensitivity*: Physical mouse speed follows Samsung system pointer speed / mouse DPI settings with 1:1 hardware coordinate mapping. The in-app Mouse Sensitivity slider configures Touchpad / Touch Gesture Mode scaling.
 
 2. **Pixel-Perfect 1:1 Samsung DeX Cursor Alignment**:
    - **DeX Windowed Mode**: Dynamically queries system window caption insets using `WindowInsets.Type.captionBar()` to offset the Samsung DeX window title bar header, guaranteeing 1:1 cursor alignment right up to the top window edge ($Y = 0$).

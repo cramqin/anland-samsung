@@ -68,7 +68,8 @@
     <string name="touchpad_mode_switch">触摸板模式（相对移动）</string>
     <string name="touchpad_hint">开启：手指滑动移动鼠标光标（相对）。关闭：触摸直接映射到屏幕（绝对）。</string>
     <string name="mouse_sensitivity_label">鼠标灵敏度（加速度）</string>
-    <string name="mouse_accel_value">%1$.1f 倍</string>
+    <string name="mouse_sensitivity_hint">仅适用于触摸板/触摸手势模式。物理鼠标的速度由系统指针设置/鼠标 DPI 控制。</string>
+    <string name="mouse_accel_value">%1$.1fx</string>
 
     <!-- Connection -->
     <string name="socket_path_label">守护进程套接字路径</string>
