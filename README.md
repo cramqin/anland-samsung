@@ -1,3 +1,24 @@
+# Anland (Samsung Devices Fork)
+
+> **Notice**: This repository is a fork of [`anland`](https://github.com/superturtlee/anland) created by **superturtlee**.
+> This fork specifically focuses on optimizing performance, input precision, audio playback, and display hardware interaction for **Samsung devices** (tested and verified on **Samsung Galaxy S23+ `SM-S916B` running One UI 8.5**).
+
+### Key Enhancements & Device Fixes
+
+1. **Butter-Smooth Mouse Motion & Direct DeX Hover Movement**:
+   - Implemented direct hover event handling (`ACTION_HOVER_MOVE`) in Samsung DeX mode, allowing free physical mouse movement without requiring touch long-presses to drag.
+   - Integrated an Exponential Moving Average (EMA) smoothing filter into physical mouse event processing to eliminate hand micro-vibrations and VSYNC frame jitter.
+   - Synchronized floating-point relative deltas `(dx, dy)` directly with absolute screen coordinates `(x, y)`, ensuring KWin / Wayland input engines receive 100% harmonious pointer movement without velocity conflicts.
+
+2. **Pixel-Perfect 1:1 Samsung DeX Cursor Alignment**:
+   - **DeX Windowed Mode**: Dynamically queries system window caption insets using `WindowInsets.Type.captionBar()` to offset the Samsung DeX window title bar header, guaranteeing 1:1 cursor alignment right up to the top window edge ($Y = 0$).
+   - **DeX Full Screen & Non-DeX Modes**: Preserves true native 1:1 coordinate mapping across full-screen Samsung DeX desktop mode, mirrored mode, and tablet/phone displays.
+
+3. **Native Samsung Audio Consumer Synchronization**:
+   - Fixed AAudio / OpenSL buffer queue handling and channel configuration for reliable low-latency audio streaming on Samsung hardware.
+
+---
+
 # Anland Display Protocol V3
 
 > A buffer‑sharing protocol that lets a Linux compositor (KWin / Weston) render its

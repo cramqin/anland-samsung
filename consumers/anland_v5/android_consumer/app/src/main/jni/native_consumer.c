@@ -964,9 +964,14 @@ Java_com_anland_consumer_Native_nativeSendMouseMotion(
     if (!s || !s->ctx)
         return;
 
-    if (dx == 0.0f && dy == 0.0f && s->motion_has_last) {
-        dx = x - s->motion_last_x;
-        dy = y - s->motion_last_y;
+    // Independently calculate dx and dy fallback if not provided to prevent diagonal motion jitter
+    if (s->motion_has_last) {
+        if (dx == 0.0f && x != s->motion_last_x) {
+            dx = x - s->motion_last_x;
+        }
+        if (dy == 0.0f && y != s->motion_last_y) {
+            dy = y - s->motion_last_y;
+        }
     }
 
     s->motion_last_x = x;

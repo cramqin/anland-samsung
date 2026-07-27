@@ -166,6 +166,7 @@ public class MainActivity extends Activity
             // camera frames route to this window (others get blank frames).
             sInstance = this;
             if (mNative != null) mNative.setFocused(true);
+            savedBS = 0; // Reset button state when window gains focus
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
@@ -410,13 +411,14 @@ public class MainActivity extends Activity
         });
 
         setupFullscreen();
-        setupCursorHiding();
 
         // ===== 加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         virtualTouchpad = new VirtualTouchpad(this, mNative);
         virtualTouchpad.setAccelStrength(prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f));
+
+        setupCursorHiding();
 
         registerWindow();
     }
@@ -579,6 +581,7 @@ public class MainActivity extends Activity
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         virtualTouchpad.setAccelStrength(prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f));
+        savedBS = 0; // Reset button state to prevent stuck buttons
 
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
@@ -913,21 +916,99 @@ public class MainActivity extends Activity
         return handleTouchEvent(event);
     }
 
+    private float mMouseSmoothX = 0f;
+    private float mMouseSmoothY = 0f;
+    private boolean mMouseSmoothInit = false;
+
+    private void sendSmoothMouseMotion(float rawX, float rawY) {
+        float targetX = getScaledX(rawX);
+        float targetY = getScaledY(rawY);
+
+        if (!mMouseSmoothInit) {
+            mMouseSmoothX = targetX;
+            mMouseSmoothY = targetY;
+            mMouseSmoothInit = true;
+        } else {
+            // EMA smooth factor (matching VirtualTouchpad for butter-smooth physical mouse movement)
+            mMouseSmoothX = 0.4f * targetX + 0.6f * mMouseSmoothX;
+            mMouseSmoothY = 0.4f * targetY + 0.6f * mMouseSmoothY;
+        }
+
+        mNative.sendMouseMotion(mMouseSmoothX, mMouseSmoothY, 0f, 0f);
+    }
+
+    private float getScaledX(float rawX) {
+        if (viewWidth <= 0) return rawX;
+        if (customScreenWidth <= 0) return Math.max(0.0f, rawX);
+
+        float videoAspect = (customScreenHeight > 0) ? (float) customScreenWidth / customScreenHeight : (16.0f / 9.0f);
+        float viewAspect = (viewHeight > 0) ? (float) viewWidth / viewHeight : videoAspect;
+        
+        float renderW = viewWidth;
+        float offsetX = 0.0f;
+        
+        if (viewAspect > videoAspect) {
+            renderW = viewHeight * videoAspect;
+            offsetX = (viewWidth - renderW) / 2.0f;
+        }
+        
+        float scaleX = (float) customScreenWidth / renderW;
+        float x = Math.max(0.0f, (rawX - offsetX) * scaleX);
+        return Math.min(x, (float) customScreenWidth - 0.001f);
+    }
+
+    private float getTitleBarOffset() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            try {
+                WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
+                if (insets != null) {
+                    int captionTop = insets.getInsets(WindowInsets.Type.captionBar()).top;
+                    return (float) Math.max(0, captionTop);
+                }
+            } catch (Throwable ignored) {}
+        }
+        
+        int displayH = getResources().getDisplayMetrics().heightPixels;
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N && isInMultiWindowMode()
+                && viewHeight > 0 && displayH > 0 && viewHeight < (displayH - 150)) {
+            float density = mDensity > 0 ? mDensity : getResources().getDisplayMetrics().density;
+            return 36.0f * density;
+        }
+        
+        return 0.0f;
+    }
+
+    private float getScaledY(float rawY) {
+        if (viewHeight <= 0) return rawY;
+
+        float titleBarOffset = getTitleBarOffset();
+
+        if (customScreenHeight <= 0) {
+            return Math.max(0.0f, rawY - titleBarOffset);
+        }
+
+        float videoAspect = (customScreenWidth > 0) ? (float) customScreenWidth / customScreenHeight : (16.0f / 9.0f);
+        float viewAspect = (viewWidth > 0) ? (float) viewWidth / viewHeight : videoAspect;
+        
+        float renderH = viewHeight;
+        float offsetY = 0.0f;
+        
+        if (viewAspect < videoAspect) {
+            renderH = viewWidth / videoAspect;
+            offsetY = (viewHeight - renderH) / 2.0f;
+        }
+        
+        float scaleY = (float) customScreenHeight / renderH;
+        float y = Math.max(0.0f, (rawY - titleBarOffset - offsetY) * scaleY);
+        return Math.min(y, (float) customScreenHeight - 0.001f);
+    }
+
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                        
-                // Масштабирование
-                float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                        (float)customScreenWidth / viewWidth : 1.0f;
-                float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                        (float)customScreenHeight / viewHeight : 1.0f;
-        
-                mNative.sendMouseMotion(event.getX()*scaleX, event.getY()*scaleY,
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
-                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
+                sendSmoothMouseMotion(event.getX(), event.getY());
                 return true;
             }
             if (action == MotionEvent.ACTION_SCROLL) {
@@ -1056,32 +1137,17 @@ public class MainActivity extends Activity
     };
 
     private boolean isMouseEvent(MotionEvent event) {
-        int source = event.getSource();
-        if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
-            return false;
-        if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
-            return false;
         int toolType = event.getToolType(event.getActionIndex());
-        return toolType == MotionEvent.TOOL_TYPE_MOUSE
-            || toolType == MotionEvent.TOOL_TYPE_FINGER;
+        if (toolType == MotionEvent.TOOL_TYPE_MOUSE) return true;
+        
+        int source = event.getSource();
+        if ((source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) return true;
+        
+        return false;
     }
 
     private boolean handleMouseEvent(MotionEvent event) {
-        float dx = 0f;
-        float dy = 0f;
-        
-        // Масштабирование
-        float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
-                   (float)customScreenWidth / viewWidth : 1.0f;
-        float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
-                   (float)customScreenHeight / viewHeight : 1.0f;
-        
-        if (event.getHistorySize() > 0) {
-            int last = event.getHistorySize() - 1;
-            dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
-            dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
-        }
-        mNative.sendMouseMotion(event.getX() * scaleX, event.getY() * scaleY, dx, dy);
+        sendSmoothMouseMotion(event.getX(), event.getY());
 
         int currentBS = event.getButtonState();
         for (int[] btn : BUTTON_MAP) {
