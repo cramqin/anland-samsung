@@ -51,6 +51,16 @@ public final class Native {
     public void sendTextInput(byte[] data) { nativeSendTextInput(handle, data); }
     public void setMicEnabled(boolean enabled) { nativeSetMicEnabled(handle, enabled); }
     public void setAudioLatency(int speakerMs, int micMs) { nativeSetAudioLatency(handle, speakerMs, micMs); }
+    /** Immersive full-input grab: root helper EVIOCGRABs the touchscreen + keys and
+     * streams raw evdev here, so Android sees no input. See input_grab.h.
+     * exitKeyCode is the evdev key that toggles immersion; the helper watches for it
+     * root-side, so the release works even if this process is wedged. */
+    public void startInputGrab(String helperPath, String bridgePath, int rotation, int exitKeyCode) {
+        nativeStartInputGrab(handle, helperPath, bridgePath, rotation, exitKeyCode);
+    }
+    public void stopInputGrab() { nativeStopInputGrab(handle); }
+    /** Update the grab touch rotation (Surface.ROTATION_* 0..3) live on display rotation. */
+    public void setGrabRotation(int rotation) { nativeSetGrabRotation(handle, rotation); }
 
     // ---- native handle lifecycle + handle-taking entry points ----
 
@@ -82,4 +92,7 @@ public final class Native {
     private static native void nativeSendTextInput(long handle, byte[] data);
     private static native void nativeSetMicEnabled(long handle, boolean enabled);
     private static native void nativeSetAudioLatency(long handle, int speakerMs, int micMs);
+    private static native void nativeStartInputGrab(long handle, String helperPath, String bridgePath, int rotation, int exitKeyCode);
+    private static native void nativeStopInputGrab(long handle);
+    private static native void nativeSetGrabRotation(long handle, int rotation);
 }

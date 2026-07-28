@@ -34,6 +34,7 @@
 
     <!-- Bind key -->
     <string name="bind_key_button">绑定软键盘切换键</string>
+    <string name="bind_immersion_key_button">绑定沉浸模式切换键</string>
     <string name="listening_countdown">正在监听…（%1$d 秒）</string>
     <string name="status_current_none">当前：无</string>
     <string name="status_current">当前：%1$s</string>
@@ -42,6 +43,12 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">无障碍按键拦截</string>
     <string name="accessibility_hint">通过无障碍服务拦截功能键（Fn、F1-F12 等），并将平板键盘上报的返回/浏览器后退键转换为 ESC。如果外接键盘的 Fn 组合键或 ESC 无法正确传到桌面，请启用此项。需要在系统 设置 &gt; 无障碍 中授予无障碍权限（仅需一次）。</string>
+    <string name="full_capture_switch">沉浸模式</string>
+    <string name="full_capture_hint">需要 root。按下方绑定的切换键进入沉浸模式，再按一次退出。\n沉浸模式下，Anland 会捕获输入设备，使得容器独占输入设备，而不会有误触安卓的情况。\nAnland 退出，则会自动退出。</string>
+    <string name="immerse_key_hint">用于进入／退出沉浸模式的按键，必须绑定：root 助手正是靠这个键来释放捕获，未绑定时不会进入沉浸模式。\n\n绑定时会一并记录该键的 evdev 扫描码。沉浸模式下此键被切换功能占用、不会传给 Linux，请选一个你在桌面上用不到的键。</string>
+    <string name="immerse_entered">已进入沉浸——再按一次该键退出</string>
+    <string name="immerse_exited">已退出沉浸</string>
+    <string name="immerse_key_unusable">该按键没有对应的 Linux 扫描码，将无法用它退出沉浸。请改绑其他按键。</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">扩展按键栏模式</string>

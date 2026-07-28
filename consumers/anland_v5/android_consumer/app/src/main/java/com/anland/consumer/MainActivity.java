@@ -124,6 +124,39 @@ public class MainActivity extends Activity
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
     public static final String KEY_POINTER_CAPTURE = "pointer_capture";
+    // Immersive full-input capture: a root helper (libinputgrab.so) takes an exclusive
+    // EVIOCGRAB on the touchscreen + key devices, so Android sees no input at all
+    // (home/back/recents gestures, notification shade, and every key are dead); the raw
+    // evdev stream is forwarded to Linux instead.
+    //
+    // This setting only ARMS the feature; it never immerses by itself. Immersion is
+    // always entered and left by the user pressing the key bound in Settings, and
+    // every launch/resume starts un-immersed. Nothing grabs input without an explicit
+    // press, which is what keeps a bad state from ever locking the device down.
+    public static final String KEY_FULL_KEY_CAPTURE = "full_key_capture";
+    private boolean fullKeyCaptureEnabled = false;
+
+    // The single key bound in Settings that toggles immersion. Immersion cannot be
+    // entered without one: the helper detects that same key root-side to leave, so a
+    // binding is what guarantees there is always a way out.
+    public static final String KEY_IMMERSION_KEYCODE = "immersion_keycode";
+    // Raw evdev scancode of that key, captured from the KeyEvent when it was bound.
+    // The helper matches on this, and taking it from the event works for keys
+    // KeyCodeMapper has no entry for -- the volume keys among them.
+    public static final String KEY_IMMERSION_SCANCODE = "immersion_scancode";
+    private static final int UNBOUND = -1;
+    private int immersionKeycode = UNBOUND;
+    private int immersionScancode = 0;
+    private boolean immersed = false;
+    // Tracked from onWindowFocusChanged rather than read via hasWindowFocus(), so the
+    // grab decision does not depend on when the framework updates the decor view.
+    private boolean mHasWindowFocus = false;
+    // Grab start/stop must never run on the main thread: they fork `su` and join the
+    // grab thread, and su can take seconds to grant -- that blocked main thread is
+    // what produced a real ANR ("Waited 5000ms for PointerCaptureChangedEvent").
+    // A single worker keeps start/stop strictly ordered while the UI stays responsive.
+    private final java.util.concurrent.ExecutorService grabExecutor =
+            java.util.concurrent.Executors.newSingleThreadExecutor();
 
     // Routing gate: when on, non-mouse touches go to the virtual touchpad.
     private boolean isTouchpadMode = true;
@@ -174,8 +207,14 @@ public class MainActivity extends Activity
             @Override public void onDisplayRemoved(int displayId) {}
             @Override public void onDisplayChanged(int displayId) {
                 Display d = getDisplay();
-                if (d != null && d.getDisplayId() == displayId)
+                if (d != null && d.getDisplayId() == displayId) {
                     pushRefreshRate();
+                    // Keep the immersive-grab touch transform aligned with the
+                    // current rotation (the activity handles orientation config
+                    // changes itself, so it is not recreated on rotate).
+                    if (mNative != null)
+                        mNative.setGrabRotation(d.getRotation());
+                }
             }
         };
 
@@ -196,6 +235,11 @@ public class MainActivity extends Activity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        mHasWindowFocus = hasFocus;
+        // Release FIRST, before the root socket probe below: that probe forks `su` and
+        // must never be able to delay handing input back to Android.
+        if (!hasFocus)
+            stopImmersiveGrab();
         if (!isSocketFile(resolveSocketPath())) {
             //exit
             android.widget.Toast.makeText(this, "Deamon Down",
@@ -219,6 +263,107 @@ public class MainActivity extends Activity
                 releasePointerCapture(false);
             }
         }
+        // Immersion never survives losing focus: the grab must not outlive our
+        // foreground, or the device would be input-dead behind us. Coming back starts
+        // un-immersed, so the user re-enters deliberately with the toggle key.
+        // The release itself already happened at the top of this method.
+        if (!hasFocus)
+            immersed = false;
+    }
+
+    // Enter immersion: launch the root helper, which grabs the touchscreen + keys.
+    // Only ever called from the toggle key, never from a lifecycle callback, so input
+    // is never taken without an explicit press.
+    private void enterImmersion() {
+        if (mNative == null || !fullKeyCaptureEnabled || immersed || !mHasWindowFocus)
+            return;
+        // The helper reads raw evdev, so it needs the scancode, not the Android
+        // keycode. Prefer the one captured when the key was bound; fall back to the
+        // mapping table for bindings made before that was recorded. If neither
+        // resolves, the helper would have no way to detect the exit key -- so refuse
+        // to grab at all rather than take over with no way out.
+        int exitScan = immersionScancode > 0
+                ? immersionScancode : KeyCodeMapper.getScanCode(immersionKeycode);
+        if (exitScan <= 0) {
+            android.widget.Toast.makeText(this, R.string.immerse_key_unusable,
+                    android.widget.Toast.LENGTH_LONG).show();
+            return;
+        }
+        immersed = true;
+        android.widget.Toast.makeText(this, R.string.immerse_entered,
+                android.widget.Toast.LENGTH_SHORT).show();
+        String helper = getApplicationInfo().nativeLibraryDir + "/libinputgrab.so";
+        String bridge = getCacheDir().getAbsolutePath() + "/anland_grab.sock";
+        int rotation = currentDisplayRotation();
+        final Native n = mNative;
+        postGrabTask(() -> n.startInputGrab(helper, bridge, rotation, exitScan));
+    }
+
+    private void stopImmersiveGrab() {
+        if (mNative == null)
+            return;
+        final Native n = mNative;
+        postGrabTask(n::stopInputGrab);
+    }
+
+    // The executor is shut down in onDestroy, and a late lifecycle callback can still
+    // reach here; a rejected task means the pipeline is already being torn down (which
+    // releases the grab natively), so dropping it is correct rather than crashing.
+    private void postGrabTask(Runnable task) {
+        try {
+            grabExecutor.execute(task);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            Log.w(TAG, "grab task rejected (shutting down)");
+        }
+    }
+
+    // Surface.ROTATION_* (0..3). Raw evdev touch is in the panel's natural
+    // orientation, so native rotates it into surface space by this value.
+    private int currentDisplayRotation() {
+        Display d = getDisplay();
+        return d != null ? d.getRotation() : Surface.ROTATION_0;
+    }
+
+    // Called from native (grab thread) once the helper has released the grab on its
+    // own -- the user pressed the toggle key, it gave up on a stalled app, or it died.
+    // So this only has to catch up our own state. Posted to the UI thread (the grab
+    // thread must not self-join). Not the only way out: even if this never runs, the
+    // helper has already ungrabbed, so input is back with Android regardless.
+    public void onImmersionReleased() {
+        runOnUiThread(this::exitImmersion);
+    }
+
+    private void exitImmersion() {
+        if (immersed)
+            android.widget.Toast.makeText(this, R.string.immerse_exited,
+                    android.widget.Toast.LENGTH_SHORT).show();
+        immersed = false;
+        stopImmersiveGrab();
+    }
+
+    // The bound key toggles immersion. Entering is detected here from an ordinary
+    // Android key event (we are not grabbing yet); leaving is detected by the root
+    // helper, which sees the same key and releases the grab itself -- so the way out
+    // never depends on this process being responsive.
+    //
+    // Reaching this while `immersed` means the grab is NOT actually in force (the
+    // helper failed to start, e.g. root was denied, or it already died), because
+    // otherwise Android would not be delivering us keys -- so treat it as an exit and
+    // the user can never be stuck unable to toggle either way.
+    // Returns true if the event was consumed.
+    private boolean handleImmersionKey(KeyEvent event) {
+        if (!fullKeyCaptureEnabled || immersionKeycode == UNBOUND)
+            return false;
+        if (event.getKeyCode() != immersionKeycode)
+            return false;
+        // Swallow both DOWN and UP: this key is the toggle, so Linux must not also see
+        // it (the helper likewise never forwards it while immersed). The repeatCount
+        // guard stops a held key from toggling over and over.
+        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+            if (immersed) exitImmersion();
+            else          enterImmersion();
+        }
+        return true;
     }
 
     private void pushRefreshRate() {
@@ -305,7 +450,17 @@ public class MainActivity extends Activity
             p = new ProcessBuilder("su", "-c", helperPath + " " + path + " test")
                     .redirectErrorStream(true)
                     .start();
-            return p.waitFor() == 0;
+            // Bounded: this runs on the main thread (onWindowFocusChanged, onCreate,
+            // startNative) and `su` can sit on an unanswered root prompt indefinitely,
+            // which is exactly the main-thread block that ANRs us. A timeout is
+            // inconclusive, not proof the daemon is gone -- returning false here would
+            // toast "Deamon Down" and finish(). A genuinely dead daemon is still caught
+            // by the native on_fallback path.
+            if (!p.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "root socket probe timed out; assuming daemon alive");
+                return true;
+            }
+            return p.exitValue() == 0;
         } catch (Exception e) {
             Log.w(TAG, "root socket probe failed: " + e);
             return false;
@@ -1192,6 +1347,14 @@ public class MainActivity extends Activity
         autoStretch = prefs.getBoolean(KEY_AUTO_STRETCH, true);
         relayout();
 
+        // Pick up an immersive-capture toggle made in Settings. Resuming never immerses
+        // by itself -- it only arms the toggle key and makes sure nothing is still grabbed.
+        fullKeyCaptureEnabled = prefs.getBoolean(KEY_FULL_KEY_CAPTURE, false);
+        immersionKeycode = prefs.getInt(KEY_IMMERSION_KEYCODE, UNBOUND);
+        immersionScancode = prefs.getInt(KEY_IMMERSION_SCANCODE, 0);
+        immersed = false;
+        stopImmersiveGrab();
+
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
     }
@@ -1204,6 +1367,8 @@ public class MainActivity extends Activity
         if (mForceSettings) return;
         clearPointerCaptureBackTracking();
         releasePointerCapture(false);
+        immersed = false;
+        stopImmersiveGrab();
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
         DisplayManager dm = getSystemService(DisplayManager.class);
@@ -1226,8 +1391,14 @@ public class MainActivity extends Activity
         // every window, so it is intentionally not torn down here -- destroying it
         // would cut the camera for the other open windows.
         if (mNative != null) {
-            mNative.destroy();
+            // Destroy on the grab worker, not here: nativeDestroy joins the grab
+            // thread, which can be parked in waitpid() on `su`. Queued behind any
+            // pending start/stop on this single-thread executor, so free() can never
+            // race them. Blocking the main thread here was an ANR plus a use-after-free.
+            final Native n = mNative;
             mNative = null;
+            postGrabTask(n::destroy);
+            grabExecutor.shutdown();
         }
         cameraInited = false;
         super.onDestroy();
@@ -1571,6 +1742,15 @@ public class MainActivity extends Activity
         }
     }
 
+    // The bound key toggles immersion. Intercepted here rather than in onKeyDown so it
+    // is seen before the key would be forwarded to Linux.
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (handleImmersionKey(event))
+            return true;
+        return super.dispatchKeyEvent(event);
+    }
+
     // ================================================================
     // Route touchscreen gestures and ordinary (non-captured) mouse events.
     // ================================================================
@@ -1700,6 +1880,12 @@ public class MainActivity extends Activity
     // Called from KeyInterceptor (accessibility service) to handle keys that
     // the normal onKeyDown/onKeyUp might miss (e.g. Fn combos).
     public boolean handleAccessibilityKey(KeyEvent event) {
+        // Check the toggle here too: when accessibility interception is on, this path
+        // consumes every key BEFORE the window sees it, so dispatchKeyEvent would never
+        // run and immersion could never be entered. Whichever path delivers the key,
+        // the immersion toggle gets first look.
+        if (handleImmersionKey(event))
+            return true;
         if (handlePointerCaptureBackKey(event))
             return true;
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))

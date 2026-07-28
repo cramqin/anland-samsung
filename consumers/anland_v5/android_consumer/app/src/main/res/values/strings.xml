@@ -34,6 +34,7 @@
 
     <!-- Bind key -->
     <string name="bind_key_button">Bind Soft Keyboard Toggle Key</string>
+    <string name="bind_immersion_key_button">Bind Immersion Mode Toggle Key</string>
     <string name="listening_countdown">Listening… (%1$ds)</string>
     <string name="status_current_none">Current: None</string>
     <string name="status_current">Current: %1$s</string>
@@ -42,6 +43,12 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">Accessibility Key Interception</string>
     <string name="accessibility_hint">Intercept function keys (Fn, F1-F12 etc.) via AccessibilityService and convert tablet-keyboard Back/Browser Back to ESC. Enable this if external keyboard Fn combos or ESC don\'t reach the desktop correctly. Requires Accessibility permission granted in system Settings &gt; Accessibility (one-time).</string>
+    <string name="full_capture_switch">Immersion Mode</string>
+    <string name="full_capture_hint">Requires root. Press the toggle key bound below to enter immersion mode, and press it again to leave.\nWhile immersed, Anland captures the input devices so the container has them exclusively, with no stray taps reaching Android.\nWhen Anland exits, immersion is released automatically.</string>
+    <string name="immerse_key_hint">The key that enters and leaves immersion mode. A binding is required: this same key is what the root helper watches in order to release the capture, so immersion cannot be entered until one is bound.\n\nBinding also records the key\'s evdev scancode. While immersed the key is reserved by the toggle and is not passed to Linux, so choose one you do not need on the desktop.</string>
+    <string name="immerse_entered">Immersion on — press the same key again to leave</string>
+    <string name="immerse_exited">Immersion off</string>
+    <string name="immerse_key_unusable">That key has no Linux scancode, so immersion could not be released with it. Bind a different key.</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">Extra keys bar mode</string>

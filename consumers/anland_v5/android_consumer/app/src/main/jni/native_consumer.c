@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <jni.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,7 @@
 #include "native_audio.h"
 #include "protocol.h"
 #include "socket_utils.h"
+#include "input_grab.h"
 
 #define TAG "Anland"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -73,6 +75,21 @@ struct consumer_state {
      * deferred to the next start_event_thread() (create time), which runs on the
      * render thread and so cannot self-join. */
     bool event_thread_joinable;
+
+    /* Immersive full-input grab: libinputgrab.so (root, via su) EVIOCGRABs the
+     * touchscreen + key devices and streams raw evdev here over a bridge socket;
+     * we translate and push_input_event(). See input_grab.h and grab_thread_func. */
+    pthread_t grab_thread;
+    volatile bool grab_running;
+    bool grab_thread_joinable;
+    char grab_helper_path[512];
+    char grab_bridge_path[512];
+    /* Display rotation for the grab touch transform: Surface.ROTATION_* (0..3).
+     * Set from Java at start and updated live on rotation. */
+    volatile int grab_rotation;
+    /* evdev key that toggles immersion. Passed through to the helper, which
+     * detects it root-side so the escape works even if we are wedged. */
+    int grab_exit_code;
 
     /* Connection config, set from Java via nativeConfigure() and read on each
      * (re)connect in do_connect(). Guarded by cfg_lock. Per-instance. */
@@ -392,6 +409,380 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
     return fd;
 }
 
+/* ============================================================
+ * Immersive full-input grab. libinputgrab.so (root, launched via su) takes an
+ * exclusive EVIOCGRAB on the touchscreen + key devices, so Android sees NO input
+ * at all -- home/back/recents gestures, the notification shade, and every key are
+ * dead -- and streams the raw evdev triples to us over a bridge socket. We rebuild
+ * multitouch (MT-slot) and keys and push_input_event() them to the producer, the
+ * same path the normal touch/key JNI uses. The user's bound toggle key releases it,
+ * detected by the helper itself. The grab also auto-releases when we close the socket
+ * or the app dies (the grab lives on the fds the helper holds -- see input_grab.h).
+ * ============================================================ */
+#define GEV_SYN             0
+#define GEV_KEY             1
+#define GEV_ABS             3
+#define GSYN_REPORT         0
+#define GSYN_DROPPED        3     /* helper dropped records: resync, don't trust state */
+#define GABS_MT_SLOT        0x2f
+#define GABS_MT_POSITION_X  0x35
+#define GABS_MT_POSITION_Y  0x36
+#define GABS_MT_TRACKING_ID 0x39
+#define GRAB_MAX_SLOTS      10
+#define GRAB_KEY_CNT        768   /* KEY_CNT: track held keys for synth-release */
+
+struct grab_slot { int active, down, up, dirty; int32_t x, y; };
+struct grab_devstate {
+    int is_touch;
+    int32_t x_min, x_max, y_min, y_max;
+    int cur_slot;
+    struct grab_slot slots[GRAB_MAX_SLOTS];
+};
+
+/* Post to Java that the helper released the grab of its own accord. The Java side
+ * MUST handle it asynchronously (runOnUiThread) -- it calls back into
+ * nativeStopInputGrab, and doing that synchronously here (on the grab thread) would
+ * self-join-deadlock. */
+static void grab_notify_released(struct consumer_state *s)
+{
+    if (!g_jvm || !s->activity_obj)
+        return;
+    JNIEnv *env = NULL;
+    bool att = false;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED)
+        att = ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == 0);
+    if (env) {
+        jclass c = (*env)->GetObjectClass(env, s->activity_obj);
+        jmethodID m = (*env)->GetMethodID(env, c, "onImmersionReleased", "()V");
+        if (m)
+            (*env)->CallVoidMethod(env, s->activity_obj, m);
+    }
+    if (att)
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+}
+
+static void grab_push_key(struct consumer_state *s, int code, int down)
+{
+    display_ctx *ctx = s->ctx;
+    if (!ctx)
+        return;
+    struct InputEvent ev = { .type = INPUT_TYPE_KEY,
+        .key = { .action = down ? INPUT_ACTION_DOWN : INPUT_ACTION_UP, .keycode = code } };
+    push_input_event(ctx, &ev);
+}
+
+/* Raw axis value -> [0,1] over its reported ABS range. */
+static float grab_norm(int32_t v, int32_t lo, int32_t hi)
+{
+    if (hi <= lo)
+        return 0.f;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    return (float)(v - lo) / (float)(hi - lo);
+}
+
+/*
+ * Map a raw panel touch to the producer's output-pixel space, applying the
+ * display rotation. We bypass Android, so raw coords are in the panel's NATURAL
+ * (unrotated) orientation; the producer expects surface-space coords, which are
+ * rotated by grab_rotation (Surface.ROTATION_0/90/180/270 -> 0/1/2/3). Standard
+ * rotation of normalized (u,v):
+ *   0:(u,v)  90:(v,1-u)  180:(1-u,1-v)  270:(1-v,u)
+ */
+static void grab_push_touch(struct consumer_state *s, int action,
+                            int32_t rx, int32_t ry, struct grab_devstate *d, int id)
+{
+    display_ctx *ctx = s->ctx;
+    if (!ctx)
+        return;
+    float u = grab_norm(rx, d->x_min, d->x_max);
+    float v = grab_norm(ry, d->y_min, d->y_max);
+    float nx, ny;
+    switch (s->grab_rotation) {
+    case 1:  nx = v;         ny = 1.f - u;   break;   /* ROTATION_90  */
+    case 2:  nx = 1.f - u;   ny = 1.f - v;   break;   /* ROTATION_180 */
+    case 3:  nx = 1.f - v;   ny = u;         break;   /* ROTATION_270 */
+    default: nx = u;         ny = v;         break;   /* ROTATION_0   */
+    }
+    struct InputEvent ev = { .type = INPUT_TYPE_TOUCH,
+        .touch = { .action = action,
+                   .x = nx * (float)s->screen_w,
+                   .y = ny * (float)s->screen_h,
+                   .pointer_id = id } };
+    push_input_event(ctx, &ev);
+}
+
+/* On SYN_REPORT: emit one touch event per changed slot, then one frame. */
+static void grab_flush_touch(struct consumer_state *s, struct grab_devstate *d)
+{
+    int emitted = 0;
+    for (int i = 0; i < GRAB_MAX_SLOTS; i++) {
+        struct grab_slot *sl = &d->slots[i];
+        if (!sl->dirty)
+            continue;
+        int action = sl->up ? INPUT_ACTION_UP
+                            : (sl->down ? INPUT_ACTION_DOWN : INPUT_ACTION_MOVE);
+        grab_push_touch(s, action, sl->x, sl->y, d, i);
+        emitted = 1;
+        if (sl->up)
+            sl->active = 0;
+        sl->down = sl->up = sl->dirty = 0;
+    }
+    if (emitted && s->ctx) {
+        struct InputEvent ev = { .type = INPUT_TYPE_TOUCH_FRAME };
+        push_input_event(s->ctx, &ev);
+    }
+}
+
+/* Lift every held key and finger. Used on teardown and on SYN_DROPPED (the helper
+ * had to drop records, so our slot/key state may describe presses that already
+ * ended) -- either way the producer must never be left with something stuck down. */
+static void grab_release_all(struct consumer_state *s, struct grab_devstate *devs,
+                             unsigned char *keydown)
+{
+    for (int c = 0; c < GRAB_KEY_CNT; c++) {
+        if (keydown[c]) {
+            grab_push_key(s, c, 0);
+            keydown[c] = 0;
+        }
+    }
+    for (int i = 0; i < IGRAB_MAX_DEVICES; i++) {
+        if (!devs[i].is_touch)
+            continue;
+        int any = 0;
+        for (int k = 0; k < GRAB_MAX_SLOTS; k++) {
+            struct grab_slot *sl = &devs[i].slots[k];
+            if (sl->active) {
+                grab_push_touch(s, INPUT_ACTION_UP, sl->x, sl->y, &devs[i], k);
+                any = 1;
+            }
+            memset(sl, 0, sizeof *sl);
+        }
+        devs[i].cur_slot = 0;
+        if (any && s->ctx) {
+            struct InputEvent ev = { .type = INPUT_TYPE_TOUCH_FRAME };
+            push_input_event(s->ctx, &ev);
+        }
+    }
+}
+
+/* Reap an `su` child without ever blocking indefinitely. The root manager's grant
+ * prompt can sit unanswered for as long as the user ignores it, and anything joining
+ * this thread would block for exactly that long. Killing the su *client* is safe: if
+ * the grant arrives later the helper cannot connect (the bridge is already unlinked)
+ * so it ungrabs and exits, and the next session's pkill sweeps any leftover. */
+static void reap_su(pid_t pid, int timeout_ms)
+{
+    for (int waited = 0; waited < timeout_ms; waited += 10) {
+        if (waitpid(pid, NULL, WNOHANG) != 0)
+            return;
+        usleep(10000);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+}
+
+static void *grab_thread_func(void *arg)
+{
+    struct consumer_state *s = arg;
+    LOGI("grab thread started");
+
+    pthread_mutex_lock(&s->cfg_lock);
+    char helper[sizeof(s->grab_helper_path)];
+    char bridge[sizeof(s->grab_bridge_path)];
+    memcpy(helper, s->grab_helper_path, sizeof helper);
+    memcpy(bridge, s->grab_bridge_path, sizeof bridge);
+    pthread_mutex_unlock(&s->cfg_lock);
+    if (helper[0] == '\0' || bridge[0] == '\0') {
+        LOGE("grab: helper/bridge path unset");
+        return NULL;
+    }
+
+    /* Kill any leaked helper from a previous session before launching a new one.
+     * A stale helper still holding the grab with no reader is exactly the lockout
+     * we are preventing -- only ever let one exist. Runs as root via su so it can
+     * signal the root helper; pkill never signals itself. */
+    pid_t kpid = fork();
+    if (kpid == 0) {
+        execlp("su", "su", "-c", "pkill -f libinputgrab.so", (char *)NULL);
+        _exit(127);
+    }
+    if (kpid > 0)
+        reap_su(kpid, 3000);
+
+    unlink(bridge);
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0) { LOGE("grab: socket: %s", strerror(errno)); return NULL; }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, bridge, sizeof addr.sun_path - 1);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        LOGE("grab: bind(%s): %s", bridge, strerror(errno));
+        close(lfd);
+        return NULL;
+    }
+    chmod(bridge, 0777);
+    if (listen(lfd, 1) < 0) {
+        LOGE("grab: listen: %s", strerror(errno));
+        close(lfd); unlink(bridge);
+        return NULL;
+    }
+
+    char inner[1200];
+    snprintf(inner, sizeof inner, "%s %s %d", helper, bridge, s->grab_exit_code);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("su", "su", "-c", inner, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        LOGE("grab: fork: %s", strerror(errno));
+        close(lfd); unlink(bridge);
+        return NULL;
+    }
+
+    int cfd = -1;
+    while (s->grab_running) {
+        struct pollfd p = { .fd = lfd, .events = POLLIN };
+        int r = poll(&p, 1, 200);
+        if (r > 0 && (p.revents & POLLIN)) {
+            cfd = accept(lfd, NULL, NULL);
+            break;
+        }
+    }
+    close(lfd);
+    unlink(bridge);
+    if (cfd < 0) {
+        LOGI("grab: stopped before helper connected");
+        reap_su(pid, 3000);
+        return NULL;
+    }
+
+    struct igrab_hello hello;
+    struct grab_devstate devs[IGRAB_MAX_DEVICES];
+    memset(devs, 0, sizeof devs);
+    if (recv_all(cfd, &hello, sizeof hello) < 0 || hello.magic != IGRAB_MAGIC) {
+        LOGE("grab: bad hello");
+        close(cfd);
+        reap_su(pid, 3000);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < hello.dev_count; i++) {
+        struct igrab_dev gd;
+        if (recv_all(cfd, &gd, sizeof gd) < 0) { close(cfd); goto reap; }
+        if (gd.index < (uint32_t)IGRAB_MAX_DEVICES) {
+            struct grab_devstate *d = &devs[gd.index];
+            d->is_touch = (gd.kind == IGRAB_KIND_TOUCH);
+            d->x_min = gd.abs_x_min; d->x_max = gd.abs_x_max;
+            d->y_min = gd.abs_y_min; d->y_max = gd.abs_y_max;
+        }
+    }
+    LOGI("grab: streaming %u devices", hello.dev_count);
+
+    unsigned char keydown[GRAB_KEY_CNT];
+    memset(keydown, 0, sizeof keydown);
+
+    while (s->grab_running) {
+        struct pollfd p = { .fd = cfd, .events = POLLIN };
+        int r = poll(&p, 1, 200);
+        if (r < 0) { if (errno == EINTR) continue; break; }
+        if (r == 0) continue;
+        if (p.revents & (POLLHUP | POLLERR)) break;
+        if (!(p.revents & POLLIN)) continue;
+
+        struct igrab_rec rec;
+        if (recv_all(cfd, &rec, sizeof rec) < 0)
+            break;
+        struct grab_devstate *d = (rec.index < (uint32_t)IGRAB_MAX_DEVICES)
+                                  ? &devs[rec.index] : NULL;
+
+        /* The helper dropped records because we were not draining fast enough, so
+         * a press/lift may be missing. Lift everything before trusting new input. */
+        if (rec.type == GEV_SYN && rec.code == GSYN_DROPPED) {
+            LOGI("grab: helper dropped records -> resync (releasing keys/fingers)");
+            grab_release_all(s, devs, keydown);
+            continue;
+        }
+
+        if (rec.type == GEV_KEY) {
+            int code = rec.code, val = rec.value;
+            if (val == 2)
+                continue;               /* autorepeat: the compositor repeats */
+            grab_push_key(s, code, val != 0);
+            if (code >= 0 && code < GRAB_KEY_CNT)
+                keydown[code] = (val != 0);
+        } else if (d && d->is_touch && rec.type == GEV_ABS) {
+            int slot = d->cur_slot;
+            if (slot < 0 || slot >= GRAB_MAX_SLOTS) slot = 0;
+            struct grab_slot *sl = &d->slots[slot];
+            switch (rec.code) {
+            case GABS_MT_SLOT:
+                if (rec.value >= 0 && rec.value < GRAB_MAX_SLOTS)
+                    d->cur_slot = rec.value;
+                break;
+            case GABS_MT_TRACKING_ID:
+                if (rec.value == -1) { sl->up = 1; sl->dirty = 1; }
+                else { sl->active = 1; sl->down = 1; sl->dirty = 1; }
+                break;
+            case GABS_MT_POSITION_X:
+                sl->x = rec.value;
+                if (!sl->down) sl->dirty = 1;
+                break;
+            case GABS_MT_POSITION_Y:
+                sl->y = rec.value;
+                if (!sl->down) sl->dirty = 1;
+                break;
+            }
+        } else if (d && d->is_touch && rec.type == GEV_SYN && rec.code == GSYN_REPORT) {
+            grab_flush_touch(s, d);
+        }
+    }
+
+    /* Synthesize releases so the producer never sees a stuck key/finger. */
+    grab_release_all(s, devs, keydown);
+    close(cfd);
+    /* Still "running" means the stream ended on the HELPER's initiative, not ours:
+     * the user hit the exit key, the helper released after a sustained stall, or
+     * it died. Either way the grab is gone, so tell Java to leave the immersed state --
+     * otherwise its view of the world would be stuck on. (When we asked it to stop,
+     * grab_running is already false and Java knows.) */
+    if (s->grab_running)
+        grab_notify_released(s);
+reap:
+    reap_su(pid, 3000);
+    LOGI("grab thread stopped");
+    return NULL;
+}
+
+static void join_grab_thread(struct consumer_state *s)
+{
+    if (s->grab_thread_joinable) {
+        pthread_join(s->grab_thread, NULL);
+        s->grab_thread_joinable = false;
+    }
+}
+
+static void start_grab_thread(struct consumer_state *s)
+{
+    if (s->grab_running)
+        return;
+    join_grab_thread(s);              /* reap a previous stopped-but-unjoined one */
+    s->grab_running = true;
+    if (pthread_create(&s->grab_thread, NULL, grab_thread_func, s) == 0)
+        s->grab_thread_joinable = true;
+    else
+        s->grab_running = false;
+}
+
+/* Signal only. The thread notices within one poll timeout (200 ms), synthesizes
+ * releases, closes the socket (-> helper releases the grab), and exits. The join
+ * happens from the JNI caller (a non-grab thread), never from the notify path. */
+static void stop_grab_thread(struct consumer_state *s)
+{
+    s->grab_running = false;
+}
+
 static int do_connect(struct consumer_state *s)
 {
     /* Snapshot the connection config for this attempt. */
@@ -682,6 +1073,9 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
 
     /* Stop the transport (mirrors nativeStop), release the camera client + audio
      * bridge, then free. */
+    stop_grab_thread(s);
+    join_grab_thread(s);
+
     pthread_mutex_lock(&s->lock);
     if (s->running) {
         s->running = false;
@@ -757,6 +1151,49 @@ Java_com_anland_consumer_Native_nativeConfigure(
 
     LOGI("configured: socket=%s root=%d helper=%s bridge=%s",
          s->cfg_socket_path, s->cfg_use_root, s->cfg_helper_path, s->cfg_bridge_path);
+}
+
+/* Start immersive full-input grab: launch libinputgrab.so via su and stream. The
+ * paths are the extracted helper (nativeLibraryDir/libinputgrab.so) and a bridge
+ * socket in the app's cache dir. Idempotent while already running. */
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeStartInputGrab(
+    JNIEnv *env, jclass clazz, jlong handle, jstring helperPath, jstring bridgePath,
+    jint rotation, jint exitKeyCode)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    s->grab_rotation = rotation;
+    s->grab_exit_code = exitKeyCode;
+    pthread_mutex_lock(&s->cfg_lock);
+    copy_jstring(env, helperPath, s->grab_helper_path, sizeof(s->grab_helper_path));
+    copy_jstring(env, bridgePath, s->grab_bridge_path, sizeof(s->grab_bridge_path));
+    pthread_mutex_unlock(&s->cfg_lock);
+    start_grab_thread(s);
+}
+
+/* Update the touch rotation live (called on display rotation while grabbing). */
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSetGrabRotation(
+    JNIEnv *env, jclass clazz, jlong handle, jint rotation)
+{
+    (void)env; (void)clazz;
+    struct consumer_state *s = STATE(handle);
+    if (s)
+        s->grab_rotation = rotation;
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeStopInputGrab(
+    JNIEnv *env, jclass clazz, jlong handle)
+{
+    (void)env; (void)clazz;
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    stop_grab_thread(s);
+    join_grab_thread(s);
 }
 
 JNIEXPORT void JNICALL
@@ -854,6 +1291,13 @@ Java_com_anland_consumer_Native_nativeStop(
     struct consumer_state *s = STATE(handle);
     if (!s)
         return;
+
+    /* Signal only -- never join here. nativeStop is called from onPause /
+     * surfaceChanged / surfaceDestroyed on the MAIN thread, and the grab thread can
+     * sit for seconds in waitpid() on an un-granted `su` prompt; joining it here is
+     * the ANR we already hit. The join is deferred to start_grab_thread() and
+     * nativeStopInputGrab(), which run on the app's grab executor. */
+    stop_grab_thread(s);
 
     pthread_mutex_lock(&s->lock);
 
