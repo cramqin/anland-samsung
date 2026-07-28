@@ -666,8 +666,8 @@ public class SettingsActivity extends Activity {
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
 
-        // External mouse pointer capture.  This is opt-in because it changes
-        // Android's mouse event mode from absolute coordinates to relative motion.
+        // External mouse/touchpad capture. This is opt-in because it changes
+        // Android's pointer event mode from absolute coordinates to relative motion.
         Switch pointerCaptureSwitch = new Switch(this);
         pointerCaptureSwitch.setText(R.string.pointer_capture_switch);
         pointerCaptureSwitch.setTextSize(14);

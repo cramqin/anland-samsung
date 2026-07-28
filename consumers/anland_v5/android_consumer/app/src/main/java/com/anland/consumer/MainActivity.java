@@ -16,6 +16,7 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.Log;
+import android.util.SparseIntArray;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -261,6 +262,7 @@ public class MainActivity extends Activity
             else {
                 clearPointerCaptureBackTracking();
                 releasePointerCapture(false);
+                resetScreenTouchpadGesture();
             }
         }
         // Immersion never survives losing focus: the grab must not outlive our
@@ -565,7 +567,7 @@ public class MainActivity extends Activity
             public void dispatchPointerCaptureChanged(boolean hasCapture) {
                 super.dispatchPointerCaptureChanged(hasCapture);
                 if (!hasCapture) {
-                    releaseAllMouseButtons();
+                    releaseAllHardwarePointerButtons();
                     resetCapturedTouchpadGesture();
                 }
             }
@@ -652,29 +654,10 @@ public class MainActivity extends Activity
         // ===== 加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        virtualTouchpad = new VirtualTouchpad(this, mNative);
-        capturedTouchpadRecognizer = new VirtualTouchpad(this, mNative,
-                new VirtualTouchpad.Output() {
-                    @Override
-                    public void onMotion(float dx, float dy) {
-                        // Cursor motion is handled from AXIS_RELATIVE_X/Y below.
-                        // Keeping this callback empty lets the original class
-                        // remain the single source of truth for tap/drag/scroll
-                        // state without duplicating its movement output.
-                    }
-
-                    @Override
-                    public void onScroll(int axis, float value) {
-                        if (mNative != null)
-                            mNative.sendMouseScroll(axis, value);
-                    }
-
-                    @Override
-                    public void onButton(int button, boolean pressed) {
-                        if (mNative != null)
-                            mNative.sendMouseButton(button, pressed);
-                    }
-                });
+        virtualTouchpad = new VirtualTouchpad(this,
+                createTouchpadOutput(true, BUTTON_OWNER_SCREEN_TOUCHPAD));
+        capturedTouchpadRecognizer = new VirtualTouchpad(this,
+                createTouchpadOutput(false, BUTTON_OWNER_CAPTURED_TOUCHPAD));
         capturedTouchpadAccel = Math.max(0.5f,
                 Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f)));
         virtualTouchpad.setAccelStrength(capturedTouchpadAccel);
@@ -775,6 +758,34 @@ public class MainActivity extends Activity
         surfaceView.setPointerIcon(PointerIcon.getSystemIcon(this, PointerIcon.TYPE_NULL));
     }
 
+    /**
+     * Build an isolated gesture sink backed by the shared remote cursor. The two
+     * VirtualTouchpad instances keep independent gesture state, while movement and
+     * buttons converge here so switching input sources cannot jump or release each
+     * other's pointer state.
+     */
+    private VirtualTouchpad.Output createTouchpadOutput(boolean forwardMotion,
+                                                        int buttonOwner) {
+        return new VirtualTouchpad.Output() {
+            @Override
+            public void onMotion(float dx, float dy) {
+                if (forwardMotion)
+                    sendRelativePointerMotion(dx, dy);
+            }
+
+            @Override
+            public void onScroll(int axis, float value) {
+                if (mNative != null)
+                    mNative.sendMouseScroll(axis, value);
+            }
+
+            @Override
+            public void onButton(int button, boolean pressed) {
+                setSyntheticPointerButton(buttonOwner, button, pressed);
+            }
+        };
+    }
+
     /** Keep the window's pointer-capture state in sync with the saved setting. */
     private void syncPointerCapture() {
         if (mRoot == null)
@@ -799,7 +810,7 @@ public class MainActivity extends Activity
     private void releasePointerCapture(boolean suppressUntilClick) {
         if (suppressUntilClick)
             pointerCaptureSuppressed = true;
-        releaseAllMouseButtons();
+        releaseAllHardwarePointerButtons();
         resetCapturedTouchpadGesture();
         if (mRoot != null && mRoot.hasPointerCapture())
             mRoot.releasePointerCapture();
@@ -889,6 +900,10 @@ public class MainActivity extends Activity
         return mRoot != null ? mRoot.getHeight() : 0;
     }
 
+    private boolean hasCustomScreenResolution() {
+        return customScreenWidth > 0 && customScreenHeight > 0;
+    }
+
     // pointerX/pointerY live in root-view coordinates, the same space MotionEvent
     // reports. With auto-stretch the surface fills the root, so that space starts at
     // 0; letterboxed, it starts at the surface's centering offset.
@@ -916,12 +931,12 @@ public class MainActivity extends Activity
     }
 
     private float pointerScaleX() {
-        return (customScreenWidth > 0 && pointerViewWidth() > 0)
+        return (hasCustomScreenResolution() && pointerViewWidth() > 0)
                 ? (float) customScreenWidth / pointerViewWidth() : 1.0f;
     }
 
     private float pointerScaleY() {
-        return (customScreenHeight > 0 && pointerViewHeight() > 0)
+        return (hasCustomScreenResolution() && pointerViewHeight() > 0)
                 ? (float) customScreenHeight / pointerViewHeight() : 1.0f;
     }
 
@@ -946,10 +961,10 @@ public class MainActivity extends Activity
             // Relative mouse samples can be batched.  Consume every historical
             // sample so fast movements do not lose deltas between frames.
             for (int i = 0; i < event.getHistorySize(); i++) {
-                sendCapturedMouseMotion(event.getHistoricalX(0, i),
+                sendRelativePointerMotion(event.getHistoricalX(0, i),
                         event.getHistoricalY(0, i));
             }
-            sendCapturedMouseMotion(event.getX(), event.getY());
+            sendRelativePointerMotion(event.getX(), event.getY());
         }
 
         if (action == MotionEvent.ACTION_SCROLL) {
@@ -965,7 +980,7 @@ public class MainActivity extends Activity
         // this diff in one place also handles mice that report button actions as
         // ACTION_BUTTON_PRESS/RELEASE instead of ACTION_DOWN/UP.
         if (action == MotionEvent.ACTION_CANCEL)
-            releaseAllMouseButtons();
+            releaseMouseButtonsForDevice(event.getDeviceId());
         else
             updateMouseButtonStateFromEvent(event);
         return true;
@@ -995,22 +1010,19 @@ public class MainActivity extends Activity
         boolean scrollEvent = action == MotionEvent.ACTION_SCROLL || explicitScroll;
 
         if (canceled || unsupportedGesture) {
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
+            cancelCapturedTouchpadRecognizer();
             capturedTouchpadBaselineValid = false;
         } else if (scrollEvent) {
             // Absolute capture normally supplies raw pointer coordinates, but a
             // few drivers still emit scroll axes. They must cancel a pending tap
             // before its final ACTION_UP.
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
+            cancelCapturedTouchpadRecognizer();
             for (int i = 0; i < event.getHistorySize(); i++)
                 sendCapturedTouchpadScrollAxes(event, i);
             sendCapturedTouchpadScrollAxes(event, -1);
             capturedTouchpadBaselineValid = false;
         } else if (hasButton) {
-            if (capturedTouchpadRecognizer != null)
-                capturedTouchpadRecognizer.cancel();
+            cancelCapturedTouchpadRecognizer();
         } else if (capturedTouchpadRecognizer != null) {
             MotionEvent gestureEvent = normalizeCapturedTouchpadEvent(event);
             try {
@@ -1047,7 +1059,7 @@ public class MainActivity extends Activity
         }
 
         if (action == MotionEvent.ACTION_CANCEL)
-            releaseAllMouseButtons();
+            releaseMouseButtonsForDevice(event.getDeviceId());
         else
             updateMouseButtonStateFromEvent(event);
         return true;
@@ -1057,13 +1069,42 @@ public class MainActivity extends Activity
                                                       int historyPos) {
         if (event.getPointerCount() != 1)
             return;
-        float dx = capturedTouchpadAxis(event, MotionEvent.AXIS_RELATIVE_X,
-                0, historyPos);
-        float dy = capturedTouchpadAxis(event, MotionEvent.AXIS_RELATIVE_Y,
-                0, historyPos);
+        float dx = normalizeCapturedTouchpadRelativeAxis(event,
+                MotionEvent.AXIS_RELATIVE_X, MotionEvent.AXIS_X,
+                true, historyPos);
+        float dy = normalizeCapturedTouchpadRelativeAxis(event,
+                MotionEvent.AXIS_RELATIVE_Y, MotionEvent.AXIS_Y,
+                false, historyPos);
         float[] fallback = applyCapturedTouchpadAbsoluteFallback(
                 event, historyPos, dx, dy);
         sendCapturedTouchpadMotion(fallback[0], fallback[1]);
+    }
+
+    /**
+     * AOSP reports captured-touchpad relative axes in the pad's raw ABS_MT units.
+     * Convert them to the same view-pixel space used by the absolute fallback and
+     * the shared cursor. OEMs that expose a value without declaring a motion range
+     * retain the old behavior because their units cannot be identified reliably.
+     */
+    private float normalizeCapturedTouchpadRelativeAxis(MotionEvent event,
+                                                        int relativeAxis,
+                                                        int absoluteAxis,
+                                                        boolean xAxis,
+                                                        int historyPos) {
+        float value = capturedTouchpadAxis(event, relativeAxis, 0, historyPos);
+        if (value == 0f)
+            return 0f;
+
+        InputDevice device = event.getDevice();
+        if (device == null)
+            return value;
+        InputDevice.MotionRange relativeRange = device.getMotionRange(
+                relativeAxis, InputDevice.SOURCE_TOUCHPAD);
+        if (relativeRange == null)
+            return value;
+
+        float scale = capturedTouchpadCoordinateScale(event, absoluteAxis, xAxis);
+        return scale > 0f ? value * scale : value;
     }
 
     /**
@@ -1150,7 +1191,7 @@ public class MainActivity extends Activity
         float scale = 1.0f + (capturedTouchpadAccel - 1.0f)
                 * (speed / (1.0f + speed));
         scale = Math.max(0.3f, Math.min(10.0f, scale));
-        sendCapturedMouseMotion(dx * scale, dy * scale);
+        sendRelativePointerMotion(dx * scale, dy * scale);
     }
 
     private void sendCapturedTouchpadScrollAxes(MotionEvent event, int historyPos) {
@@ -1231,16 +1272,32 @@ public class MainActivity extends Activity
         capturedTouchpadBaselineValid = capturedTouchpadBaselinePointers > 0;
     }
 
-    private void resetCapturedTouchpadGesture() {
+    private void cancelCapturedTouchpadRecognizer() {
         if (capturedTouchpadRecognizer != null)
             capturedTouchpadRecognizer.cancel();
+        releaseSyntheticPointerButtons(BUTTON_OWNER_CAPTURED_TOUCHPAD);
+    }
+
+    private void resetCapturedTouchpadGesture() {
+        cancelCapturedTouchpadRecognizer();
         capturedTouchpadBaselineValid = false;
         capturedTouchpadBaselinePointers = 0;
         capturedTouchpadLastCentroidX = 0f;
         capturedTouchpadLastCentroidY = 0f;
     }
 
-    private void sendCapturedMouseMotion(float dx, float dy) {
+    private void resetScreenTouchpadGesture() {
+        if (virtualTouchpad != null)
+            virtualTouchpad.cancel();
+        releaseSyntheticPointerButtons(BUTTON_OWNER_SCREEN_TOUCHPAD);
+    }
+
+    /**
+     * Move the single shared cursor using the current view-to-output gain. Screen
+     * and captured-touchpad callers provide view pixels; captured mice retain the
+     * existing policy that treats one raw REL count as one view-space unit.
+     */
+    private void sendRelativePointerMotion(float dx, float dy) {
         if (!Float.isFinite(dx) || !Float.isFinite(dy)
                 || (dx == 0f && dy == 0f))
             return;
@@ -1260,9 +1317,11 @@ public class MainActivity extends Activity
         // (scaled into the output coordinate space).  This is important for games:
         // movement continues to be reported even while the virtual cursor is at an
         // output edge.
-        mNative.sendMouseMotion((pointerX - originX) * scaleX,
-                (pointerY - originY) * scaleY,
-                dx * scaleX, dy * scaleY);
+        if (mNative != null) {
+            mNative.sendMouseMotion((pointerX - originX) * scaleX,
+                    (pointerY - originY) * scaleY,
+                    dx * scaleX, dy * scaleY);
+        }
     }
 
     @Override
@@ -1367,6 +1426,7 @@ public class MainActivity extends Activity
         if (mForceSettings) return;
         clearPointerCaptureBackTracking();
         releasePointerCapture(false);
+        resetScreenTouchpadGesture();
         immersed = false;
         stopImmersiveGrab();
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
@@ -1380,6 +1440,7 @@ public class MainActivity extends Activity
     @Override
     protected void onDestroy() {
         releasePointerCapture(false);
+        resetScreenTouchpadGesture();
         if (mRegisteredSocket != null) {
             sWindowsBySocket.remove(mRegisteredSocket, this);
             mRegisteredSocket = null;
@@ -1511,6 +1572,7 @@ public class MainActivity extends Activity
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
         releasePointerCapture(false);
+        resetScreenTouchpadGesture();
         mNative.stop();
     }
 
@@ -1793,9 +1855,9 @@ public class MainActivity extends Activity
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
                 float nativeX, nativeY;
                 if (autoStretch) {
-                    float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                    float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
                             (float)customScreenWidth / viewWidth : 1.0f;
-                    float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                    float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
                             (float)customScreenHeight / viewHeight : 1.0f;
                     nativeX = event.getX() * scaleX;
                     nativeY = event.getY() * scaleY;
@@ -1959,7 +2021,8 @@ public class MainActivity extends Activity
     private static final int CLASSIFICATION_MULTI_FINGER_SWIPE = 4;
     private static final int CLASSIFICATION_PINCH = 5;
 
-    private int savedBS = 0;
+    private static final int BUTTON_OWNER_SCREEN_TOUCHPAD = 0;
+    private static final int BUTTON_OWNER_CAPTURED_TOUCHPAD = 1;
 
     private static final int[][] BUTTON_MAP = {
         {MotionEvent.BUTTON_PRIMARY,   0x110}, // BTN_LEFT
@@ -1969,14 +2032,69 @@ public class MainActivity extends Activity
         {MotionEvent.BUTTON_FORWARD,   0x114}, // BTN_EXTRA
     };
 
-    private void updateMouseButtonState(int currentBS) {
+    private static final int SUPPORTED_POINTER_BUTTONS =
+            MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY
+            | MotionEvent.BUTTON_TERTIARY | MotionEvent.BUTTON_BACK
+            | MotionEvent.BUTTON_FORWARD;
+
+    // Physical devices publish snapshots keyed by device id. Gesture recognizers
+    // own separate masks. The aggregate is sent only when a button transitions
+    // globally, so one source cannot release a button still held by another.
+    private final SparseIntArray hardwarePointerButtonStates = new SparseIntArray();
+    private int screenTouchpadButtonState = 0;
+    private int capturedTouchpadButtonState = 0;
+    private int forwardedPointerButtonState = 0;
+
+    private int motionButtonForLinuxButton(int linuxButton) {
         for (int[] btn : BUTTON_MAP) {
-            boolean wasDown = (savedBS & btn[0]) != 0;
+            if (btn[1] == linuxButton)
+                return btn[0];
+        }
+        return 0;
+    }
+
+    private void setSyntheticPointerButton(int owner, int linuxButton,
+                                           boolean pressed) {
+        int mask = motionButtonForLinuxButton(linuxButton);
+        if (mask == 0)
+            return;
+
+        int state;
+        if (owner == BUTTON_OWNER_SCREEN_TOUCHPAD) {
+            state = screenTouchpadButtonState;
+            screenTouchpadButtonState = pressed ? state | mask : state & ~mask;
+        } else if (owner == BUTTON_OWNER_CAPTURED_TOUCHPAD) {
+            state = capturedTouchpadButtonState;
+            capturedTouchpadButtonState = pressed ? state | mask : state & ~mask;
+        } else {
+            return;
+        }
+        dispatchPointerButtonState();
+    }
+
+    private void releaseSyntheticPointerButtons(int owner) {
+        if (owner == BUTTON_OWNER_SCREEN_TOUCHPAD)
+            screenTouchpadButtonState = 0;
+        else if (owner == BUTTON_OWNER_CAPTURED_TOUCHPAD)
+            capturedTouchpadButtonState = 0;
+        else
+            return;
+        dispatchPointerButtonState();
+    }
+
+    private void dispatchPointerButtonState() {
+        int currentBS = screenTouchpadButtonState | capturedTouchpadButtonState;
+        for (int i = 0; i < hardwarePointerButtonStates.size(); i++)
+            currentBS |= hardwarePointerButtonStates.valueAt(i);
+        currentBS &= SUPPORTED_POINTER_BUTTONS;
+
+        for (int[] btn : BUTTON_MAP) {
+            boolean wasDown = (forwardedPointerButtonState & btn[0]) != 0;
             boolean isDown  = (currentBS & btn[0]) != 0;
             if (wasDown != isDown && mNative != null)
                 mNative.sendMouseButton(btn[1], isDown);
         }
-        savedBS = currentBS;
+        forwardedPointerButtonState = currentBS;
     }
 
     // ACTION_BUTTON_RELEASE may report a stale buttonState on some touchpad
@@ -1988,17 +2106,23 @@ public class MainActivity extends Activity
             buttonState |= event.getActionButton();
         else if (action == MotionEvent.ACTION_BUTTON_RELEASE)
             buttonState &= ~event.getActionButton();
-        updateMouseButtonState(buttonState);
+        buttonState &= SUPPORTED_POINTER_BUTTONS;
+        int deviceId = event.getDeviceId();
+        if (buttonState == 0)
+            hardwarePointerButtonStates.delete(deviceId);
+        else
+            hardwarePointerButtonStates.put(deviceId, buttonState);
+        dispatchPointerButtonState();
     }
 
-    private void releaseAllMouseButtons() {
-        if (savedBS == 0)
-            return;
-        for (int[] btn : BUTTON_MAP) {
-            if ((savedBS & btn[0]) != 0 && mNative != null)
-                mNative.sendMouseButton(btn[1], false);
-        }
-        savedBS = 0;
+    private void releaseMouseButtonsForDevice(int deviceId) {
+        hardwarePointerButtonStates.delete(deviceId);
+        dispatchPointerButtonState();
+    }
+
+    private void releaseAllHardwarePointerButtons() {
+        hardwarePointerButtonStates.clear();
+        dispatchPointerButtonState();
     }
 
     private boolean isMouseEvent(MotionEvent event) {
@@ -2023,9 +2147,9 @@ public class MainActivity extends Activity
         
         float nativeX, nativeY;
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+            float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
                        (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+            float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
                        (float)customScreenHeight / viewHeight : 1.0f;
             nativeX = event.getX() * scaleX;
             nativeY = event.getY() * scaleY;
@@ -2050,7 +2174,10 @@ public class MainActivity extends Activity
         }
         mNative.sendMouseMotion(nativeX, nativeY, dx, dy);
 
-        updateMouseButtonStateFromEvent(event);
+        if (event.getActionMasked() == MotionEvent.ACTION_CANCEL)
+            releaseMouseButtonsForDevice(event.getDeviceId());
+        else
+            updateMouseButtonStateFromEvent(event);
         return true;
     }
 
@@ -2108,9 +2235,9 @@ public class MainActivity extends Activity
     
     private float[] convertToNativeCoords(float x, float y) {
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+            float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
                            (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+            float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
                            (float)customScreenHeight / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {
@@ -2120,9 +2247,9 @@ public class MainActivity extends Activity
     
     private float[] convertMouseToNative(float x, float y) {
         if (autoStretch) {
-            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+            float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
                            (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+            float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
                            (float)customScreenHeight / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {

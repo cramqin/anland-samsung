@@ -1,28 +1,26 @@
 package com.anland.consumer;
 
 import android.content.Context;
-import android.graphics.Point;
 import android.view.MotionEvent;
 import android.view.ViewConfiguration;
-import android.view.WindowManager;
 
 /**
  * Laptop-style virtual touchpad: interprets finger gestures on the surface as
  * relative mouse motion, taps/clicks, long-press drag and two-finger scroll,
- * forwarding them to the remote through {@link Native}.
+ * forwarding them through a host-provided {@link Output}.
  *
  * Self-contained state machine — the host routes non-mouse touches here (see
  * MainActivity.onTouchEvent) when touchpad mode is on, pushes the acceleration
- * preference via {@link #setAccelStrength}, and calls {@link #onSurfaceChanged}
- * when the surface is resized.
+ * preference via {@link #setAccelStrength}. Each physical input stream should use
+ * its own instance so gesture state cannot leak between devices; their outputs may
+ * still share one cursor controller.
  */
 public final class VirtualTouchpad {
 
     /**
-     * Optional output used by the pointer-capture adapter.  The original
-     * touchpad path keeps writing directly to Native; a capture instance can
-     * reuse the same gesture state machine while supplying its own movement
-     * and coordinate backend.
+     * Gesture output supplied by the host. Keeping coordinates and button state
+     * outside this recognizer lets the on-screen and captured touchpads share one
+     * remote cursor without sharing their state machines.
      */
     interface Output {
         void onMotion(float dx, float dy);
@@ -41,26 +39,17 @@ public final class VirtualTouchpad {
     private float startX1, startY1;
     private float lastX2, lastY2;
     private long downTime1;
+    private long twoFingerDownTime;
     private final float touchSlop;
 
     private boolean isSingleTapCandidate = false;
     private boolean isTwoFingerTapCandidate = false;
     private boolean isDraggingActive = false;
 
-    private long lastTapTime = 0;
-    private float lastTapX, lastTapY;
-    private boolean isDoubleTapPending = false;
-
     private static final long TOUCH_LONG_PRESS_TIMEOUT = 500;
     private boolean hasLongPressed = false;
     private boolean isLongPressPossible = false;
     private boolean isMultiFinger = false;
-
-    // 鼠标位置（相对模式）
-    private float mouseX = 0;
-    private float mouseY = 0;
-    private int screenWidth = 1920;
-    private int screenHeight = 1080;
 
     private float mouseAccelStrength = 1.0f; // 加速度强度，0.5 ~ 10.0
 
@@ -75,27 +64,13 @@ public final class VirtualTouchpad {
     private float accumulatedY = 0f;
     private boolean smoothInitialized = false;
 
-    private final Context context;
-    private final Native mNative;
     private final Output output;
-    // The original on-screen touchpad emits an explicit double-click sequence.
-    // Captured hardware taps already arrive as separate clicks, so emitting a
-    // second synthetic pair would turn two taps into three clicks.
-    private final boolean synthesizeDoubleTap;
 
-    VirtualTouchpad(Context context, Native n) {
-        this(context, n, null);
-    }
-
-    VirtualTouchpad(Context context, Native n, Output output) {
-        this.context = context;
-        this.mNative = n;
+    VirtualTouchpad(Context context, Output output) {
+        if (output == null)
+            throw new IllegalArgumentException("VirtualTouchpad output must not be null");
         this.output = output;
-        this.synthesizeDoubleTap = output == null;
         touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
-        updateScreenSize();
-        mouseX = screenWidth / 2f;
-        mouseY = screenHeight / 2f;
     }
 
     /** Set the acceleration strength (clamped to 0.5 ~ 10.0). */
@@ -103,11 +78,8 @@ public final class VirtualTouchpad {
         mouseAccelStrength = Math.max(0.5f, Math.min(10.0f, strength));
     }
 
-    /** Re-read screen size and re-anchor the cursor after a surface resize. */
+    /** Drop any smoothing history after a surface resize. */
     void onSurfaceChanged() {
-        updateScreenSize();
-        mouseX = clamp(mouseX, 0, screenWidth);
-        mouseY = clamp(mouseY, 0, screenHeight);
         resetSmoothing();
     }
 
@@ -117,38 +89,21 @@ public final class VirtualTouchpad {
             sendButton(0x110, false);
         resetTouchpadState();
         resetSmoothing();
-        lastTapTime = 0L;
-        lastTapX = 0f;
-        lastTapY = 0f;
     }
 
     private void sendButton(int button, boolean pressed) {
-        if (output != null)
-            output.onButton(button, pressed);
-        else if (mNative != null)
-            mNative.sendMouseButton(button, pressed);
+        output.onButton(button, pressed);
     }
 
     private void sendScroll(int axis, float value) {
-        if (output != null)
-            output.onScroll(axis, value);
-        else if (mNative != null)
-            mNative.sendMouseScroll(axis, value);
+        output.onScroll(axis, value);
     }
 
     /**
-     * Send a relative movement to an adapter, or preserve the original
-     * absolute-cursor behavior for the normal virtual touchpad.
+     * Send relative movement to the shared cursor backend.
      */
     private void sendMotion(float dx, float dy) {
-        if (output != null) {
-            output.onMotion(dx, dy);
-            return;
-        }
-        mouseX = clamp(mouseX + dx, 0, screenWidth);
-        mouseY = clamp(mouseY + dy, 0, screenHeight);
-        if (mNative != null)
-            mNative.sendMouseMotion(mouseX, mouseY, 0f, 0f);
+        output.onMotion(dx, dy);
     }
 
     // ==================== 触摸板手势及辅助方法 ====================
@@ -158,11 +113,15 @@ public final class VirtualTouchpad {
 
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
+                // Recover from a missing CANCEL/UP before starting a new stream.
+                if (isDraggingActive)
+                    sendButton(0x110, false);
                 float x = event.getX();
                 float y = event.getY();
                 startX1 = lastX1 = x;
                 startY1 = lastY1 = y;
                 downTime1 = event.getEventTime();
+                twoFingerDownTime = 0L;
                 hasLongPressed = false;
                 isLongPressPossible = true;
                 isSingleTapCandidate = true;
@@ -184,6 +143,7 @@ public final class VirtualTouchpad {
                 if (pointerCount == 2) {
                     currentState = STATE_TWO_FINGER;
                     isTwoFingerTapCandidate = true;
+                    twoFingerDownTime = event.getEventTime();
                     lastX1 = event.getX(0);
                     lastY1 = event.getY(0);
                     lastX2 = event.getX(1);
@@ -202,12 +162,9 @@ public final class VirtualTouchpad {
                     if (dist > touchSlop) {
                         isLongPressPossible = false;
                         isSingleTapCandidate = false;
-                        // The original state machine intentionally preserves
-                        // this flag through POINTER_UP. In capture mode, clear
-                        // it once the remaining finger actually moves so a
-                        // scroll/drag cannot finish as a right-click.
-                        if (output != null)
-                            isTwoFingerTapCandidate = false;
+                        // Clear this once the remaining finger actually moves so
+                        // a scroll/drag cannot finish as a right-click.
+                        isTwoFingerTapCandidate = false;
                     }
 
                     if (isLongPressPossible && !hasLongPressed &&
@@ -216,12 +173,7 @@ public final class VirtualTouchpad {
                         currentState = STATE_DRAGGING;
                         isDraggingActive = true;
                         sendButton(0x110, true);
-                        mouseX = clamp(mouseX, 0, screenWidth);
-                        mouseY = clamp(mouseY, 0, screenHeight);
-                        if (output != null)
-                            output.onMotion(0f, 0f);
-                        else if (mNative != null)
-                            mNative.sendMouseMotion(mouseX, mouseY, 0f, 0f);
+                        output.onMotion(0f, 0f);
                         resetSmoothing();
                         break;
                     }
@@ -296,6 +248,8 @@ public final class VirtualTouchpad {
             case MotionEvent.ACTION_UP: {
                 long duration = event.getEventTime() - downTime1;
                 boolean isQuickTap = duration < 300;
+                boolean isQuickTwoFingerTap = twoFingerDownTime > 0L
+                        && event.getEventTime() - twoFingerDownTime < 300;
 
                 if (isDraggingActive) {
                     sendButton(0x110, false);
@@ -305,7 +259,7 @@ public final class VirtualTouchpad {
                     return true;
                 }
 
-                if (isTwoFingerTapCandidate && isQuickTap) {
+                if (isTwoFingerTapCandidate && isQuickTwoFingerTap) {
                     sendButton(0x111, true);
                     sendButton(0x111, false);
                     resetTouchpadState();
@@ -314,25 +268,11 @@ public final class VirtualTouchpad {
                 }
 
                 if (currentState == STATE_ONE_FINGER && isSingleTapCandidate && isQuickTap) {
-                    long gap = event.getEventTime() - lastTapTime;
-                    float dist = (float) Math.hypot(lastX1 - lastTapX, lastY1 - lastTapY);
-                    if (synthesizeDoubleTap && gap < 300 && dist < touchSlop
-                            && !isDoubleTapPending) {
-                        isDoubleTapPending = true;
-                        sendButton(0x110, true);
-                        sendButton(0x110, false);
-                        sendButton(0x110, true);
-                        sendButton(0x110, false);
-                        isDoubleTapPending = false;
-                        lastTapTime = 0;
-                    } else {
-                        sendButton(0x110, true);
-                        sendButton(0x110, false);
-                        lastTapTime = event.getEventTime();
-                        lastTapX = lastX1;
-                        lastTapY = lastY1;
-                        isDoubleTapPending = false;
-                    }
+                    // Each physical tap is one click. Two quick taps naturally form
+                    // a double-click at the remote compositor; synthesizing another
+                    // pair here would turn two taps into three clicks.
+                    sendButton(0x110, true);
+                    sendButton(0x110, false);
                     resetTouchpadState();
                     resetSmoothing();
                     return true;
@@ -358,11 +298,11 @@ public final class VirtualTouchpad {
         currentState = STATE_IDLE;
         isSingleTapCandidate = false;
         isTwoFingerTapCandidate = false;
-        isDoubleTapPending = false;
         hasLongPressed = false;
         isDraggingActive = false;
         isLongPressPossible = false;
         isMultiFinger = false;
+        twoFingerDownTime = 0L;
     }
 
     private void resetSmoothing() {
@@ -407,17 +347,4 @@ public final class VirtualTouchpad {
         return new float[]{outX, outY};
     }
 
-    private float clamp(float value, float min, float max) {
-        return Math.max(min, Math.min(max, value));
-    }
-
-    private void updateScreenSize() {
-        Point size = new Point();
-        WindowManager wm = context.getSystemService(WindowManager.class);
-        if (wm != null) {
-            wm.getDefaultDisplay().getSize(size);
-            screenWidth = size.x;
-            screenHeight = size.y;
-        }
-    }
 }
