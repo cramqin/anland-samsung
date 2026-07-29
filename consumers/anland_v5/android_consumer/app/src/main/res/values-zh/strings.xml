@@ -83,6 +83,18 @@
     <string name="pointer_capture_released">外接指针已释放。点击桌面画面可重新捕获。</string>
     <string name="mouse_sensitivity_label">触摸板指针灵敏度（加速度）</string>
     <string name="mouse_accel_value">%1$.1f 倍</string>
+    <string name="scroll_reverse_switch">反向滚动</string>
+    <string name="scroll_reverse_hint">开启后内容跟随手指移动（“自然滚动”）。对屏上触摸板和物理触摸板的双指滚动同时生效。</string>
+    <string name="scroll_speed_label">双指滚动速度</string>
+    <string name="scroll_speed_value">%1$.2f</string>
+    <string name="threshold_factor_value">%1$.2f 倍触摸阈值</string>
+    <string name="scroll_threshold_label">滚动判定阈值</string>
+    <string name="scroll_threshold_hint">手指移动多远才算“在动”。如果双指开合被当成滚动，调低此值。</string>
+    <string name="move_threshold_label">手势定性阈值</string>
+    <string name="move_threshold_hint">主导手指移动多远才对双指手势定性。如果滚动起步迟滞，调低此值。</string>
+    <string name="gesture_scale_label">手势幅度</string>
+    <string name="gesture_scale_value">%1$.0f 像素</string>
+    <string name="gesture_scale_hint">转为触摸的手势（双指开合、三指及以上）会映射到以指针为中心、边长为此值的正方形内。值越大，相同的手指移动幅度越大。</string>
 
     <!-- Connection -->
     <string name="socket_path_label">守护进程套接字路径</string>

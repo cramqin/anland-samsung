@@ -73,6 +73,11 @@ public class SettingsActivity extends Activity {
     private static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
     private static final String KEY_MOUSE_ACCEL = "mouse_speed";
     private static final String KEY_POINTER_CAPTURE = "pointer_capture";
+    private static final String KEY_SCROLL_SPEED = "scroll_speed";
+    private static final String KEY_SCROLL_REVERSE = "scroll_reverse";
+    private static final String KEY_SCROLL_THRESHOLD = "touchpad_scroll_threshold";
+    private static final String KEY_MOVE_THRESHOLD = "touchpad_move_threshold";
+    private static final String KEY_GESTURE_SCALE = "touchpad_gesture_scale";
 
     // Latency presets: target buffer in ms (0 = auto). The user-visible labels live
     // in the R.array.latency_labels string-array, parallel to this array.
@@ -719,6 +724,89 @@ public class SettingsActivity extends Activity {
         });
         accelLayout.addView(accelSeek);
         root.addView(accelLayout);
+
+        // ===== 双指滚动 =====
+        Switch reverseScrollSwitch = new Switch(this);
+        reverseScrollSwitch.setText(R.string.scroll_reverse_switch);
+        reverseScrollSwitch.setTextSize(14);
+        reverseScrollSwitch.setPadding(0, dp(8), 0, 0);
+        reverseScrollSwitch.setChecked(prefs.getBoolean(KEY_SCROLL_REVERSE, false));
+        reverseScrollSwitch.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_SCROLL_REVERSE, checked).apply());
+        root.addView(reverseScrollSwitch);
+
+        TextView reverseScrollHint = new TextView(this);
+        reverseScrollHint.setText(R.string.scroll_reverse_hint);
+        reverseScrollHint.setTextSize(12);
+        reverseScrollHint.setTextColor(Color.GRAY);
+        reverseScrollHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(reverseScrollHint);
+
+        addFloatSlider(root, R.string.scroll_speed_label, R.string.scroll_speed_value,
+                null, KEY_SCROLL_SPEED, 0.05f, 3.0f, 0.05f, 0.5f);
+        addFloatSlider(root, R.string.scroll_threshold_label,
+                R.string.threshold_factor_value, R.string.scroll_threshold_hint,
+                KEY_SCROLL_THRESHOLD, 0.05f, 3.0f, 0.05f, 0.5f);
+        addFloatSlider(root, R.string.move_threshold_label,
+                R.string.threshold_factor_value, R.string.move_threshold_hint,
+                KEY_MOVE_THRESHOLD, 0.1f, 8.0f, 0.05f, 2.35f);
+        addFloatSlider(root, R.string.gesture_scale_label, R.string.gesture_scale_value,
+                R.string.gesture_scale_hint,
+                KEY_GESTURE_SCALE, 100f, 3000f, 20f, 800f);
+    }
+
+    /**
+     * A labelled slider over a float preference, with the live value beside the label
+     * and an optional grey hint underneath.
+     */
+    private void addFloatSlider(LinearLayout root, int labelRes, int valueFormatRes,
+                                Integer hintRes, final String key,
+                                final float min, float max, final float step,
+                                float defValue) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(0, dp(8), 0, hintRes == null ? dp(16) : 0);
+
+        TextView label = new TextView(this);
+        label.setText(labelRes);
+        label.setTextSize(14);
+        layout.addView(label);
+
+        final TextView value = new TextView(this);
+        value.setTextSize(14);
+        value.setTextColor(Color.BLUE);
+        layout.addView(value);
+
+        SeekBar seek = new SeekBar(this);
+        seek.setMax(Math.round((max - min) / step));
+        float cur = Math.max(min, Math.min(max, prefs.getFloat(key, defValue)));
+        seek.setProgress(Math.round((cur - min) / step));
+        value.setText(getString(valueFormatRes, cur));
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                float val = min + progress * step;
+                value.setText(getString(valueFormatRes, val));
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putFloat(key, val).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        layout.addView(seek);
+        root.addView(layout);
+
+        if (hintRes != null) {
+            TextView hint = new TextView(this);
+            hint.setText(hintRes);
+            hint.setTextSize(12);
+            hint.setTextColor(Color.GRAY);
+            hint.setPadding(0, dp(2), 0, dp(12));
+            root.addView(hint);
+        }
     }
 
     // Connection settings: a custom daemon socket path and a "connect with root"

@@ -83,6 +83,18 @@
     <string name="pointer_capture_released">外接指標已釋放。點擊桌面畫面即可重新擷取。</string>
     <string name="mouse_sensitivity_label">觸控板指標靈敏度（加速度）</string>
     <string name="mouse_accel_value">%1$.1f 倍</string>
+    <string name="scroll_reverse_switch">反向捲動</string>
+    <string name="scroll_reverse_hint">開啟後內容會跟隨手指移動（「自然捲動」）。同時套用於螢幕觸控板與實體觸控板的雙指捲動。</string>
+    <string name="scroll_speed_label">雙指捲動速度</string>
+    <string name="scroll_speed_value">%1$.2f</string>
+    <string name="threshold_factor_value">%1$.2f 倍觸控閾值</string>
+    <string name="scroll_threshold_label">捲動判定閾值</string>
+    <string name="scroll_threshold_hint">手指需要移動多遠才算正在移動。若雙指縮放被誤判為捲動，請降低此值。</string>
+    <string name="move_threshold_label">手勢定性閾值</string>
+    <string name="move_threshold_hint">主要手指需要移動多遠才判定模糊的雙指手勢。若捲動啟動遲緩，請降低此值。</string>
+    <string name="gesture_scale_label">手勢幅度</string>
+    <string name="gesture_scale_value">%1$.0f 像素</string>
+    <string name="gesture_scale_hint">轉送為觸控的手勢（雙指縮放、三指或更多手指）會映射到以指標為中心、邊長為此值的正方形內。值越大，相同手指移動產生的幅度越大。</string>
 
     <!-- Connection -->
     <string name="socket_path_label">守護程序 socket 路徑</string>
