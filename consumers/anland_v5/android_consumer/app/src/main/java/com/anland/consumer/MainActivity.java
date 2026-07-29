@@ -15,7 +15,9 @@ import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
+import android.util.SparseArray;
 import android.util.SparseIntArray;
 import android.view.Display;
 import android.view.Gravity;
@@ -27,6 +29,7 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -42,7 +45,7 @@ public class MainActivity extends Activity
     private static final String TAG = "Anland";
 
     private SurfaceView surfaceView;
-    private boolean surfaceReady = false;
+    private volatile boolean surfaceReady = false;
     // System-clipboard bridge; also the target for the native clipboard callbacks.
     private Clipboard clipboard;
     private static final String PREFS_NAME = "anland_settings";
@@ -70,7 +73,7 @@ public class MainActivity extends Activity
     static final String EXTRA_SOCKET_PATH = "socket_path";
     static final String EXTRA_WINDOW_NAME = "window_name";
     // This window's own native transport instance (its own consumer_state handle).
-    private Native mNative;
+    private volatile Native mNative;
     // Socket path from the launch Intent; overrides the saved pref when non-null.
     private String mSocketOverride = null;
     // Title shown in recents / freeform (setTaskDescription); default "anland".
@@ -148,7 +151,35 @@ public class MainActivity extends Activity
     private static final int UNBOUND = -1;
     private int immersionKeycode = UNBOUND;
     private int immersionScancode = 0;
-    private boolean immersed = false;
+
+    private enum ImmersionState { OFF, STARTING, ACTIVE, STOPPING }
+    private ImmersionState immersionState = ImmersionState.OFF;
+    private long immersionSessionId = 0L;
+    private long immersionNativeStartQueuedSession = -1L;
+    private volatile long immersionDesiredSessionId = -1L;
+    // Snapshot of KEY_TOUCHPAD_MODE for the current grab session. The setting is
+    // deliberately session-scoped: native must choose one raw-touch route for the
+    // whole helper lifetime, and returning from Settings always ends immersion.
+    private boolean immersionTouchpadMode = false;
+    private boolean immersionToggleDownPending = false;
+    private int immersionToggleDeviceId = 0;
+    private long immersionToggleDownTime = 0L;
+
+    // Pointer capture is a session resource while immersive input is starting/active.
+    // Keep the user's saved setting untouched and restore the pre-session temporary
+    // suppression state when the session ends.
+    private boolean immersionPointerCaptureForced = false;
+    private boolean immersionPointerCaptureRequired = false;
+    private boolean immersionPointerSuppressedBefore = false;
+    private boolean immersionExitToastPending = false;
+
+    // Transport changes are also serialized on grabExecutor. A generation makes stale
+    // surface/lifecycle work harmless when callbacks arrive in quick succession.
+    private volatile long transportGeneration = 0L;
+    private volatile boolean transportReady = false;
+    private volatile boolean activityResumed = false;
+
+    private static final int IMMERSION_REASON_POINTER_CAPTURE = 100;
     // Tracked from onWindowFocusChanged rather than read via hasWindowFocus(), so the
     // grab decision does not depend on when the framework updates the decor view.
     private boolean mHasWindowFocus = false;
@@ -163,6 +194,35 @@ public class MainActivity extends Activity
     private boolean isTouchpadMode = true;
     // Finger-gesture touchpad (relative motion, taps, drag, two-finger scroll).
     private VirtualTouchpad virtualTouchpad;
+    // Raw touchscreen changes delivered by the immersive helper are frame deltas,
+    // not Android MotionEvents. Keep the active set here and rebuild ordinary
+    // touchscreen MotionEvents on the UI thread so both input paths share exactly
+    // the same VirtualTouchpad state machine.
+    private static final int IMMERSIVE_TOUCH_DOWN = 0;
+    private static final int IMMERSIVE_TOUCH_UP = 1;
+    private static final int IMMERSIVE_TOUCH_MOVE = 2;
+    private static final int IMMERSIVE_TOUCH_CANCEL = 3;
+    private static final int MAX_MOTION_EVENT_POINTERS = 32;
+
+    private static final class ImmersiveTouchPoint {
+        final int rawId;
+        final int motionId;
+        float normalizedX;
+        float normalizedY;
+
+        ImmersiveTouchPoint(int rawId, int motionId,
+                            float normalizedX, float normalizedY) {
+            this.rawId = rawId;
+            this.motionId = motionId;
+            this.normalizedX = normalizedX;
+            this.normalizedY = normalizedY;
+        }
+    }
+
+    private final SparseArray<ImmersiveTouchPoint> immersiveTouchPointers =
+            new SparseArray<>();
+    private long immersiveTouchDownTimeMs = 0L;
+    private long immersiveTouchLastEventTimeMs = 0L;
     // Reuses the original VirtualTouchpad gesture state machine for raw
     // SOURCE_TOUCHPAD events. Its movement output is intentionally ignored;
     // raw relative axes still go through the capture-specific cursor adapter.
@@ -224,6 +284,11 @@ public class MainActivity extends Activity
     // If the daemon socket is gone the daemon really went down, so close this window.
     public void onFallback(){
         runOnUiThread(() -> {
+            clearImmersionToggleTracking();
+            requestImmersionStop(false);
+            clearPointerCaptureBackTracking();
+            releasePointerCapture(false);
+            resetScreenTouchpadGesture();
             if (!isSocketFile(resolveSocketPath())) {
                 //exit
                 android.widget.Toast.makeText(this, "Deamon Down",
@@ -239,8 +304,18 @@ public class MainActivity extends Activity
         mHasWindowFocus = hasFocus;
         // Release FIRST, before the root socket probe below: that probe forks `su` and
         // must never be able to delay handing input back to Android.
-        if (!hasFocus)
-            stopImmersiveGrab();
+        if (!hasFocus) {
+            clearImmersionToggleTracking();
+            requestImmersionStop(false);
+            /* PointerCaptureChanged is dispatched on the main thread. Release before
+             * the root socket probe below, which may wait on su, so ViewRootImpl is
+             * never left waiting for this callback behind a blocking probe. */
+            if (mRoot != null) {
+                clearPointerCaptureBackTracking();
+                releasePointerCapture(false);
+                resetScreenTouchpadGesture();
+            }
+        }
         if (!isSocketFile(resolveSocketPath())) {
             //exit
             android.widget.Toast.makeText(this, "Deamon Down",
@@ -256,29 +331,93 @@ public class MainActivity extends Activity
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
         }
-        if (mRoot != null) {
-            if (hasFocus)
-                mRoot.post(this::syncPointerCapture);
-            else {
-                clearPointerCaptureBackTracking();
-                releasePointerCapture(false);
-                resetScreenTouchpadGesture();
-            }
-        }
+        if (hasFocus && mRoot != null)
+            mRoot.post(this::syncPointerCapture);
         // Immersion never survives losing focus: the grab must not outlive our
         // foreground, or the device would be input-dead behind us. Coming back starts
         // un-immersed, so the user re-enters deliberately with the toggle key.
-        // The release itself already happened at the top of this method.
-        if (!hasFocus)
-            immersed = false;
     }
 
-    // Enter immersion: launch the root helper, which grabs the touchscreen + keys.
-    // Only ever called from the toggle key, never from a lifecycle callback, so input
-    // is never taken without an explicit press.
-    private void enterImmersion() {
-        if (mNative == null || !fullKeyCaptureEnabled || immersed || !mHasWindowFocus)
+    private boolean isImmersionEngaged() {
+        return immersionState != ImmersionState.OFF;
+    }
+
+    private void clearImmersionToggleTracking() {
+        immersionToggleDownPending = false;
+        immersionToggleDeviceId = 0;
+        immersionToggleDownTime = 0L;
+    }
+
+    private void restoreImmersionPointerCapture() {
+        immersionPointerCaptureForced = false;
+        immersionPointerCaptureRequired = false;
+        pointerCaptureSuppressed = immersionPointerSuppressedBefore;
+        immersionPointerSuppressedBefore = false;
+        if (mRoot != null)
+            mRoot.post(this::syncPointerCapture);
+    }
+
+    /** Move Java state to STOPPING; pointer capture is restored after native joins. */
+    private long beginImmersionStopping() {
+        if (immersionState == ImmersionState.OFF)
+            return -1L;
+        if (immersionState != ImmersionState.STOPPING) {
+            immersionState = ImmersionState.STOPPING;
+            immersionNativeStartQueuedSession = -1L;
+            immersionDesiredSessionId = -1L;
+            immersionTouchpadMode = false;
+            clearImmersionToggleTracking();
+            // Rejecting later callbacks is not enough: a long-press drag may already
+            // hold BTN_LEFT, so end the recognizer synchronously as the session stops.
+            resetScreenTouchpadGesture();
+        }
+        return immersionSessionId;
+    }
+
+    private void finishImmersionStopping(long sessionId, boolean showExitToast) {
+        if (sessionId != immersionSessionId || immersionState != ImmersionState.STOPPING)
             return;
+        immersionState = ImmersionState.OFF;
+        immersionNativeStartQueuedSession = -1L;
+        restoreImmersionPointerCapture();
+        if (showExitToast || immersionExitToastPending)
+            android.widget.Toast.makeText(this, R.string.immerse_exited,
+                    android.widget.Toast.LENGTH_SHORT).show();
+        immersionExitToastPending = false;
+    }
+
+    /** Stop the helper off the UI thread; nativeStopInputGrab joins it there. */
+    private void stopImmersiveGrabForSession(long sessionId, boolean showExitToast) {
+        final Native n = mNative;
+        if (n == null) {
+            finishImmersionStopping(sessionId, showExitToast);
+            return;
+        }
+        postGrabTask(() -> {
+            n.stopInputGrab();
+            runOnUiThread(() -> finishImmersionStopping(sessionId, showExitToast));
+        });
+    }
+
+    private void requestImmersionStop(boolean showExitToast) {
+        if (immersionState == ImmersionState.OFF)
+            return;
+        boolean wasActive = immersionState == ImmersionState.ACTIVE;
+        long sessionId = beginImmersionStopping();
+        stopImmersiveGrabForSession(sessionId, showExitToast && wasActive);
+    }
+
+    // Enter immersion only after the toggle key's matching UP. This prevents the
+    // helper from grabbing a device between Android's DOWN and UP events.
+    private void enterImmersion() {
+        if (mNative == null || !fullKeyCaptureEnabled
+                || immersionState != ImmersionState.OFF || !mHasWindowFocus)
+            return;
+        if (!surfaceReady || !transportReady) {
+            android.widget.Toast.makeText(this, R.string.immerse_not_ready,
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
         // The helper reads raw evdev, so it needs the scancode, not the Android
         // keycode. Prefer the one captured when the key was bound; fall back to the
         // mapping table for bindings made before that was recorded. If neither
@@ -291,21 +430,82 @@ public class MainActivity extends Activity
                     android.widget.Toast.LENGTH_LONG).show();
             return;
         }
-        immersed = true;
-        android.widget.Toast.makeText(this, R.string.immerse_entered,
-                android.widget.Toast.LENGTH_SHORT).show();
+
+        final long sessionId = ++immersionSessionId;
+        // Drop an Android-delivered gesture before the helper takes the touchscreen;
+        // otherwise its missing UP could leave a drag/button held indefinitely.
+        resetScreenTouchpadGesture();
+        immersionState = ImmersionState.STARTING;
+        immersionNativeStartQueuedSession = -1L;
+        immersionDesiredSessionId = sessionId;
+        immersionTouchpadMode = isTouchpadMode;
+        immersionPointerSuppressedBefore = pointerCaptureSuppressed;
+        immersionPointerCaptureForced = true;
+        /* Always establish pointer capture before the root helper starts. Android's
+         * InputManager device list and raw evdev enumeration are not an atomic view;
+         * conditioning this on a Java-side mouse scan can miss a just-added or
+         * unusually classified pointer that the helper deliberately skips. */
+        immersionPointerCaptureRequired = true;
+        pointerCaptureSuppressed = false;
+        if (mRoot != null)
+            mRoot.post(this::syncPointerCapture);
+
+        maybeStartImmersionNative(sessionId, exitScan);
+        if (immersionPointerCaptureRequired && mRoot != null
+                && !mRoot.hasPointerCapture()) {
+            final long waitSession = sessionId;
+            mRoot.postDelayed(() -> {
+                if (waitSession != immersionSessionId
+                        || immersionState != ImmersionState.STARTING)
+                    return;
+                if (!mRoot.hasPointerCapture())
+                    failImmersionLocally(waitSession, IMMERSION_REASON_POINTER_CAPTURE);
+                else
+                    maybeStartImmersionNative(waitSession, exitScan);
+            }, 1200L);
+        }
+    }
+
+    private void maybeStartImmersionNative(long sessionId, int exitScan) {
+        if (sessionId != immersionSessionId || immersionState != ImmersionState.STARTING
+                || immersionNativeStartQueuedSession == sessionId)
+            return;
+        if (!mHasWindowFocus || !surfaceReady || !transportReady)
+            return;
+        if (immersionPointerCaptureRequired
+                && (mRoot == null || !mRoot.hasPointerCapture()))
+            return;
+
         String helper = getApplicationInfo().nativeLibraryDir + "/libinputgrab.so";
         String bridge = getCacheDir().getAbsolutePath() + "/anland_grab.sock";
         int rotation = currentDisplayRotation();
         final Native n = mNative;
-        postGrabTask(() -> n.startInputGrab(helper, bridge, rotation, exitScan));
+        if (n == null)
+            return;
+        final boolean touchpadMode = immersionTouchpadMode;
+        immersionNativeStartQueuedSession = sessionId;
+        postGrabTask(() -> {
+            // The user/lifecycle may have cancelled while this task waited behind a
+            // previous stop. Never resurrect an obsolete session from the queue.
+            if (immersionDesiredSessionId != sessionId)
+                return;
+            n.startInputGrab(helper, bridge, rotation, exitScan, sessionId,
+                    touchpadMode);
+        });
     }
 
-    private void stopImmersiveGrab() {
-        if (mNative == null)
+    private void failImmersionLocally(long sessionId, int reason) {
+        if (sessionId != immersionSessionId || immersionState == ImmersionState.OFF
+                || immersionState == ImmersionState.STOPPING)
             return;
-        final Native n = mNative;
-        postGrabTask(n::stopInputGrab);
+        Log.w(TAG, "ending immersion locally: session=" + sessionId
+                + " reason=" + reason);
+        boolean wasActive = immersionState == ImmersionState.ACTIVE;
+        beginImmersionStopping();
+        android.widget.Toast.makeText(this,
+                wasActive ? R.string.immerse_released : R.string.immerse_failed,
+                android.widget.Toast.LENGTH_SHORT).show();
+        stopImmersiveGrabForSession(sessionId, false);
     }
 
     // The executor is shut down in onDestroy, and a late lifecycle callback can still
@@ -326,21 +526,266 @@ public class MainActivity extends Activity
         return d != null ? d.getRotation() : Surface.ROTATION_0;
     }
 
-    // Called from native (grab thread) once the helper has released the grab on its
-    // own -- the user pressed the toggle key, it gave up on a stalled app, or it died.
-    // So this only has to catch up our own state. Posted to the UI thread (the grab
-    // thread must not self-join). Not the only way out: even if this never runs, the
-    // helper has already ungrabbed, so input is back with Android regardless.
-    public void onImmersionReleased() {
-        runOnUiThread(this::exitImmersion);
+    /**
+     * Called from the immersive grab thread once per raw touchscreen SYN_REPORT.
+     * Arrays contain only slots changed in that frame; the UI-thread adapter below
+     * retains the complete active set and emits Android-compatible MotionEvents.
+     */
+    public void onImmersiveTouchFrame(long sessionId, int[] pointerIds,
+            int[] actions, float[] xs, float[] ys, long eventTimeMs) {
+        runOnUiThread(() -> {
+            // Native callbacks may already be queued when stop/restart wins the race.
+            // Recheck both generation and state on the UI thread before touching the
+            // recognizer, otherwise an old session can press a button in a new one.
+            if (sessionId != immersionSessionId
+                    || (immersionState != ImmersionState.STARTING
+                        && immersionState != ImmersionState.ACTIVE)
+                    || !immersionTouchpadMode)
+                return;
+            handleImmersiveTouchFrame(pointerIds, actions, xs, ys, eventTimeMs);
+        });
     }
 
-    private void exitImmersion() {
-        if (immersed)
-            android.widget.Toast.makeText(this, R.string.immerse_exited,
+    private void handleImmersiveTouchFrame(int[] pointerIds, int[] actions,
+            float[] xs, float[] ys, long nativeEventTimeMs) {
+        if (pointerIds == null || actions == null || xs == null || ys == null
+                || pointerIds.length != actions.length
+                || pointerIds.length != xs.length
+                || pointerIds.length != ys.length) {
+            Log.w(TAG, "dropping malformed immersive touch frame");
+            resetScreenTouchpadGesture();
+            return;
+        }
+
+        final int changedCount = pointerIds.length;
+        for (int i = 0; i < changedCount; i++) {
+            if (actions[i] == IMMERSIVE_TOUCH_CANCEL) {
+                // A synthetic release caused by SYN_DROPPED, device loss, or helper
+                // teardown is not a user's finger-up and must never complete a tap.
+                resetScreenTouchpadGesture();
+                return;
+            }
+            if (pointerIds[i] < 0
+                    || (actions[i] != IMMERSIVE_TOUCH_DOWN
+                        && actions[i] != IMMERSIVE_TOUCH_UP
+                        && actions[i] != IMMERSIVE_TOUCH_MOVE)
+                    || !Float.isFinite(xs[i]) || !Float.isFinite(ys[i])) {
+                Log.w(TAG, "dropping invalid immersive touch change");
+                resetScreenTouchpadGesture();
+                return;
+            }
+        }
+
+        long eventTimeMs = nativeEventTimeMs > 0L
+                ? nativeEventTimeMs : SystemClock.uptimeMillis();
+        if (immersiveTouchLastEventTimeMs > 0L
+                && eventTimeMs < immersiveTouchLastEventTimeMs)
+            eventTimeMs = immersiveTouchLastEventTimeMs;
+        immersiveTouchLastEventTimeMs = eventTimeMs;
+
+        // Apply all existing-pointer coordinates first. One ACTION_MOVE then carries
+        // the complete SYN_REPORT snapshot, rather than turning simultaneous finger
+        // movement into several artificial Android events.
+        boolean existingPointerMoved = false;
+        int touchWidth = Math.max(1, pointerViewWidth());
+        int touchHeight = Math.max(1, pointerViewHeight());
+        int touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        for (int i = 0; i < changedCount; i++) {
+            int action = actions[i];
+            if (action != IMMERSIVE_TOUCH_MOVE && action != IMMERSIVE_TOUCH_UP)
+                continue;
+            ImmersiveTouchPoint point = immersiveTouchPointers.get(pointerIds[i]);
+            if (point == null)
+                continue;
+            if (action == IMMERSIVE_TOUCH_UP
+                    && Math.hypot((clampNormalized(xs[i]) - point.normalizedX)
+                                      * touchWidth,
+                                  (clampNormalized(ys[i]) - point.normalizedY)
+                                      * touchHeight) > touchSlop) {
+                // Some panels put the final coordinate change and TRACKING_ID=-1 in
+                // one report. Preserve a real last movement, but ignore normal lift
+                // jitter so a stationary long hold cannot turn into a ghost click.
+                existingPointerMoved = true;
+            }
+            setImmersiveTouchCoordinates(point, xs[i], ys[i]);
+            if (action == IMMERSIVE_TOUCH_MOVE)
+                existingPointerMoved = true;
+        }
+        if (existingPointerMoved && immersiveTouchPointers.size() > 0)
+            dispatchImmersiveTouchEvent(MotionEvent.ACTION_MOVE, -1, eventTimeMs);
+
+        // Add every newly pressed pointer before processing lifts from the same raw
+        // frame. A simultaneous hand-off is therefore treated as a multi-touch
+        // transition, not as an accidental tap from the finger that was lifted.
+        for (int i = 0; i < changedCount; i++) {
+            if (actions[i] != IMMERSIVE_TOUCH_DOWN)
+                continue;
+            int rawId = pointerIds[i];
+            ImmersiveTouchPoint existing = immersiveTouchPointers.get(rawId);
+            if (existing != null) {
+                setImmersiveTouchCoordinates(existing, xs[i], ys[i]);
+                continue;
+            }
+            int motionId = allocateImmersiveMotionPointerId();
+            if (motionId < 0) {
+                Log.w(TAG, "too many active immersive touch pointers");
+                resetScreenTouchpadGesture();
+                return;
+            }
+            boolean firstPointer = immersiveTouchPointers.size() == 0;
+            ImmersiveTouchPoint point = new ImmersiveTouchPoint(rawId, motionId,
+                    clampNormalized(xs[i]), clampNormalized(ys[i]));
+            immersiveTouchPointers.put(rawId, point);
+            if (firstPointer)
+                immersiveTouchDownTimeMs = eventTimeMs;
+            dispatchImmersiveTouchEvent(firstPointer ? MotionEvent.ACTION_DOWN
+                    : MotionEvent.ACTION_POINTER_DOWN, rawId, eventTimeMs);
+        }
+
+        // ACTION_UP/POINTER_UP must still include the lifted pointer. Remove it only
+        // after the recognizer has consumed that event.
+        for (int i = 0; i < changedCount; i++) {
+            if (actions[i] != IMMERSIVE_TOUCH_UP)
+                continue;
+            int rawId = pointerIds[i];
+            int pointerIndex = immersiveTouchPointers.indexOfKey(rawId);
+            if (pointerIndex < 0)
+                continue;
+            boolean lastPointer = immersiveTouchPointers.size() == 1;
+            dispatchImmersiveTouchEvent(lastPointer ? MotionEvent.ACTION_UP
+                    : MotionEvent.ACTION_POINTER_UP, rawId, eventTimeMs);
+            immersiveTouchPointers.removeAt(pointerIndex);
+            if (lastPointer)
+                immersiveTouchDownTimeMs = 0L;
+        }
+    }
+
+    private static float clampNormalized(float value) {
+        return Math.max(0f, Math.min(1f, value));
+    }
+
+    private static void setImmersiveTouchCoordinates(ImmersiveTouchPoint point,
+                                                      float x, float y) {
+        point.normalizedX = clampNormalized(x);
+        point.normalizedY = clampNormalized(y);
+    }
+
+    /** MotionEvent pointer ids are limited to 0..31; raw ids include device index. */
+    private int allocateImmersiveMotionPointerId() {
+        if (immersiveTouchPointers.size() >= MAX_MOTION_EVENT_POINTERS)
+            return -1;
+        for (int candidate = 0; candidate < MAX_MOTION_EVENT_POINTERS; candidate++) {
+            boolean used = false;
+            for (int i = 0; i < immersiveTouchPointers.size(); i++) {
+                if (immersiveTouchPointers.valueAt(i).motionId == candidate) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used)
+                return candidate;
+        }
+        return -1;
+    }
+
+    private void dispatchImmersiveTouchEvent(int actionMasked, int actionRawId,
+                                              long eventTimeMs) {
+        int pointerCount = immersiveTouchPointers.size();
+        if (pointerCount <= 0 || virtualTouchpad == null)
+            return;
+
+        int action = actionMasked;
+        if (actionMasked == MotionEvent.ACTION_POINTER_DOWN
+                || actionMasked == MotionEvent.ACTION_POINTER_UP) {
+            int actionIndex = immersiveTouchPointers.indexOfKey(actionRawId);
+            if (actionIndex < 0)
+                return;
+            action |= actionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT;
+        }
+
+        int width = Math.max(1, pointerViewWidth());
+        int height = Math.max(1, pointerViewHeight());
+        MotionEvent.PointerProperties[] properties =
+                new MotionEvent.PointerProperties[pointerCount];
+        MotionEvent.PointerCoords[] coordinates =
+                new MotionEvent.PointerCoords[pointerCount];
+        for (int i = 0; i < pointerCount; i++) {
+            ImmersiveTouchPoint point = immersiveTouchPointers.valueAt(i);
+            MotionEvent.PointerProperties prop = new MotionEvent.PointerProperties();
+            prop.id = point.motionId;
+            prop.toolType = MotionEvent.TOOL_TYPE_FINGER;
+            properties[i] = prop;
+
+            MotionEvent.PointerCoords coord = new MotionEvent.PointerCoords();
+            coord.x = point.normalizedX * width;
+            coord.y = point.normalizedY * height;
+            coord.pressure = 1f;
+            coord.size = 1f;
+            coordinates[i] = coord;
+        }
+
+        long downTimeMs = immersiveTouchDownTimeMs > 0L
+                ? immersiveTouchDownTimeMs : eventTimeMs;
+        MotionEvent event = MotionEvent.obtain(downTimeMs, eventTimeMs, action,
+                pointerCount, properties, coordinates, 0, 0, 1f, 1f,
+                0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
+        try {
+            virtualTouchpad.onTouch(event);
+        } finally {
+            event.recycle();
+        }
+    }
+
+    public void onImmersionStarted(long sessionId) {
+        runOnUiThread(() -> {
+            if (sessionId != immersionSessionId
+                    || immersionState != ImmersionState.STARTING)
+                return;
+            if (immersionPointerCaptureRequired
+                    && (mRoot == null || !mRoot.hasPointerCapture())) {
+                failImmersionLocally(sessionId, IMMERSION_REASON_POINTER_CAPTURE);
+                return;
+            }
+            // The helper start callback is queued before its raw event loop. Clear
+            // touches delivered by Android during STARTING at that exact hand-over.
+            resetScreenTouchpadGesture();
+            immersionState = ImmersionState.ACTIVE;
+            android.widget.Toast.makeText(this, R.string.immerse_entered,
                     android.widget.Toast.LENGTH_SHORT).show();
-        immersed = false;
-        stopImmersiveGrab();
+        });
+    }
+
+    public void onImmersionFailed(long sessionId, int reason) {
+        runOnUiThread(() -> {
+            if (sessionId != immersionSessionId
+                    || immersionState != ImmersionState.STARTING)
+                return;
+            Log.w(TAG, "immersion start failed: session=" + sessionId
+                    + " reason=" + reason);
+            beginImmersionStopping();
+            android.widget.Toast.makeText(this, R.string.immerse_failed,
+                    android.widget.Toast.LENGTH_SHORT).show();
+            stopImmersiveGrabForSession(sessionId, false);
+        });
+    }
+
+    public void onImmersionReleased(long sessionId, int reason) {
+        runOnUiThread(() -> {
+            if (sessionId != immersionSessionId
+                    || immersionState == ImmersionState.OFF
+                    || immersionState == ImmersionState.STOPPING)
+                return;
+            boolean wasActive = immersionState == ImmersionState.ACTIVE;
+            beginImmersionStopping();
+            if (wasActive) {
+                String msg = reason == Native.INPUT_GRAB_REASON_EXIT_KEY
+                        ? getString(R.string.immerse_exited)
+                        : getString(R.string.immerse_released);
+                android.widget.Toast.makeText(this, msg,
+                        android.widget.Toast.LENGTH_SHORT).show();
+            }
+            stopImmersiveGrabForSession(sessionId, false);
+        });
     }
 
     // The bound key toggles immersion. Entering is detected here from an ordinary
@@ -348,48 +793,164 @@ public class MainActivity extends Activity
     // helper, which sees the same key and releases the grab itself -- so the way out
     // never depends on this process being responsive.
     //
-    // Reaching this while `immersed` means the grab is NOT actually in force (the
-    // helper failed to start, e.g. root was denied, or it already died), because
-    // otherwise Android would not be delivering us keys -- so treat it as an exit and
-    // the user can never be stuck unable to toggle either way.
     // Returns true if the event was consumed.
     private boolean handleImmersionKey(KeyEvent event) {
         if (!fullKeyCaptureEnabled || immersionKeycode == UNBOUND)
             return false;
         if (event.getKeyCode() != immersionKeycode)
             return false;
-        // Swallow both DOWN and UP: this key is the toggle, so Linux must not also see
-        // it (the helper likewise never forwards it while immersed). The repeatCount
-        // guard stops a held key from toggling over and over.
-        if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            if (immersed) exitImmersion();
-            else          enterImmersion();
+        // Swallow both DOWN and UP. Entering waits for the matching UP; while a
+        // session is active/starting, a delivered Android DOWN is a safe cancel.
+        if (event.getAction() == KeyEvent.ACTION_DOWN
+                && event.getRepeatCount() == 0) {
+            if (immersionState == ImmersionState.OFF) {
+                immersionToggleDownPending = true;
+                immersionToggleDeviceId = event.getDeviceId();
+                immersionToggleDownTime = event.getDownTime();
+            } else if (immersionState != ImmersionState.STOPPING) {
+                requestImmersionStop(immersionState == ImmersionState.ACTIVE);
+            }
+        } else if (event.getAction() == KeyEvent.ACTION_UP
+                && immersionToggleDownPending
+                && immersionToggleDeviceId == event.getDeviceId()
+                && immersionToggleDownTime == event.getDownTime()) {
+            clearImmersionToggleTracking();
+            enterImmersion();
         }
         return true;
     }
 
     private void pushRefreshRate() {
+        Native n = mNative;
+        if (n == null || !transportReady)
+            return;
         Display d = getDisplay();
         if (d != null)
-            mNative.setRefreshRate(d.getRefreshRate());
+            n.setRefreshRate(d.getRefreshRate());
     }
 
-    // Push the current connection settings (socket path / root mode) to native
-    // before (re)connecting. The root helper is the executable bundled in the
-    // app's native lib dir; the bridge is a unix socket in our cache dir that
-    // the helper, launched via su, uses to hand back the daemon fd.
-    private void applyConnectionConfig() {
+    private static final class NativeTransportConfig {
+        final String socketPath;
+        final boolean useRoot;
+        final String helperPath;
+        final String bridgePath;
+        final int customWidth;
+        final int customHeight;
+        final float refreshRate;
+        final boolean micEnabled;
+        final int speakerLatencyMs;
+        final int micLatencyMs;
+
+        NativeTransportConfig(String socketPath, boolean useRoot, String helperPath,
+                String bridgePath, int customWidth, int customHeight, float refreshRate,
+                boolean micEnabled, int speakerLatencyMs, int micLatencyMs) {
+            this.socketPath = socketPath;
+            this.useRoot = useRoot;
+            this.helperPath = helperPath;
+            this.bridgePath = bridgePath;
+            this.customWidth = customWidth;
+            this.customHeight = customHeight;
+            this.refreshRate = refreshRate;
+            this.micEnabled = micEnabled;
+            this.speakerLatencyMs = speakerLatencyMs;
+            this.micLatencyMs = micLatencyMs;
+        }
+    }
+
+    /** Snapshot UI/preferences before handing a restart to the native worker. */
+    private NativeTransportConfig snapshotNativeTransportConfig() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String sock = resolveSocketPath();
         boolean useRoot = prefs.getBoolean(KEY_USE_ROOT, true);
         String helperPath = getApplicationInfo().nativeLibraryDir + "/libfdhelper.so";
         String bridgePath = getCacheDir().getAbsolutePath() + "/anland_fdbridge.sock";
-        mNative.configure(sock, useRoot, helperPath, bridgePath);
         int customW = prefs.getInt("custom_width", 0);
         int customH = prefs.getInt("custom_height", 0);
-        customScreenWidth = prefs.getInt("custom_width", 0);
-        customScreenHeight = prefs.getInt("custom_height", 0);
-        mNative.setCustomResolution(customW, customH);
+        customScreenWidth = customW;
+        customScreenHeight = customH;
+        Display d = getDisplay();
+        float refresh = d != null ? d.getRefreshRate() : 60.0f;
+        boolean wantMic = prefs.getBoolean(KEY_MIC_ENABLED, false);
+        boolean micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+        if (wantMic && !micGranted) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
+        }
+        return new NativeTransportConfig(sock, useRoot, helperPath, bridgePath,
+                customW, customH, refresh, wantMic && micGranted,
+                prefs.getInt(KEY_SPEAKER_LATENCY_MS, 0),
+                prefs.getInt(KEY_MIC_LATENCY_MS, 0));
+    }
+
+    private boolean isTransportOperationCurrent(long generation, Native n) {
+        return generation == transportGeneration && mNative == n;
+    }
+
+    /**
+     * Stop/restart the display transport only after nativeStopInputGrab has joined the
+     * grab reader. This keeps disconnect(ctx) from racing its input writes. All work
+     * that may block runs on grabExecutor; generation checks suppress stale restarts.
+     */
+    private void scheduleNativeTransport(Surface surface, boolean restart,
+                                         boolean showImmersionExit) {
+        final Native n = mNative;
+        if (n == null)
+            return;
+        final boolean wasImmersed = immersionState == ImmersionState.ACTIVE;
+        if (showImmersionExit && wasImmersed)
+            immersionExitToastPending = true;
+        final long stoppingSession = beginImmersionStopping();
+        final long generation = ++transportGeneration;
+        transportReady = false;
+        final NativeTransportConfig config = restart
+                ? snapshotNativeTransportConfig() : null;
+
+        postGrabTask(() -> {
+            if (!isTransportOperationCurrent(generation, n))
+                return;
+            n.stopInputGrab();
+            if (!isTransportOperationCurrent(generation, n))
+                return;
+
+            n.stop();
+            boolean started = false;
+            boolean socketMissing = false;
+            if (restart && activityResumed && surfaceReady
+                    && surface != null && surface.isValid()
+                    && isTransportOperationCurrent(generation, n)) {
+                if (!isSocketFile(config.socketPath, config.useRoot)) {
+                    socketMissing = true;
+                } else if (isTransportOperationCurrent(generation, n)) {
+                    n.configure(config.socketPath, config.useRoot,
+                            config.helperPath, config.bridgePath);
+                    n.setCustomResolution(config.customWidth, config.customHeight);
+                    n.start(surface, clipboard, this);
+                    n.setRefreshRate(config.refreshRate);
+                    n.setMicEnabled(config.micEnabled);
+                    n.setAudioLatency(config.speakerLatencyMs, config.micLatencyMs);
+                    started = true;
+                }
+            }
+
+            final boolean transportStarted = started;
+            final boolean daemonMissing = socketMissing;
+            runOnUiThread(() -> {
+                if (stoppingSession >= 0L) {
+                    finishImmersionStopping(stoppingSession,
+                            showImmersionExit && wasImmersed);
+                }
+                if (!isTransportOperationCurrent(generation, n))
+                    return;
+                transportReady = transportStarted;
+                if (transportStarted)
+                    pushRefreshRate();
+                if (daemonMissing) {
+                    android.widget.Toast.makeText(this, "Deamon Down",
+                            android.widget.Toast.LENGTH_SHORT).show();
+                    finish();
+                }
+            });
+        });
     }
 
     // The daemon socket this window targets: the launch-Intent override if any,
@@ -405,19 +966,6 @@ public class MainActivity extends Activity
         return sock.trim();
     }
 
-    // Start (or restart) this window's native pipeline, but only if the daemon
-    // socket is still a live socket. The daemon can go down after launch, so
-    // re-check on every (re)connect; if it is gone, report it and exit the window.
-    private void startNative(android.view.Surface surface) {
-        if (!isSocketFile(resolveSocketPath())) {
-            android.widget.Toast.makeText(this, "Deamon Down",
-                    android.widget.Toast.LENGTH_SHORT).show();
-            finish();
-            return;
-        }
-        mNative.start(surface, clipboard, this);
-    }
-
     // True only when `path` exists and is a unix-domain socket. In root mode the
     // daemon socket usually lives in a root-only location (e.g. /data/local/tmp),
     // which this untrusted_app process cannot stat() directly -- a direct stat
@@ -427,6 +975,10 @@ public class MainActivity extends Activity
     private boolean isSocketFile(String path) {
         boolean useRoot = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .getBoolean(KEY_USE_ROOT, true);
+        return isSocketFile(path, useRoot);
+    }
+
+    private boolean isSocketFile(String path, boolean useRoot) {
         return useRoot ? isSocketFileRoot(path) : isSocketFileLocal(path);
     }
 
@@ -570,6 +1122,7 @@ public class MainActivity extends Activity
                     releaseAllHardwarePointerButtons();
                     resetCapturedTouchpadGesture();
                 }
+                onImmersionPointerCaptureChanged(hasCapture);
             }
         };
         root.addView(surfaceView, new FrameLayout.LayoutParams(
@@ -791,8 +1344,13 @@ public class MainActivity extends Activity
         if (mRoot == null)
             return;
 
-        boolean shouldCapture = pointerCaptureEnabled
-                && !pointerCaptureSuppressed
+        boolean sessionCapture = immersionPointerCaptureForced
+                && (immersionState == ImmersionState.STARTING
+                    || immersionState == ImmersionState.ACTIVE
+                    || immersionState == ImmersionState.STOPPING);
+        boolean shouldCapture = (sessionCapture
+                || (pointerCaptureEnabled && !pointerCaptureSuppressed))
+                && activityResumed
                 && mRoot.hasWindowFocus();
         if (shouldCapture) {
             if (!mRoot.hasPointerCapture()) {
@@ -803,6 +1361,25 @@ public class MainActivity extends Activity
             }
         } else if (mRoot.hasPointerCapture()) {
             mRoot.releasePointerCapture();
+        }
+    }
+
+    private void onImmersionPointerCaptureChanged(boolean hasCapture) {
+        if (hasCapture) {
+            if (immersionState == ImmersionState.STARTING) {
+                int exitScan = immersionScancode > 0
+                        ? immersionScancode : KeyCodeMapper.getScanCode(immersionKeycode);
+                if (exitScan > 0)
+                    maybeStartImmersionNative(immersionSessionId, exitScan);
+            }
+            return;
+        }
+        // A capture request can transiently report false while STARTING; its bounded
+        // timeout handles that case. Once ACTIVE, losing a required external pointer
+        // capture would let the device escape into Android, so release everything.
+        if (immersionState == ImmersionState.ACTIVE && immersionPointerCaptureRequired) {
+            Log.w(TAG, "external pointer capture lost during immersion");
+            failImmersionLocally(immersionSessionId, IMMERSION_REASON_POINTER_CAPTURE);
         }
     }
 
@@ -847,6 +1424,12 @@ public class MainActivity extends Activity
     private boolean handlePointerCaptureBackKey(KeyEvent event) {
         if (event.getKeyCode() != KeyEvent.KEYCODE_BACK || isMouseKeyEvent(event))
             return false;
+
+        // Back may never peel pointer capture away from an immersive session. The
+        // dedicated immersion toggle owns session exit; all other Back presses are
+        // simply reserved while STARTING/ACTIVE/STOPPING.
+        if (isImmersionEngaged())
+            return true;
 
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             if (event.getRepeatCount() > 0)
@@ -1287,6 +1870,9 @@ public class MainActivity extends Activity
     }
 
     private void resetScreenTouchpadGesture() {
+        immersiveTouchPointers.clear();
+        immersiveTouchDownTimeMs = 0L;
+        immersiveTouchLastEventTimeMs = 0L;
         if (virtualTouchpad != null)
             virtualTouchpad.cancel();
         releaseSyntheticPointerButtons(BUTTON_OWNER_SCREEN_TOUCHPAD);
@@ -1327,6 +1913,7 @@ public class MainActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        activityResumed = true;
 
         // Bounced to Settings from onCreate (socket missing): nothing was set up, so
         // just exit this window instead of running the connect logic.
@@ -1383,12 +1970,10 @@ public class MainActivity extends Activity
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
         if (surfaceReady) {
-            mNative.stop();
-            applyConnectionConfig();
-            startNative(surfaceView.getHolder().getSurface());
-            pushRefreshRate();
-            applyMicState();
-            applyAudioLatency();
+            scheduleNativeTransport(surfaceView.getHolder().getSurface(), true, false);
+        } else {
+            transportReady = false;
+            requestImmersionStop(false);
         }
 
         // ===== 重新读取触摸板设置 =====
@@ -1411,8 +1996,7 @@ public class MainActivity extends Activity
         fullKeyCaptureEnabled = prefs.getBoolean(KEY_FULL_KEY_CAPTURE, false);
         immersionKeycode = prefs.getInt(KEY_IMMERSION_KEYCODE, UNBOUND);
         immersionScancode = prefs.getInt(KEY_IMMERSION_SCANCODE, 0);
-        immersed = false;
-        stopImmersiveGrab();
+        clearImmersionToggleTracking();
 
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
@@ -1420,33 +2004,48 @@ public class MainActivity extends Activity
 
     @Override
     protected void onPause() {
-        super.onPause();
+        activityResumed = false;
         // Socket-missing bounce: no pipeline exists, so skip teardown (mNative is
         // null) and don't let the jump to Settings trigger any of it.
-        if (mForceSettings) return;
+        if (mForceSettings) {
+            super.onPause();
+            return;
+        }
+        clearImmersionToggleTracking();
+        scheduleNativeTransport(null, false, false);
         clearPointerCaptureBackTracking();
         releasePointerCapture(false);
         resetScreenTouchpadGesture();
-        immersed = false;
-        stopImmersiveGrab();
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
-        mNative.stop();
+        super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        activityResumed = false;
+        transportReady = false;
+        ++transportGeneration;
+        beginImmersionStopping();
+        clearImmersionToggleTracking();
         releasePointerCapture(false);
         resetScreenTouchpadGesture();
+        if (sInstance == this)
+            sInstance = null;
         if (mRegisteredSocket != null) {
             sWindowsBySocket.remove(mRegisteredSocket, this);
             mRegisteredSocket = null;
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
+        // onPause's queued native stop may be invalidated by the destroy generation.
+        // Unregister synchronously so the Clipboard object cannot retain this dead
+        // Activity through ClipboardManager while native destruction waits in queue.
+        if (clipboard != null)
+            clipboard.nativeClipListening(false);
         // Release only THIS window's native pipeline (its consumer_state, audio bridge
         // and camera client). The camera service itself is a process-global shared by
         // every window, so it is intentionally not torn down here -- destroying it
@@ -1487,37 +2086,6 @@ public class MainActivity extends Activity
         }
     }
 
-    /*
-     * Forward the mic only when the user enabled it AND RECORD_AUDIO is granted.
-     * If enabled but not yet granted, request it; onRequestPermissionsResult applies
-     * the result. Safe to call after every nativeStart (re)connect.
-     */
-    /* Push the speaker/mic latency presets to native (which forwards them to the
-     * producer's PipeWire nodes). Safe to call after every (re)connect and whenever
-     * the user changes a preset. */
-    private void applyAudioLatency() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        int speakerMs = prefs.getInt(KEY_SPEAKER_LATENCY_MS, 0);
-        int micMs = prefs.getInt(KEY_MIC_LATENCY_MS, 0);
-        mNative.setAudioLatency(speakerMs, micMs);
-    }
-
-    private void applyMicState() {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        boolean want = prefs.getBoolean(KEY_MIC_ENABLED, false);
-        if (!want) {
-            mNative.setMicEnabled(false);
-            return;
-        }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED) {
-            mNative.setMicEnabled(true);
-        } else {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
-                               REQ_RECORD_AUDIO);
-        }
-    }
-
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
@@ -1525,7 +2093,9 @@ public class MainActivity extends Activity
         if (requestCode == REQ_RECORD_AUDIO) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            mNative.setMicEnabled(granted);
+            Native n = mNative;
+            if (n != null)
+                n.setMicEnabled(granted);
         } else if (requestCode == REQ_CAMERA) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -1555,12 +2125,7 @@ public class MainActivity extends Activity
         surfaceReady = true;
         // Same ordering guarantee as onResume: camera service settled before connect.
         applyCameraState();
-        mNative.stop();
-        applyConnectionConfig();
-        startNative(holder.getSurface());
-        pushRefreshRate();
-        applyMicState();
-        applyAudioLatency();
+        scheduleNativeTransport(holder.getSurface(), true, true);
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         virtualTouchpad.onSurfaceChanged();
@@ -1571,9 +2136,11 @@ public class MainActivity extends Activity
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
+        transportReady = false;
+        clearImmersionToggleTracking();
+        scheduleNativeTransport(null, false, false);
         releasePointerCapture(false);
         resetScreenTouchpadGesture();
-        mNative.stop();
     }
 
 
@@ -1929,6 +2496,8 @@ public class MainActivity extends Activity
     // unexpectedly finish via gesture navigation.
     @Override
     public void onBackPressed() {
+        if (isImmersionEngaged())
+            return;
         if (mRoot != null && mRoot.hasPointerCapture()) {
             releasePointerCapture(true);
             // There is no KeyEvent on this OEM path. Use a wildcard so a trailing

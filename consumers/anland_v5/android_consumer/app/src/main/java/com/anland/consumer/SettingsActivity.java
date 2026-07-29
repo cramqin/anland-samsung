@@ -1073,9 +1073,27 @@ public class SettingsActivity extends Activity {
         // Ignore generic Virtual Keyboard keycode (it's a placeholder)
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN) return true;
 
-        // Record the raw evdev scancode alongside: the immersion helper matches on it.
-        finishListening(keyCode, event.getScanCode());
-        Log.i(TAG, "Bound keycode: " + keyCode + " scancode: " + event.getScanCode());
+        int scanCode = event.getScanCode();
+        if (KEY_IMMERSION_KEYCODE.equals(listeningFor.prefKey)) {
+            // Back is not delivered as a KeyEvent on every OEM, and Power is owned by
+            // the system. Neither is a reliable root-side escape key.
+            if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_POWER) {
+                Toast.makeText(this, R.string.immerse_bind_key_reserved,
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+            if (scanCode <= 0)
+                scanCode = KeyCodeMapper.getScanCode(keyCode);
+            if (scanCode <= 0) {
+                Toast.makeText(this, R.string.immerse_key_unusable,
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+        }
+
+        // Record the raw/fallback evdev scancode alongside: the helper matches on it.
+        finishListening(keyCode, scanCode);
+        Log.i(TAG, "Bound keycode: " + keyCode + " scancode: " + scanCode);
         return true;
     }
 

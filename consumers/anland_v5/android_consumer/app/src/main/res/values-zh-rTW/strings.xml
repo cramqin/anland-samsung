@@ -48,7 +48,11 @@
     <string name="immerse_key_hint">用於進入／退出沉浸模式的按鍵，必須綁定：root 助手正是靠這個鍵來釋放擷取，未綁定時不會進入沉浸模式。\n\n綁定時會一併記錄該鍵的 evdev 掃描碼。沉浸模式下此鍵被切換功能占用、不會傳給 Linux，請選一個你在桌面上用不到的鍵。</string>
     <string name="immerse_entered">已進入沉浸——再按一次該鍵退出</string>
     <string name="immerse_exited">已退出沉浸</string>
+    <string name="immerse_failed">無法進入沉浸模式，輸入已安全釋放。</string>
+    <string name="immerse_released">輸入擷取意外中斷，已安全退出沉浸模式。</string>
+    <string name="immerse_not_ready">桌面連線尚未就緒，請稍後再試。</string>
     <string name="immerse_key_unusable">該按鍵沒有對應的 Linux 掃描碼，將無法用它退出沉浸。請改綁其他按鍵。</string>
+    <string name="immerse_bind_key_reserved">返回鍵和電源鍵無法作為可靠的沉浸逃生鍵，請按其他按鍵。</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">擴充按鍵列模式</string>

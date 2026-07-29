@@ -48,7 +48,11 @@
     <string name="immerse_key_hint">The key that enters and leaves immersion mode. A binding is required: this same key is what the root helper watches in order to release the capture, so immersion cannot be entered until one is bound.\n\nBinding also records the key\'s evdev scancode. While immersed the key is reserved by the toggle and is not passed to Linux, so choose one you do not need on the desktop.</string>
     <string name="immerse_entered">Immersion on — press the same key again to leave</string>
     <string name="immerse_exited">Immersion off</string>
+    <string name="immerse_failed">Could not enter immersion. Input has been released safely.</string>
+    <string name="immerse_released">Immersion ended for safety because input capture was interrupted.</string>
+    <string name="immerse_not_ready">The desktop connection is not ready yet. Try again in a moment.</string>
     <string name="immerse_key_unusable">That key has no Linux scancode, so immersion could not be released with it. Bind a different key.</string>
+    <string name="immerse_bind_key_reserved">Back and Power cannot be used as reliable immersion escape keys. Press a different key.</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">Extra keys bar mode</string>

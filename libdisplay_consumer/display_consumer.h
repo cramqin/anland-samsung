@@ -1,6 +1,7 @@
 #ifndef DISPLAY_CONSUMER_H
 #define DISPLAY_CONSUMER_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "../common/protocol.h"
 
@@ -18,6 +19,9 @@ int  set_fallback_callback(display_ctx *ctx, void (*on_fallback)(void *), void *
 int  poll_output_event(display_ctx *ctx, struct OutputEvent *event, int timeout_ms);
 int  poll_output_event_extend_data(display_ctx *ctx, void* payload, size_t size, int timeout_ms);
 int  set_exit_fallback_callback(display_ctx *ctx, void (*on_exit_fallback)(void *), void *userdata);
+int  display_is_active(display_ctx *ctx);
+int  display_control_dead(display_ctx *ctx);
+/* These return owned CLOEXEC duplicates of the current channel. Caller closes. */
 int  get_data_fd(display_ctx *ctx);
 int  get_audio_fd(display_ctx *ctx);
 void handle_unhandled_event(display_ctx *ctx, const struct OutputEvent *event);
