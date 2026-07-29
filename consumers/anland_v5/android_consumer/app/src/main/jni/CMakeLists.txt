@@ -48,3 +48,23 @@ set_target_properties(fdhelper PROPERTIES
 )
 
 target_link_libraries(fdhelper log)
+
+# Root grab helper for immersive full-input capture: EVIOCGRAB the touchscreen +
+# key devices as root and stream raw evdev events to the app over a bridge
+# socket. Same lib*.so-executable packaging trick as fdhelper.
+add_executable(inputgrab
+    input_grab.c
+    ${LIBDISPLAY_DIR}/common/socket_utils.c
+)
+
+target_include_directories(inputgrab PRIVATE
+    ${LIBDISPLAY_DIR}/common
+)
+
+set_target_properties(inputgrab PROPERTIES
+    PREFIX "lib"
+    OUTPUT_NAME "inputgrab"
+    SUFFIX ".so"
+)
+
+target_link_libraries(inputgrab log)

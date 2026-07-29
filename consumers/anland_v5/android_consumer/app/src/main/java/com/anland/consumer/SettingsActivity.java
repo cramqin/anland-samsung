@@ -42,6 +42,10 @@ public class SettingsActivity extends Activity {
     private static final String TAG = "AnlandSettings";
     private static final String PREFS_NAME = "anland_settings";
     private static final String KEY_BOUND_KEYCODE = "bound_keycode";
+    // Owned by MainActivity (it reads them on every resume); referenced rather than
+    // re-declared so a rename cannot silently split the two halves of the feature.
+    private static final String KEY_IMMERSION_KEYCODE = MainActivity.KEY_IMMERSION_KEYCODE;
+    private static final String KEY_IMMERSION_SCANCODE = MainActivity.KEY_IMMERSION_SCANCODE;
     private static final String KEY_SOCKET_PATH = "socket_path";
     private static final String KEY_USE_ROOT = "use_root";
     private static final String KEY_MIC_ENABLED = "mic_enabled";
@@ -49,6 +53,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_SPEAKER_LATENCY_MS = "speaker_latency_ms";
     private static final String KEY_MIC_LATENCY_MS = "mic_latency_ms";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
+    private static final String KEY_FULL_KEY_CAPTURE = "full_key_capture";
     private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
     // Mapped to R.array.extra_keys_mode_options positions
     private static final String MODE_ALWAYS = "always";
@@ -67,6 +72,12 @@ public class SettingsActivity extends Activity {
     // ===== 新增：触摸板 Key =====
     private static final String KEY_TOUCHPAD_MODE = "touchpad_mode";
     private static final String KEY_MOUSE_ACCEL = "mouse_speed";
+    private static final String KEY_POINTER_CAPTURE = "pointer_capture";
+    private static final String KEY_SCROLL_SPEED = "scroll_speed";
+    private static final String KEY_SCROLL_REVERSE = "scroll_reverse";
+    private static final String KEY_SCROLL_THRESHOLD = "touchpad_scroll_threshold";
+    private static final String KEY_MOVE_THRESHOLD = "touchpad_move_threshold";
+    private static final String KEY_GESTURE_SCALE = "touchpad_gesture_scale";
 
     // Latency presets: target buffer in ms (0 = auto). The user-visible labels live
     // in the R.array.latency_labels string-array, parallel to this array.
@@ -76,10 +87,8 @@ public class SettingsActivity extends Activity {
     private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL }
     private Page currentPage = Page.HOME;
 
-    private Button bindButton;
-    private TextView statusText;
+    private KeyBinding listeningFor;    // non-null only while capturing a key
     private CountDownTimer listenTimer;
-    private boolean isListening = false;
 
     // Custom extra-keys layout editor (JSON), and the SAF file-picker request code.
     private EditText layoutInput;
@@ -260,7 +269,6 @@ public class SettingsActivity extends Activity {
         buildExtraKeysSection(root);
         buildCustomLayoutSection(root);
         setContent(root);
-        updateStatus();
     }
 
     private void showTouchpadPage() {
@@ -296,7 +304,7 @@ public class SettingsActivity extends Activity {
     public void onBackPressed() {
         // While listening for a key binding, let onKeyDown capture the Back key
         // instead of navigating back.
-        if (isListening) return;
+        if (listeningFor != null) return;
         if (currentPage != Page.HOME) {
             showHome();
         } else {
@@ -316,16 +324,51 @@ public class SettingsActivity extends Activity {
         bindLabel.setPadding(0, 0, 0, dp(8));
         root.addView(bindLabel);
 
-        statusText = new TextView(this);
-        statusText.setTextSize(14);
-        statusText.setTextColor(Color.GRAY);
-        statusText.setPadding(0, 0, 0, dp(16));
-        root.addView(statusText);
+        buildKeyBinding(root, KEY_BOUND_KEYCODE, null, R.string.bind_key_button);
+    }
 
-        bindButton = new Button(this);
-        bindButton.setText(R.string.bind_key_button);
-        bindButton.setOnClickListener(v -> startListening());
-        root.addView(bindButton);
+    /*
+     * One "current binding + press a key to rebind" row. Several settings bind a key
+     * (the virtual-keyboard toggle, the immersion toggle), so the row -- including the
+     * 5s listening countdown -- is built once here and keyed by its pref. Only one row
+     * can listen at a time; onKeyDown routes the captured key to whichever asked.
+     *
+     * scanPrefKey, when non-null, also records the key's raw evdev scancode. The
+     * immersion helper reads raw evdev, so it needs that rather than the Android
+     * keycode -- and taking it straight from the KeyEvent works for keys no mapping
+     * table knows (volume keys, vendor keys).
+     */
+    private void buildKeyBinding(LinearLayout root, String prefKey, String scanPrefKey,
+                                 int buttonLabelRes) {
+        TextView status = new TextView(this);
+        status.setTextSize(14);
+        status.setTextColor(Color.GRAY);
+        status.setPadding(0, 0, 0, dp(16));
+        root.addView(status);
+
+        Button bind = new Button(this);
+        bind.setText(buttonLabelRes);
+        root.addView(bind);
+
+        KeyBinding kb = new KeyBinding(prefKey, scanPrefKey, buttonLabelRes, bind, status);
+        bind.setOnClickListener(v -> startListening(kb));
+        updateStatus(kb);
+    }
+
+    private static final class KeyBinding {
+        final String prefKey;
+        final String scanPrefKey;    // null when the raw scancode is not needed
+        final int buttonLabelRes;    // restored after the listening countdown ends
+        final Button button;
+        final TextView status;
+        KeyBinding(String prefKey, String scanPrefKey, int buttonLabelRes,
+                   Button button, TextView status) {
+            this.prefKey = prefKey;
+            this.scanPrefKey = scanPrefKey;
+            this.buttonLabelRes = buttonLabelRes;
+            this.button = button;
+            this.status = status;
+        }
     }
 
     private void buildAccessibilitySection(LinearLayout root) {
@@ -353,6 +396,38 @@ public class SettingsActivity extends Activity {
         accessibilityHint.setTextColor(Color.GRAY);
         accessibilityHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(accessibilityHint);
+
+        // Immersive full-input capture: a root helper EVIOCGRABs the touchscreen +
+        // keys, so Android sees no input at all (gestures, shade, keys all dead)
+        // and everything goes to Linux. Takes effect on return to the desktop.
+        Switch fullCaptureSwitch = new Switch(this);
+        fullCaptureSwitch.setText(R.string.full_capture_switch);
+        fullCaptureSwitch.setTextSize(14);
+        fullCaptureSwitch.setPadding(0, dp(16), 0, 0);
+        fullCaptureSwitch.setChecked(prefs.getBoolean(KEY_FULL_KEY_CAPTURE, false));
+        fullCaptureSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_FULL_KEY_CAPTURE, checked).apply());
+        root.addView(fullCaptureSwitch);
+
+        TextView fullCaptureHint = new TextView(this);
+        fullCaptureHint.setText(R.string.full_capture_hint);
+        fullCaptureHint.setTextSize(12);
+        fullCaptureHint.setTextColor(Color.GRAY);
+        fullCaptureHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(fullCaptureHint);
+
+        // The key that toggles immersion. Required: the helper watches for this same
+        // key to release the grab, so nothing is captured until one is bound.
+        TextView immerseKeyHint = new TextView(this);
+        immerseKeyHint.setText(R.string.immerse_key_hint);
+        immerseKeyHint.setTextSize(12);
+        immerseKeyHint.setTextColor(Color.GRAY);
+        immerseKeyHint.setPadding(0, dp(4), 0, dp(8));
+        root.addView(immerseKeyHint);
+
+        buildKeyBinding(root, KEY_IMMERSION_KEYCODE, KEY_IMMERSION_SCANCODE,
+                        R.string.bind_immersion_key_button);
     }
 
     private void buildExtraKeysSection(LinearLayout root) {
@@ -596,6 +671,25 @@ public class SettingsActivity extends Activity {
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
 
+        // External mouse/touchpad capture. This is opt-in because it changes
+        // Android's pointer event mode from absolute coordinates to relative motion.
+        Switch pointerCaptureSwitch = new Switch(this);
+        pointerCaptureSwitch.setText(R.string.pointer_capture_switch);
+        pointerCaptureSwitch.setTextSize(14);
+        pointerCaptureSwitch.setPadding(0, dp(8), 0, 0);
+        pointerCaptureSwitch.setChecked(prefs.getBoolean(KEY_POINTER_CAPTURE, false));
+        pointerCaptureSwitch.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_POINTER_CAPTURE, checked).apply());
+        root.addView(pointerCaptureSwitch);
+
+        TextView pointerCaptureHint = new TextView(this);
+        pointerCaptureHint.setText(R.string.pointer_capture_hint);
+        pointerCaptureHint.setTextSize(12);
+        pointerCaptureHint.setTextColor(Color.GRAY);
+        pointerCaptureHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(pointerCaptureHint);
+
         // 鼠标加速度（灵敏度）—— 范围 0.5 ~ 10.0
         LinearLayout accelLayout = new LinearLayout(this);
         accelLayout.setOrientation(LinearLayout.VERTICAL);
@@ -638,6 +732,89 @@ public class SettingsActivity extends Activity {
         accelLayout.addView(accelHint);
 
         root.addView(accelLayout);
+
+        // ===== 双指滚动 =====
+        Switch reverseScrollSwitch = new Switch(this);
+        reverseScrollSwitch.setText(R.string.scroll_reverse_switch);
+        reverseScrollSwitch.setTextSize(14);
+        reverseScrollSwitch.setPadding(0, dp(8), 0, 0);
+        reverseScrollSwitch.setChecked(prefs.getBoolean(KEY_SCROLL_REVERSE, false));
+        reverseScrollSwitch.setOnCheckedChangeListener((v, checked) ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putBoolean(KEY_SCROLL_REVERSE, checked).apply());
+        root.addView(reverseScrollSwitch);
+
+        TextView reverseScrollHint = new TextView(this);
+        reverseScrollHint.setText(R.string.scroll_reverse_hint);
+        reverseScrollHint.setTextSize(12);
+        reverseScrollHint.setTextColor(Color.GRAY);
+        reverseScrollHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(reverseScrollHint);
+
+        addFloatSlider(root, R.string.scroll_speed_label, R.string.scroll_speed_value,
+                null, KEY_SCROLL_SPEED, 0.05f, 3.0f, 0.05f, 0.5f);
+        addFloatSlider(root, R.string.scroll_threshold_label,
+                R.string.threshold_factor_value, R.string.scroll_threshold_hint,
+                KEY_SCROLL_THRESHOLD, 0.05f, 3.0f, 0.05f, 0.5f);
+        addFloatSlider(root, R.string.move_threshold_label,
+                R.string.threshold_factor_value, R.string.move_threshold_hint,
+                KEY_MOVE_THRESHOLD, 0.1f, 8.0f, 0.05f, 2.35f);
+        addFloatSlider(root, R.string.gesture_scale_label, R.string.gesture_scale_value,
+                R.string.gesture_scale_hint,
+                KEY_GESTURE_SCALE, 100f, 3000f, 20f, 800f);
+    }
+
+    /**
+     * A labelled slider over a float preference, with the live value beside the label
+     * and an optional grey hint underneath.
+     */
+    private void addFloatSlider(LinearLayout root, int labelRes, int valueFormatRes,
+                                Integer hintRes, final String key,
+                                final float min, float max, final float step,
+                                float defValue) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(0, dp(8), 0, hintRes == null ? dp(16) : 0);
+
+        TextView label = new TextView(this);
+        label.setText(labelRes);
+        label.setTextSize(14);
+        layout.addView(label);
+
+        final TextView value = new TextView(this);
+        value.setTextSize(14);
+        value.setTextColor(Color.BLUE);
+        layout.addView(value);
+
+        SeekBar seek = new SeekBar(this);
+        seek.setMax(Math.round((max - min) / step));
+        float cur = Math.max(min, Math.min(max, prefs.getFloat(key, defValue)));
+        seek.setProgress(Math.round((cur - min) / step));
+        value.setText(getString(valueFormatRes, cur));
+        seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                float val = min + progress * step;
+                value.setText(getString(valueFormatRes, val));
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                        .putFloat(key, val).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        layout.addView(seek);
+        root.addView(layout);
+
+        if (hintRes != null) {
+            TextView hint = new TextView(this);
+            hint.setText(hintRes);
+            hint.setTextSize(12);
+            hint.setTextColor(Color.GRAY);
+            hint.setPadding(0, dp(2), 0, dp(12));
+            root.addView(hint);
+        }
     }
 
     // Connection settings: a custom daemon socket path and a "connect with root"
@@ -850,6 +1027,22 @@ public class SettingsActivity extends Activity {
     hint.setTextColor(Color.GRAY);
     hint.setPadding(0, dp(4), 0, 0);
     root.addView(hint);
+
+    Switch autoStretchSwitch = new Switch(this);
+    autoStretchSwitch.setText(R.string.auto_stretch_switch);
+    autoStretchSwitch.setTextSize(14);
+    autoStretchSwitch.setPadding(0, dp(16), 0, 0);
+    autoStretchSwitch.setChecked(prefs.getBoolean("auto_stretch", true));
+    autoStretchSwitch.setOnCheckedChangeListener((v, checked) ->
+        prefs.edit().putBoolean("auto_stretch", checked).apply());
+    root.addView(autoStretchSwitch);
+
+    TextView autoStretchHint = new TextView(this);
+    autoStretchHint.setText(R.string.auto_stretch_hint);
+    autoStretchHint.setTextSize(12);
+    autoStretchHint.setTextColor(Color.GRAY);
+    autoStretchHint.setPadding(0, dp(4), 0, 0);
+    root.addView(autoStretchHint);
     }
 
     // Maps a res_preset_labels index to {width, height}, or null for the index-0
@@ -919,60 +1112,84 @@ public class SettingsActivity extends Activity {
         return box;
     }
 
-    private void startListening() {
-        if (isListening) return;
-        isListening = true;
-        bindButton.setText(getString(R.string.listening_countdown, 5));
+    private void startListening(KeyBinding kb) {
+        if (listeningFor != null) return;
+        listeningFor = kb;
+        kb.button.setText(getString(R.string.listening_countdown, 5));
 
         listenTimer = new CountDownTimer(5000, 1000) {
             @Override
             public void onTick(long millisUntilFinished) {
-                bindButton.setText(getString(R.string.listening_countdown,
+                kb.button.setText(getString(R.string.listening_countdown,
                     (int) (millisUntilFinished / 1000)));
             }
 
             @Override
             public void onFinish() {
-                finishListening(UNBOUND);
+                finishListening(UNBOUND, 0);
             }
         }.start();
     }
 
-    private void finishListening(int keycode) {
-        isListening = false;
+    private void finishListening(int keycode, int scanCode) {
         listenTimer.cancel();
+        KeyBinding kb = listeningFor;
+        listeningFor = null;
+        if (kb == null) return;
 
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        prefs.edit().putInt(KEY_BOUND_KEYCODE, keycode).apply();
+        SharedPreferences.Editor e = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+        e.putInt(kb.prefKey, keycode);
+        if (kb.scanPrefKey != null)
+            e.putInt(kb.scanPrefKey, scanCode);
+        e.apply();
 
-        bindButton.setText(R.string.bind_key_button);
-        updateStatus();
+        kb.button.setText(kb.buttonLabelRes);
+        updateStatus(kb);
     }
 
-    private void updateStatus() {
-        if (statusText == null) return;
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        int bound = prefs.getInt(KEY_BOUND_KEYCODE, UNBOUND);
+    private void updateStatus(KeyBinding kb) {
+        if (kb == null) return;
+        int bound = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getInt(kb.prefKey, UNBOUND);
         if (bound == UNBOUND) {
-            statusText.setText(R.string.status_current_none);
+            kb.status.setText(R.string.status_current_none);
         } else {
             int nameRes = KEY_NAME_RES.get(bound);
             String name = nameRes != 0
                 ? getString(nameRes)
                 : getString(R.string.keycode_unknown, bound);
-            statusText.setText(getString(R.string.status_current, name));
+            kb.status.setText(getString(R.string.status_current, name));
         }
     }
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (!isListening) return super.onKeyDown(keyCode, event);
+        if (listeningFor == null) return super.onKeyDown(keyCode, event);
 
         // Ignore generic Virtual Keyboard keycode (it's a placeholder)
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN) return true;
 
-        finishListening(keyCode);
-        Log.i(TAG, "Bound keycode: " + keyCode);
+        int scanCode = event.getScanCode();
+        if (KEY_IMMERSION_KEYCODE.equals(listeningFor.prefKey)) {
+            // Back is not delivered as a KeyEvent on every OEM, and Power is owned by
+            // the system. Neither is a reliable root-side escape key.
+            if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_POWER) {
+                Toast.makeText(this, R.string.immerse_bind_key_reserved,
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+            if (scanCode <= 0)
+                scanCode = KeyCodeMapper.getScanCode(keyCode);
+            if (scanCode <= 0) {
+                Toast.makeText(this, R.string.immerse_key_unusable,
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+        }
+
+        // Record the raw/fallback evdev scancode alongside: the helper matches on it.
+        finishListening(keyCode, scanCode);
+        Log.i(TAG, "Bound keycode: " + keyCode + " scancode: " + scanCode);
         return true;
     }
 

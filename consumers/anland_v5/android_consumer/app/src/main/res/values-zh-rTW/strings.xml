@@ -17,7 +17,7 @@
     <string name="cat_keyboard_title">鍵盤與按鍵</string>
     <string name="cat_keyboard_subtitle">按鍵綁定、無障礙與擴充按鍵列</string>
     <string name="cat_touchpad_title">觸控板與滑鼠</string>
-    <string name="cat_touchpad_subtitle">觸控板模式與指標靈敏度</string>
+    <string name="cat_touchpad_subtitle">觸控板模式、指標擷取與靈敏度</string>
     <string name="cat_connection_subtitle">socket、root、麥克風、相機與音訊延遲</string>
     <string name="cat_resolution_subtitle">輸出解析度與預設</string>
     <string name="cat_general_title">一般</string>
@@ -34,6 +34,7 @@
 
     <!-- Bind key -->
     <string name="bind_key_button">綁定虛擬鍵盤切換鍵</string>
+    <string name="bind_immersion_key_button">綁定沉浸模式切換鍵</string>
     <string name="listening_countdown">正在監聽…（%1$d 秒）</string>
     <string name="status_current_none">目前：無</string>
     <string name="status_current">目前：%1$s</string>
@@ -42,6 +43,16 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">無障礙按鍵攔截</string>
     <string name="accessibility_hint">透過無障礙服務攔截功能鍵（Fn、F1-F12 等），並將平板鍵盤回報的返回／瀏覽器上一頁鍵轉換為 ESC。如果外接鍵盤的 Fn 組合鍵或 ESC 無法正確傳到桌面，請啟用此項。需要在系統 設定 &gt; 無障礙 中授予無障礙權限（僅需一次）。</string>
+    <string name="full_capture_switch">沉浸模式</string>
+    <string name="full_capture_hint">需要 root。按下方綁定的切換鍵進入沉浸模式，再按一次退出。\n沉浸模式下，Anland 會擷取輸入裝置，使得容器獨佔輸入裝置，而不會有誤觸 Android 的情況。\nAnland 結束，則會自動退出。</string>
+    <string name="immerse_key_hint">用於進入／退出沉浸模式的按鍵，必須綁定：root 助手正是靠這個鍵來釋放擷取，未綁定時不會進入沉浸模式。\n\n綁定時會一併記錄該鍵的 evdev 掃描碼。沉浸模式下此鍵被切換功能占用、不會傳給 Linux，請選一個你在桌面上用不到的鍵。</string>
+    <string name="immerse_entered">已進入沉浸——再按一次該鍵退出</string>
+    <string name="immerse_exited">已退出沉浸</string>
+    <string name="immerse_failed">無法進入沉浸模式，輸入已安全釋放。</string>
+    <string name="immerse_released">輸入擷取意外中斷，已安全退出沉浸模式。</string>
+    <string name="immerse_not_ready">桌面連線尚未就緒，請稍後再試。</string>
+    <string name="immerse_key_unusable">該按鍵沒有對應的 Linux 掃描碼，將無法用它退出沉浸。請改綁其他按鍵。</string>
+    <string name="immerse_bind_key_reserved">返回鍵和電源鍵無法作為可靠的沉浸逃生鍵，請按其他按鍵。</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">擴充按鍵列模式</string>
@@ -67,8 +78,23 @@
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">觸控板模式（相對移動）</string>
     <string name="touchpad_hint">開啟：手指滑動移動滑鼠游標（相對）。關閉：觸控直接對應到螢幕（絕對）。</string>
-    <string name="mouse_sensitivity_label">滑鼠靈敏度（加速度）</string>
+    <string name="pointer_capture_switch">擷取外接指標</string>
+    <string name="pointer_capture_hint">開啟後會將外接滑鼠或觸控板鎖定在桌面畫面內並使用相對移動，移到螢幕頂部或底部不會呼出 Android 狀態列或導覽列。按 Android 返回鍵可暫時釋放，點擊桌面畫面重新擷取；螢幕觸控不受影響。</string>
+    <string name="pointer_capture_released">外接指標已釋放。點擊桌面畫面即可重新擷取。</string>
+    <string name="mouse_sensitivity_label">觸控板指標靈敏度（加速度）</string>
     <string name="mouse_accel_value">%1$.1f 倍</string>
+    <string name="scroll_reverse_switch">反向捲動</string>
+    <string name="scroll_reverse_hint">開啟後內容會跟隨手指移動（「自然捲動」）。同時套用於螢幕觸控板與實體觸控板的雙指捲動。</string>
+    <string name="scroll_speed_label">雙指捲動速度</string>
+    <string name="scroll_speed_value">%1$.2f</string>
+    <string name="threshold_factor_value">%1$.2f 倍觸控閾值</string>
+    <string name="scroll_threshold_label">捲動判定閾值</string>
+    <string name="scroll_threshold_hint">手指需要移動多遠才算正在移動。若雙指縮放被誤判為捲動，請降低此值。</string>
+    <string name="move_threshold_label">手勢定性閾值</string>
+    <string name="move_threshold_hint">主要手指需要移動多遠才判定模糊的雙指手勢。若捲動啟動遲緩，請降低此值。</string>
+    <string name="gesture_scale_label">手勢幅度</string>
+    <string name="gesture_scale_value">%1$.0f 像素</string>
+    <string name="gesture_scale_hint">轉送為觸控的手勢（雙指縮放、三指或更多手指）會映射到以指標為中心、邊長為此值的正方形內。值越大，相同手指移動產生的幅度越大。</string>
 
     <!-- Connection -->
     <string name="socket_path_label">守護程序 socket 路徑</string>

@@ -17,7 +17,7 @@
     <string name="cat_keyboard_title">键盘与按键</string>
     <string name="cat_keyboard_subtitle">按键绑定、无障碍与扩展按键栏</string>
     <string name="cat_touchpad_title">触摸板与鼠标</string>
-    <string name="cat_touchpad_subtitle">触摸板模式与指针灵敏度</string>
+    <string name="cat_touchpad_subtitle">触摸板模式、指针捕获与灵敏度</string>
     <string name="cat_connection_subtitle">套接字、root、麦克风、摄像头与音频延迟</string>
     <string name="cat_resolution_subtitle">输出分辨率与预设</string>
     <string name="cat_general_title">通用</string>
@@ -34,6 +34,7 @@
 
     <!-- Bind key -->
     <string name="bind_key_button">绑定软键盘切换键</string>
+    <string name="bind_immersion_key_button">绑定沉浸模式切换键</string>
     <string name="listening_countdown">正在监听…（%1$d 秒）</string>
     <string name="status_current_none">当前：无</string>
     <string name="status_current">当前：%1$s</string>
@@ -42,6 +43,16 @@
     <!-- Accessibility -->
     <string name="accessibility_switch">无障碍按键拦截</string>
     <string name="accessibility_hint">通过无障碍服务拦截功能键（Fn、F1-F12 等），并将平板键盘上报的返回/浏览器后退键转换为 ESC。如果外接键盘的 Fn 组合键或 ESC 无法正确传到桌面，请启用此项。需要在系统 设置 &gt; 无障碍 中授予无障碍权限（仅需一次）。</string>
+    <string name="full_capture_switch">沉浸模式</string>
+    <string name="full_capture_hint">需要 root。按下方绑定的切换键进入沉浸模式，再按一次退出。\n沉浸模式下，Anland 会捕获输入设备，使得容器独占输入设备，而不会有误触安卓的情况。\nAnland 退出，则会自动退出。</string>
+    <string name="immerse_key_hint">用于进入／退出沉浸模式的按键，必须绑定：root 助手正是靠这个键来释放捕获，未绑定时不会进入沉浸模式。\n\n绑定时会一并记录该键的 evdev 扫描码。沉浸模式下此键被切换功能占用、不会传给 Linux，请选一个你在桌面上用不到的键。</string>
+    <string name="immerse_entered">已进入沉浸——再按一次该键退出</string>
+    <string name="immerse_exited">已退出沉浸</string>
+    <string name="immerse_failed">无法进入沉浸模式，输入已安全释放。</string>
+    <string name="immerse_released">输入捕获意外中断，已安全退出沉浸模式。</string>
+    <string name="immerse_not_ready">桌面连接尚未就绪，请稍后再试。</string>
+    <string name="immerse_key_unusable">该按键没有对应的 Linux 扫描码，将无法用它退出沉浸。请改绑其他按键。</string>
+    <string name="immerse_bind_key_reserved">返回键和电源键无法作为可靠的沉浸逃生键，请按其他按键。</string>
 
     <!-- Extra keys bar -->
     <string name="extra_keys_mode_label">扩展按键栏模式</string>
@@ -67,9 +78,25 @@
     <!-- Touchpad -->
     <string name="touchpad_mode_switch">触摸板模式（相对移动）</string>
     <string name="touchpad_hint">开启：手指滑动移动鼠标光标（相对）。关闭：触摸直接映射到屏幕（绝对）。</string>
-    <string name="mouse_sensitivity_label">鼠标灵敏度（加速度）</string>
+    <string name="pointer_capture_switch">捕获外接指针</string>
+    <string name="pointer_capture_hint">开启后将外接鼠标或触摸板锁定在桌面画面内并使用相对移动，移到屏幕顶部或底部不会呼出 Android 状态栏或导航栏。按 Android 返回键可暂时释放，点击桌面画面重新捕获；屏幕触摸不受影响。</string>
+    <string name="pointer_capture_released">外接指针已释放。点击桌面画面可重新捕获。</string>
+    <string name="mouse_sensitivity_label">触摸板指针灵敏度（加速度）</string>
     <string name="mouse_sensitivity_hint">仅适用于触摸板/触摸手势模式。物理鼠标的速度由系统指针设置/鼠标 DPI 控制。</string>
-    <string name="mouse_accel_value">%1$.1fx</string>
+    <string name="mouse_accel_value">%1$.1f 倍</string>
+    <string name="scroll_reverse_switch">反向滚动</string>
+    <string name="scroll_reverse_hint">开启后内容跟随手指移动（“自然滚动”）。对屏上触摸板和物理触摸板的双指滚动同时生效。</string>
+    <string name="scroll_speed_label">双指滚动速度</string>
+    <string name="scroll_speed_value">%1$.2f</string>
+    <string name="threshold_factor_value">%1$.2f 倍触摸阈值</string>
+    <string name="scroll_threshold_label">滚动判定阈值</string>
+    <string name="scroll_threshold_hint">手指移动多远才算“在动”。如果双指开合被当成滚动，调低此值。</string>
+    <string name="move_threshold_label">手势定性阈值</string>
+    <string name="move_threshold_hint">主导手指移动多远才对双指手势定性。如果滚动起步迟滞，调低此值。</string>
+    <string name="gesture_scale_label">手势幅度</string>
+    <string name="gesture_scale_value">%1$.0f 像素</string>
+    <string name="gesture_scale_hint">转为触摸的手势（双指开合、三指及以上）会映射到以指针为中心、边长为此值的正方形内。值越大，相同的手指移动幅度越大。</string>
+>>>>>>> upstream/main
 
     <!-- Connection -->
     <string name="socket_path_label">守护进程套接字路径</string>
@@ -91,6 +118,8 @@
     <string name="width_hint">宽度（例如 1920）</string>
     <string name="height_hint">高度（例如 1080）</string>
     <string name="resolution_hint">选择预设或手动输入数值。填 0 表示原生分辨率。\"Screen ×\" 会按本设备面板（横向）缩放。下次连接时生效。</string>
+    <string name="auto_stretch_switch">自动拉伸显示</string>
+    <string name="auto_stretch_hint">开启时，显示内容会填满屏幕（必要时拉伸）。关闭时，显示内容保持自定义分辨率的宽高比，四周留黑边（信箱模式）。输入坐标会自动映射。</string>
 
     <!-- Settings notification -->
     <string name="notification_switch">显示设置通知</string>

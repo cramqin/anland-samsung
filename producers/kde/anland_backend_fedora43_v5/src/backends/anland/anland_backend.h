@@ -91,6 +91,7 @@ private:
     void onBufferReady();
     void processInputEvent(const InputEvent &ev);
     QPointF mapInputToLogical(const QPointF &devicePoint) const;
+    QPointF mapInputDeltaToLogical(const QPointF &deviceDelta) const;
     void onReconnectTimer();
     void enterFallback();
 

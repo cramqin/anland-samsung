@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 #define TAG "AnlandAudio"
@@ -27,17 +28,20 @@
 #define MIC_MAX_FRAMES     1024   /* upper bound on frames per mic read */
 
 struct audio_bridge {
-    volatile bool running;
-    volatile bool mic_enabled;
+    atomic_bool running;
+    atomic_bool mic_enabled;
 
-    /* The live connection. Set by audio_set_ctx() from the render thread, read by
-     * the audio threads -- same lightweight convention as the event thread's
-     * s->ctx. get_audio_fd() returns -1 in fallback, so a stale-but-valid ctx just
-     * yields no fd rather than misbehaving. */
-    display_ctx *volatile ctx;
+    /* The live connection. current_fd() duplicates the channel while holding this
+     * mutex; audio_set_ctx(NULL) therefore waits until no thread can dereference the
+     * old display_ctx, and the owned duplicate remains valid across fallback close. */
+    pthread_mutex_t ctx_lock;
+    display_ctx *ctx;
+    uint64_t ctx_epoch;
 
     pthread_t play_thread;
     pthread_t cap_thread;
+    bool play_thread_joinable;
+    bool cap_thread_joinable;
 
     AAudioStream *play;   /* output: desktop -> speaker */
     AAudioStream *rec;    /* input:  mic -> producer    */
@@ -47,17 +51,22 @@ struct audio_bridge {
     int cap_rate, cap_channels;
 
     /* Latency presets in ms (0 = engine default), set from the settings UI. */
-    volatile int play_latency_ms;
-    volatile int cap_latency_ms;
-    volatile bool resend_formats;   /* a preset changed -> re-announce on the live fd */
+    atomic_int play_latency_ms;
+    atomic_int cap_latency_ms;
+    atomic_bool resend_formats;   /* a preset changed -> re-announce on the live fd */
 
     uint8_t rx[MAX_DGRAM];
 };
 
-static int current_fd(struct audio_bridge *b)
+static int current_fd(struct audio_bridge *b, uint64_t *epoch)
 {
+    pthread_mutex_lock(&b->ctx_lock);
     display_ctx *ctx = b->ctx;
-    return ctx ? get_audio_fd(ctx) : -1;
+    int fd = ctx ? get_audio_fd(ctx) : -1;
+    if (epoch)
+        *epoch = b->ctx_epoch;
+    pthread_mutex_unlock(&b->ctx_lock);
+    return fd;
 }
 
 /* ---- AAudio stream helpers ---- */
@@ -133,9 +142,11 @@ static void *play_thread_func(void *arg)
 
     bool had_fd = false;   /* drives a one-shot format handshake per connection */
     bool stream_paused = false;
+    uint64_t last_epoch = 0;
 
-    while (b->running) {
-        int fd = current_fd(b);
+    while (atomic_load_explicit(&b->running, memory_order_acquire)) {
+        uint64_t epoch = 0;
+        int fd = current_fd(b, &epoch);
         if (fd < 0) {
             had_fd = false;
             usleep(20000);
@@ -145,13 +156,15 @@ static void *play_thread_func(void *arg)
         /* Hand the producer the real device formats + latency presets for both
          * directions: once when the socket comes up (just left fallback), and again
          * whenever a preset changes so it re-sizes its PipeWire nodes live. */
-        if (!had_fd || b->resend_formats) {
-            b->resend_formats = false;
+        bool resend = atomic_exchange_explicit(&b->resend_formats, false,
+                                               memory_order_acq_rel);
+        if (!had_fd || epoch != last_epoch || resend) {
             send_format(fd, AUDIO_ROLE_PLAYBACK, b->play_rate, b->play_channels,
-                        ms_to_frames(b->play_latency_ms, b->play_rate));
+                        ms_to_frames(atomic_load(&b->play_latency_ms), b->play_rate));
             send_format(fd, AUDIO_ROLE_CAPTURE, b->cap_rate, b->cap_channels,
-                        ms_to_frames(b->cap_latency_ms, b->cap_rate));
+                        ms_to_frames(atomic_load(&b->cap_latency_ms), b->cap_rate));
             had_fd = true;
+            last_epoch = epoch;
         }
 
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
@@ -164,24 +177,31 @@ static void *play_thread_func(void *arg)
             continue;
         }
         if (pfd.revents & (POLLHUP | POLLERR)) {
+            close(fd);
             usleep(20000);
             continue;
         }
 
         ssize_t n = recv(fd, b->rx, sizeof(b->rx), 0);
-        if (n < (ssize_t)sizeof(struct audio_msg))
+        if (n < (ssize_t)sizeof(struct audio_msg)) {
+            close(fd);
             continue;
+        }
 
         struct audio_msg h;
         memcpy(&h, b->rx, sizeof(h));
-        if (h.type != AUDIO_MSG_PCM || !b->play)
+        if (h.type != AUDIO_MSG_PCM || !b->play) {
+            close(fd);
             continue;   /* the producer only sends PCM back; formats flow upstream */
+        }
 
         size_t avail = (size_t)n - sizeof(struct audio_msg);
         size_t bytes = h.size < avail ? h.size : avail;
         int32_t frames = (int32_t)(bytes / (sizeof(int16_t) * b->play_channels));
-        if (frames <= 0)
+        if (frames <= 0) {
+            close(fd);
             continue;
+        }
 
         if (!b->play) continue;
         if (stream_paused) {
@@ -224,9 +244,11 @@ static void *cap_thread_func(void *arg)
     if (mic_frames > MIC_MAX_FRAMES)
         mic_frames = MIC_MAX_FRAMES;
 
-    while (b->running) {
-        int fd = current_fd(b);
-        if (!b->mic_enabled || fd < 0) {
+    while (atomic_load_explicit(&b->running, memory_order_acquire)) {
+        int fd = current_fd(b, NULL);
+        if (!atomic_load_explicit(&b->mic_enabled, memory_order_acquire) || fd < 0) {
+            if (fd >= 0)
+                close(fd);
             if (started && b->rec) {
                 AAudioStream_requestStop(b->rec);
                 started = false;
@@ -235,11 +257,13 @@ static void *cap_thread_func(void *arg)
             continue;
         }
         if (!b->rec) {
+            close(fd);
             usleep(20000);
             continue;
         }
         if (!started) {
             if (AAudioStream_requestStart(b->rec) != AAUDIO_OK) {
+                close(fd);
                 usleep(50000);
                 continue;
             }
@@ -270,6 +294,7 @@ static void *cap_thread_func(void *arg)
         };
         struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
         sendmsg(fd, &m, MSG_DONTWAIT | MSG_NOSIGNAL);   /* drop if the socket is full */
+        close(fd);
     }
 
     if (started && b->rec)
@@ -282,7 +307,16 @@ static void *cap_thread_func(void *arg)
 
 audio_bridge *audio_create(void)
 {
-    return calloc(1, sizeof(struct audio_bridge));
+    audio_bridge *b = calloc(1, sizeof(struct audio_bridge));
+    if (b) {
+        pthread_mutex_init(&b->ctx_lock, NULL);
+        atomic_init(&b->running, false);
+        atomic_init(&b->mic_enabled, false);
+        atomic_init(&b->play_latency_ms, 0);
+        atomic_init(&b->cap_latency_ms, 0);
+        atomic_init(&b->resend_formats, false);
+    }
+    return b;
 }
 
 void audio_destroy(audio_bridge *b)
@@ -290,12 +324,13 @@ void audio_destroy(audio_bridge *b)
     if (!b)
         return;
     audio_stop(b);
+    pthread_mutex_destroy(&b->ctx_lock);
     free(b);
 }
 
 void audio_start(audio_bridge *b)
 {
-    if (!b || b->running)
+    if (!b || atomic_load_explicit(&b->running, memory_order_acquire))
         return;
 
     /* Open the output stream and read back the rate/channels the device actually
@@ -321,19 +356,34 @@ void audio_start(audio_bridge *b)
     LOGI("device formats: playback %d Hz x%d, capture %d Hz x%d",
          b->play_rate, b->play_channels, b->cap_rate, b->cap_channels);
 
-    b->running = true;
-    pthread_create(&b->play_thread, NULL, play_thread_func, b);
-    pthread_create(&b->cap_thread, NULL, cap_thread_func, b);
+    atomic_store_explicit(&b->running, true, memory_order_release);
+    b->play_thread_joinable =
+            pthread_create(&b->play_thread, NULL, play_thread_func, b) == 0;
+    b->cap_thread_joinable =
+            pthread_create(&b->cap_thread, NULL, cap_thread_func, b) == 0;
+    if (!b->play_thread_joinable)
+        LOGE("failed to create playback thread");
+    if (!b->cap_thread_joinable)
+        LOGE("failed to create capture thread");
     LOGI("audio bridge started (play=%p rec=%p)", (void *)b->play, (void *)b->rec);
 }
 
 void audio_stop(audio_bridge *b)
 {
-    if (!b || !b->running)
+    if (!b)
         return;
-    b->running = false;
-    pthread_join(b->play_thread, NULL);
-    pthread_join(b->cap_thread, NULL);
+    audio_set_ctx(b, NULL);
+    if (!atomic_load_explicit(&b->running, memory_order_acquire))
+        return;
+    atomic_store_explicit(&b->running, false, memory_order_release);
+    if (b->play_thread_joinable) {
+        pthread_join(b->play_thread, NULL);
+        b->play_thread_joinable = false;
+    }
+    if (b->cap_thread_joinable) {
+        pthread_join(b->cap_thread, NULL);
+        b->cap_thread_joinable = false;
+    }
 
     if (b->play) {
         AAudioStream_requestStop(b->play);
@@ -345,30 +395,37 @@ void audio_stop(audio_bridge *b)
         AAudioStream_close(b->rec);
         b->rec = NULL;
     }
-    b->ctx = NULL;
     LOGI("audio bridge stopped");
 }
 
 void audio_set_ctx(audio_bridge *b, display_ctx *ctx)
 {
-    if (b)
-        b->ctx = ctx;
+    if (!b)
+        return;
+    pthread_mutex_lock(&b->ctx_lock);
+    b->ctx = ctx;
+    if (++b->ctx_epoch == 0)
+        ++b->ctx_epoch;
+    if (ctx)
+        atomic_store_explicit(&b->resend_formats, true, memory_order_release);
+    pthread_mutex_unlock(&b->ctx_lock);
 }
 
 void audio_set_mic_enabled(audio_bridge *b, int enabled)
 {
     if (!b)
         return;
-    b->mic_enabled = enabled != 0;
-    LOGI("mic %s", b->mic_enabled ? "enabled" : "disabled");
+    bool mic_enabled = enabled != 0;
+    atomic_store_explicit(&b->mic_enabled, mic_enabled, memory_order_release);
+    LOGI("mic %s", mic_enabled ? "enabled" : "disabled");
 }
 
 void audio_set_latency(audio_bridge *b, int speaker_ms, int mic_ms)
 {
     if (!b)
         return;
-    b->play_latency_ms = speaker_ms;
-    b->cap_latency_ms = mic_ms;
-    b->resend_formats = true;   /* picked up by the playback thread on the live fd */
+    atomic_store(&b->play_latency_ms, speaker_ms);
+    atomic_store(&b->cap_latency_ms, mic_ms);
+    atomic_store_explicit(&b->resend_formats, true, memory_order_release);
     LOGI("latency preset: speaker=%dms mic=%dms", speaker_ms, mic_ms);
 }

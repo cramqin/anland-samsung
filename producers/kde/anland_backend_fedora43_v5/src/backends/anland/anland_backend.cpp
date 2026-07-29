@@ -281,6 +281,19 @@ QPointF AnlandBackend::mapInputToLogical(const QPointF &devicePoint) const
     return logical / output->scale();
 }
 
+QPointF AnlandBackend::mapInputDeltaToLogical(const QPointF &deviceDelta) const
+{
+    AnlandOutput *output = m_outputs[0];
+    const OutputTransform transform = output->transform().inverted();
+    const QSizeF bounds = QSizeF(output->modeSize());
+    // OutputTransform maps points inside a bounded rectangle, so rotated/flipped
+    // mappings include a translation. Subtract the transformed origin to retain
+    // only the linear vector component for relative pointer motion.
+    const QPointF mappedDelta = transform.map(deviceDelta, bounds)
+            - transform.map(QPointF(0, 0), bounds);
+    return mappedDelta / output->scale();
+}
+
 void AnlandBackend::processInputEvent(const InputEvent &ev)
 {
     if (!m_inputDevice) {
@@ -289,12 +302,8 @@ void AnlandBackend::processInputEvent(const InputEvent &ev)
 
     switch (ev.type) {
     case INPUT_TYPE_POINTER_MOTION: {
-        // Both absolute position (x, y) and relative delta (dx, dy) come from the
-        // consumer. Use the same mapInputToLogical for both so that dx/dy delivered
-        // via wl_pointer.relative_motion match the cursor's position space, giving
-        // Wayland clients correct velocity for momentum/kinetic scrolling.
         const QPointF pos = mapInputToLogical(QPointF(ev.pointer_motion.x, ev.pointer_motion.y));
-        const QPointF delta = mapInputToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
+        const QPointF delta = mapInputDeltaToLogical(QPointF(ev.pointer_motion.dx, ev.pointer_motion.dy));
         m_inputDevice->pointerMotion(pos, delta, delta);
         break;
     }

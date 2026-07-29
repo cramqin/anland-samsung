@@ -15,7 +15,8 @@
  * The AAudio streams are opened once and stay open across reconnects; the active
  * display_ctx (and thus the live audio fd) is swapped via audio_set_ctx(). While
  * detached the playback stream simply has nothing to play and the capture stream's
- * PCM is dropped. The audio fd is owned by the display library -- never closed here.
+ * PCM is dropped. get_audio_fd() returns an owned duplicate for each iteration, so
+ * the bridge closes that duplicate after the poll/read or write completes.
  *
  * The bridge is per-instance: each consumer window owns its own audio_bridge (its
  * own AAudio playback + capture streams, connected to its own producer). Multiple
