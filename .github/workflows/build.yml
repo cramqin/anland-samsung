@@ -78,8 +78,20 @@ jobs:
         run: |
           # Save a copy of the original manifest
           cp app/src/main/AndroidManifest.xml app/src/main/AndroidManifest.xml.bak
-          sed -i 's/android:screenOrientation="fullSensor"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
-          ./gradlew clean assembleRelease
+          sed -i -E 's/android:screenOrientation="(fullSensor|fullUser)"/android:screenOrientation="sensorLandscape"/g' app/src/main/AndroidManifest.xml
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            ./gradlew clean assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/release.keystore" \
+              -Pandroid.injected.signing.store.password="${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" \
+              -Pandroid.injected.signing.key.alias="${{ secrets.RELEASE_KEY_ALIAS }}" \
+              -Pandroid.injected.signing.key.password="${{ secrets.RELEASE_KEY_PASSWORD }}"
+          else
+            ./gradlew clean assembleRelease \
+              -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
+              -Pandroid.injected.signing.store.password=android \
+              -Pandroid.injected.signing.key.alias=androiddebugkey \
+              -Pandroid.injected.signing.key.password=android
+          fi
           APK_FILE=$(find app/build/outputs/apk/ -name "*.apk" | head -n 1)
           cp "$APK_FILE" ../../../anland-v5-landscape.apk
           # Restore the original manifest so the build directory has the correct state
@@ -116,7 +128,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: anland-daemon
-          path: magisk_module/
+          path: anland-daemon.zip
 
       - name: Create Release and Upload Assets
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'

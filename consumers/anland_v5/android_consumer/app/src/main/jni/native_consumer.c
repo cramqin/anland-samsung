@@ -2438,7 +2438,6 @@ Java_com_anland_consumer_Native_nativeSendMouseMotion(
             dy = y - s->motion_last_y;
         }
     }
-    }
 
     s->motion_last_x = x;
     s->motion_last_y = y;

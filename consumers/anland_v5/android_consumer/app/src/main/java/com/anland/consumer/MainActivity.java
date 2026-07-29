@@ -341,7 +341,7 @@ public class MainActivity extends Activity
             // camera frames route to this window (others get blank frames).
             sInstance = this;
             if (mNative != null) mNative.setFocused(true);
-            savedBS = 0; // Reset button state when window gains focus
+            releaseAllHardwarePointerButtons(); // Reset button state when window gains focus
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
