@@ -12,11 +12,13 @@
  *                datagrams to the socket (the producer exposes them as a Linux
  *                recording source). Only active while the mic is enabled.
  *
- * The AAudio streams are opened once and stay open across reconnects; the active
- * display_ctx (and thus the live audio fd) is swapped via audio_set_ctx(). While
- * detached the playback stream simply has nothing to play and the capture stream's
- * PCM is dropped. get_audio_fd() returns an owned duplicate for each iteration, so
- * the bridge closes that duplicate after the poll/read or write completes.
+ * The playback AAudio stream stays open and is driven by an AAudio callback. The
+ * socket thread appends PCM into a small ring buffer; the callback outputs an
+ * inaudible keepalive when Linux is idle. This keeps Android's mixer awake across
+ * short UI sounds without reconnecting the display pipeline. The capture stream is
+ * opened once and only started while the mic is enabled. The active display_ctx
+ * (and thus the live audio fd) is swapped via audio_set_ctx(). The audio fd is
+ * owned by the display library -- never closed here.
  *
  * The bridge is per-instance: each consumer window owns its own audio_bridge (its
  * own AAudio playback + capture streams, connected to its own producer). Multiple
@@ -46,5 +48,10 @@ void audio_set_mic_enabled(audio_bridge *b, int enabled);
  * producer, which applies it as the PipeWire node.latency. Takes effect immediately
  * (the formats are re-announced on the live connection). */
 void audio_set_latency(audio_bridge *b, int speaker_ms, int mic_ms);
+
+/* Keep the AAudio output stream hot with a near-silent keepalive (bursty UI sounds
+ * always play immediately), or let it idle-stop after silence to save standby power.
+ * Default is disabled. Takes effect on the playback thread's next loop pass. */
+void audio_set_keepalive(audio_bridge *b, int enabled);
 
 #endif

@@ -14,7 +14,6 @@ import android.text.Editable;
 import android.text.TextWatcher;
 import android.text.InputType;
 import android.util.Log;
-import android.util.SparseIntArray;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -42,18 +41,17 @@ public class SettingsActivity extends Activity {
     private static final String TAG = "AnlandSettings";
     private static final String PREFS_NAME = "anland_settings";
     private static final String KEY_BOUND_KEYCODE = "bound_keycode";
-    // Owned by MainActivity (it reads them on every resume); referenced rather than
-    // re-declared so a rename cannot silently split the two halves of the feature.
-    private static final String KEY_IMMERSION_KEYCODE = MainActivity.KEY_IMMERSION_KEYCODE;
-    private static final String KEY_IMMERSION_SCANCODE = MainActivity.KEY_IMMERSION_SCANCODE;
     private static final String KEY_SOCKET_PATH = "socket_path";
     private static final String KEY_USE_ROOT = "use_root";
     private static final String KEY_MIC_ENABLED = "mic_enabled";
     private static final String KEY_CAMERA_ENABLED = "camera_enabled";
+    private static final String KEY_AUDIO_KEEPALIVE = "audio_keepalive";
     private static final String KEY_SPEAKER_LATENCY_MS = "speaker_latency_ms";
     private static final String KEY_MIC_LATENCY_MS = "mic_latency_ms";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
-    private static final String KEY_FULL_KEY_CAPTURE = "full_key_capture";
+    private static final String KEY_IMMERSIVE_ENABLED = ImmersiveMode.KEY_ENABLED;
+    private static final String KEY_IMMERSIVE_KEYCODE = ImmersiveMode.KEY_KEYCODE;
+    private static final String KEY_IMMERSIVE_SCANCODE = ImmersiveMode.KEY_SCANCODE;
     private static final String KEY_EXTRA_KEYS_MODE = "extra_keys_mode";
     // Mapped to R.array.extra_keys_mode_options positions
     private static final String MODE_ALWAYS = "always";
@@ -87,30 +85,13 @@ public class SettingsActivity extends Activity {
     private enum Page { HOME, KEYBOARD, TOUCHPAD, CONNECTION, RESOLUTION, GENERAL }
     private Page currentPage = Page.HOME;
 
-    private KeyBinding listeningFor;    // non-null only while capturing a key
-    private CountDownTimer listenTimer;
+    // The key-binding row currently counting down, if any: it gets the next key
+    // press. The rows themselves live in the page's view hierarchy.
+    private KeyBinding listeningBinding;
 
     // Custom extra-keys layout editor (JSON), and the SAF file-picker request code.
     private EditText layoutInput;
     private static final int REQ_PICK_LAYOUT = 2001;
-
-    // Android keycode → localized name string resource
-    private static final SparseIntArray KEY_NAME_RES = new SparseIntArray();
-    static {
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_VOLUME_UP, R.string.key_volume_up);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_VOLUME_DOWN, R.string.key_volume_down);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_VOLUME_MUTE, R.string.key_volume_mute);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_POWER, R.string.key_power);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_CAMERA, R.string.key_camera);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_HEADSETHOOK, R.string.key_headset_hook);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, R.string.key_media_play_pause);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_MEDIA_NEXT, R.string.key_media_next);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_MEDIA_PREVIOUS, R.string.key_media_previous);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_BRIGHTNESS_UP, R.string.key_brightness_up);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_BRIGHTNESS_DOWN, R.string.key_brightness_down);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_HOME, R.string.key_home);
-        KEY_NAME_RES.put(KeyEvent.KEYCODE_BACK, R.string.key_back);
-    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -149,6 +130,7 @@ public class SettingsActivity extends Activity {
     }
 
     private void showHome() {
+        stopListening();
         currentPage = Page.HOME;
 
         LinearLayout root = new LinearLayout(this);
@@ -238,6 +220,7 @@ public class SettingsActivity extends Activity {
 
     // A fresh page root with a back link and a bold page title.
     private LinearLayout newPage(int titleRes) {
+        stopListening();
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
 
@@ -265,6 +248,7 @@ public class SettingsActivity extends Activity {
         currentPage = Page.KEYBOARD;
         LinearLayout root = newPage(R.string.cat_keyboard_title);
         buildVirtualKeyboardSection(root);
+        buildImmersiveSection(root);
         buildAccessibilitySection(root);
         buildExtraKeysSection(root);
         buildCustomLayoutSection(root);
@@ -304,7 +288,7 @@ public class SettingsActivity extends Activity {
     public void onBackPressed() {
         // While listening for a key binding, let onKeyDown capture the Back key
         // instead of navigating back.
-        if (listeningFor != null) return;
+        if (listeningBinding != null) return;
         if (currentPage != Page.HOME) {
             showHome();
         } else {
@@ -317,57 +301,161 @@ public class SettingsActivity extends Activity {
     // ============================================================
 
     private void buildVirtualKeyboardSection(LinearLayout root) {
-        TextView bindLabel = new TextView(this);
-        bindLabel.setText(R.string.section_virtual_keyboard);
-        bindLabel.setTextSize(16);
-        bindLabel.setTypeface(null, Typeface.BOLD);
-        bindLabel.setPadding(0, 0, 0, dp(8));
-        root.addView(bindLabel);
-
-        buildKeyBinding(root, KEY_BOUND_KEYCODE, null, R.string.bind_key_button);
+        addSectionHeader(root, R.string.section_virtual_keyboard, 0);
+        // Constructing the row appends it to `root`.
+        new KeyBinding(root, KEY_BOUND_KEYCODE, null, R.string.bind_key_button);
     }
 
-    /*
-     * One "current binding + press a key to rebind" row. Several settings bind a key
-     * (the virtual-keyboard toggle, the immersion toggle), so the row -- including the
-     * 5s listening countdown -- is built once here and keyed by its pref. Only one row
-     * can listen at a time; onKeyDown routes the captured key to whichever asked.
-     *
-     * scanPrefKey, when non-null, also records the key's raw evdev scancode. The
-     * immersion helper reads raw evdev, so it needs that rather than the Android
-     * keycode -- and taking it straight from the KeyEvent works for keys no mapping
-     * table knows (volume keys, vendor keys).
+    /**
+     * Immersive mode: a root helper takes the touchscreen, keyboard and pointer
+     * away from Android for as long as the session lasts, so every input goes to
+     * the Linux desktop instead. The switch is a safety gate rather than the
+     * feature itself — with it off the bound key does nothing — and the binding
+     * below records the key's raw scan code, which is the only thing the root
+     * helper can compare while Android is no longer in the loop.
      */
-    private void buildKeyBinding(LinearLayout root, String prefKey, String scanPrefKey,
-                                 int buttonLabelRes) {
-        TextView status = new TextView(this);
-        status.setTextSize(14);
-        status.setTextColor(Color.GRAY);
-        status.setPadding(0, 0, 0, dp(16));
-        root.addView(status);
+    private void buildImmersiveSection(LinearLayout root) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
-        Button bind = new Button(this);
-        bind.setText(buttonLabelRes);
-        root.addView(bind);
+        addSectionHeader(root, R.string.section_immersive, dp(24));
 
-        KeyBinding kb = new KeyBinding(prefKey, scanPrefKey, buttonLabelRes, bind, status);
-        bind.setOnClickListener(v -> startListening(kb));
-        updateStatus(kb);
+        Switch immersiveSwitch = new Switch(this);
+        immersiveSwitch.setText(R.string.immersive_switch);
+        immersiveSwitch.setTextSize(14);
+        immersiveSwitch.setPadding(0, 0, 0, 0);
+        immersiveSwitch.setChecked(prefs.getBoolean(KEY_IMMERSIVE_ENABLED, false));
+        immersiveSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_IMMERSIVE_ENABLED, checked).apply());
+        root.addView(immersiveSwitch);
+
+        TextView immersiveHint = new TextView(this);
+        immersiveHint.setText(R.string.immersive_hint);
+        immersiveHint.setTextSize(12);
+        immersiveHint.setTextColor(Color.GRAY);
+        immersiveHint.setPadding(0, dp(4), 0, dp(12));
+        root.addView(immersiveHint);
+
+        // Constructing the row appends it to `root`.
+        new KeyBinding(root, KEY_IMMERSIVE_KEYCODE, KEY_IMMERSIVE_SCANCODE,
+                R.string.bind_immersive_key_button);
     }
 
-    private static final class KeyBinding {
-        final String prefKey;
-        final String scanPrefKey;    // null when the raw scancode is not needed
-        final int buttonLabelRes;    // restored after the listening countdown ends
-        final Button button;
-        final TextView status;
-        KeyBinding(String prefKey, String scanPrefKey, int buttonLabelRes,
-                   Button button, TextView status) {
-            this.prefKey = prefKey;
-            this.scanPrefKey = scanPrefKey;
+    private void addSectionHeader(LinearLayout root, int titleRes, int topPadding) {
+        TextView header = new TextView(this);
+        header.setText(titleRes);
+        header.setTextSize(16);
+        header.setTypeface(null, Typeface.BOLD);
+        header.setPadding(0, topPadding, 0, dp(8));
+        root.addView(header);
+    }
+
+    /**
+     * One "bind a key" row: a status line plus a button that listens for the next
+     * key press for five seconds. Both bindings on this page use it, so the
+     * listening state lives per row instead of on the activity.
+     */
+    private final class KeyBinding {
+        private final String keyPref;
+        /**
+         * Where to store the raw evdev scan code, or null when only the Android
+         * key code matters. Immersive mode needs it: {@link KeyCodeMapper} has no
+         * entry for the volume keys, and its root helper only ever sees evdev
+         * codes.
+         */
+        private final String scanPref;
+        private final int buttonLabelRes;
+        private final Button button;
+        private final TextView status;
+        private CountDownTimer timer;
+
+        KeyBinding(LinearLayout root, String keyPref, String scanPref,
+                   int buttonLabelRes) {
+            this.keyPref = keyPref;
+            this.scanPref = scanPref;
             this.buttonLabelRes = buttonLabelRes;
-            this.button = button;
-            this.status = status;
+
+            status = new TextView(SettingsActivity.this);
+            status.setTextSize(14);
+            status.setTextColor(Color.GRAY);
+            status.setPadding(0, 0, 0, dp(16));
+            root.addView(status);
+
+            button = new Button(SettingsActivity.this);
+            button.setText(buttonLabelRes);
+            button.setOnClickListener(v -> startListening());
+            root.addView(button);
+
+            updateStatus();
+        }
+
+        private void startListening() {
+            if (listeningBinding == this)
+                return;
+            stopListening();
+            listeningBinding = this;
+            button.setText(getString(R.string.listening_countdown, 5));
+            timer = new CountDownTimer(5000, 1000) {
+                @Override
+                public void onTick(long millisUntilFinished) {
+                    button.setText(getString(R.string.listening_countdown,
+                        (int) (millisUntilFinished / 1000)));
+                }
+
+                @Override
+                public void onFinish() {
+                    // Timed out with no key: clear the binding, matching the
+                    // original behaviour of "listen, then store whatever came".
+                    bind(UNBOUND, UNBOUND);
+                }
+            }.start();
+        }
+
+        /** Stop listening without changing what is bound. */
+        void cancel() {
+            if (timer != null) {
+                timer.cancel();
+                timer = null;
+            }
+            button.setText(buttonLabelRes);
+        }
+
+        void bind(int keycode, int scancode) {
+            cancel();
+            listeningBinding = null;
+            SharedPreferences.Editor edit =
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+            edit.putInt(keyPref, keycode);
+            if (scanPref != null)
+                edit.putInt(scanPref, scancode);
+            edit.apply();
+            updateStatus();
+        }
+
+        void updateStatus() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            int bound = prefs.getInt(keyPref, UNBOUND);
+            int scan = scanPref == null ? UNBOUND : prefs.getInt(scanPref, UNBOUND);
+            if (bound == UNBOUND && scan <= 0) {
+                status.setText(R.string.status_current_none);
+                status.setTextColor(Color.GRAY);
+                return;
+            }
+            String name = KeyCodeMapper.keyName(SettingsActivity.this, bound, scan);
+            // A binding that resolves to no evdev code is useless to the root
+            // helper, so say so here rather than let the key quietly do nothing.
+            if (scanPref != null && resolveEvdev(bound, scan) <= 0) {
+                status.setText(getString(R.string.status_current_no_scancode, name));
+                status.setTextColor(0xFFC62828);  // red
+                return;
+            }
+            status.setText(getString(R.string.status_current, name));
+            status.setTextColor(Color.GRAY);
+        }
+
+        private int resolveEvdev(int keycode, int scancode) {
+            return scancode > 0 ? scancode
+                    : (keycode == UNBOUND ? -1 : KeyCodeMapper.getScanCode(keycode));
         }
     }
 
@@ -396,38 +484,6 @@ public class SettingsActivity extends Activity {
         accessibilityHint.setTextColor(Color.GRAY);
         accessibilityHint.setPadding(0, dp(4), 0, dp(8));
         root.addView(accessibilityHint);
-
-        // Immersive full-input capture: a root helper EVIOCGRABs the touchscreen +
-        // keys, so Android sees no input at all (gestures, shade, keys all dead)
-        // and everything goes to Linux. Takes effect on return to the desktop.
-        Switch fullCaptureSwitch = new Switch(this);
-        fullCaptureSwitch.setText(R.string.full_capture_switch);
-        fullCaptureSwitch.setTextSize(14);
-        fullCaptureSwitch.setPadding(0, dp(16), 0, 0);
-        fullCaptureSwitch.setChecked(prefs.getBoolean(KEY_FULL_KEY_CAPTURE, false));
-        fullCaptureSwitch.setOnCheckedChangeListener((v, checked) ->
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
-                .putBoolean(KEY_FULL_KEY_CAPTURE, checked).apply());
-        root.addView(fullCaptureSwitch);
-
-        TextView fullCaptureHint = new TextView(this);
-        fullCaptureHint.setText(R.string.full_capture_hint);
-        fullCaptureHint.setTextSize(12);
-        fullCaptureHint.setTextColor(Color.GRAY);
-        fullCaptureHint.setPadding(0, dp(4), 0, dp(8));
-        root.addView(fullCaptureHint);
-
-        // The key that toggles immersion. Required: the helper watches for this same
-        // key to release the grab, so nothing is captured until one is bound.
-        TextView immerseKeyHint = new TextView(this);
-        immerseKeyHint.setText(R.string.immerse_key_hint);
-        immerseKeyHint.setTextSize(12);
-        immerseKeyHint.setTextColor(Color.GRAY);
-        immerseKeyHint.setPadding(0, dp(4), 0, dp(8));
-        root.addView(immerseKeyHint);
-
-        buildKeyBinding(root, KEY_IMMERSION_KEYCODE, KEY_IMMERSION_SCANCODE,
-                        R.string.bind_immersion_key_button);
     }
 
     private void buildExtraKeysSection(LinearLayout root) {
@@ -671,8 +727,8 @@ public class SettingsActivity extends Activity {
         touchpadHint.setPadding(0, dp(4), 0, dp(12));
         root.addView(touchpadHint);
 
-        // External mouse/touchpad capture. This is opt-in because it changes
-        // Android's pointer event mode from absolute coordinates to relative motion.
+        // External mouse pointer capture.  This is opt-in because it changes
+        // Android's mouse event mode from absolute coordinates to relative motion.
         Switch pointerCaptureSwitch = new Switch(this);
         pointerCaptureSwitch.setText(R.string.pointer_capture_switch);
         pointerCaptureSwitch.setTextSize(14);
@@ -723,14 +779,6 @@ public class SettingsActivity extends Activity {
             @Override public void onStopTrackingTouch(SeekBar seekBar) {}
         });
         accelLayout.addView(accelSeek);
-
-        TextView accelHint = new TextView(this);
-        accelHint.setText(R.string.mouse_sensitivity_hint);
-        accelHint.setTextSize(12);
-        accelHint.setTextColor(Color.GRAY);
-        accelHint.setPadding(0, dp(4), 0, dp(8));
-        accelLayout.addView(accelHint);
-
         root.addView(accelLayout);
 
         // ===== 双指滚动 =====
@@ -937,6 +985,27 @@ public class SettingsActivity extends Activity {
         cameraHint.setPadding(0, dp(4), 0, 0);
         root.addView(cameraHint);
 
+        // Audio keep-alive: keep the AAudio output stream running (fed near-silent
+        // keepalive) so short Linux UI sounds (volume ticks, key clicks) always play
+        // immediately. Off by default so the audio path can sleep when the desktop is
+        // silent and save standby power.
+        Switch keepaliveSwitch = new Switch(this);
+        keepaliveSwitch.setText(R.string.audio_keepalive_switch);
+        keepaliveSwitch.setTextSize(14);
+        keepaliveSwitch.setPadding(0, dp(16), 0, 0);
+        keepaliveSwitch.setChecked(prefs.getBoolean(KEY_AUDIO_KEEPALIVE, false));
+        keepaliveSwitch.setOnCheckedChangeListener((v, checked) ->
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                .putBoolean(KEY_AUDIO_KEEPALIVE, checked).apply());
+        root.addView(keepaliveSwitch);
+
+        TextView keepaliveHint = new TextView(this);
+        keepaliveHint.setText(R.string.audio_keepalive_hint);
+        keepaliveHint.setTextSize(12);
+        keepaliveHint.setTextColor(Color.GRAY);
+        keepaliveHint.setPadding(0, dp(4), 0, 0);
+        root.addView(keepaliveHint);
+
         // Audio latency presets, separately for the speaker (playback) and microphone
         // (capture) paths. The chosen buffer is forwarded to the producer's PipeWire
         // nodes; smaller = lower latency but more risk of audio glitches.
@@ -1112,84 +1181,26 @@ public class SettingsActivity extends Activity {
         return box;
     }
 
-    private void startListening(KeyBinding kb) {
-        if (listeningFor != null) return;
-        listeningFor = kb;
-        kb.button.setText(getString(R.string.listening_countdown, 5));
-
-        listenTimer = new CountDownTimer(5000, 1000) {
-            @Override
-            public void onTick(long millisUntilFinished) {
-                kb.button.setText(getString(R.string.listening_countdown,
-                    (int) (millisUntilFinished / 1000)));
-            }
-
-            @Override
-            public void onFinish() {
-                finishListening(UNBOUND, 0);
-            }
-        }.start();
-    }
-
-    private void finishListening(int keycode, int scanCode) {
-        listenTimer.cancel();
-        KeyBinding kb = listeningFor;
-        listeningFor = null;
-        if (kb == null) return;
-
-        SharedPreferences.Editor e = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
-        e.putInt(kb.prefKey, keycode);
-        if (kb.scanPrefKey != null)
-            e.putInt(kb.scanPrefKey, scanCode);
-        e.apply();
-
-        kb.button.setText(kb.buttonLabelRes);
-        updateStatus(kb);
-    }
-
-    private void updateStatus(KeyBinding kb) {
-        if (kb == null) return;
-        int bound = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getInt(kb.prefKey, UNBOUND);
-        if (bound == UNBOUND) {
-            kb.status.setText(R.string.status_current_none);
-        } else {
-            int nameRes = KEY_NAME_RES.get(bound);
-            String name = nameRes != 0
-                ? getString(nameRes)
-                : getString(R.string.keycode_unknown, bound);
-            kb.status.setText(getString(R.string.status_current, name));
+    /** Stop whichever row is counting down, leaving its binding untouched. */
+    private void stopListening() {
+        if (listeningBinding != null) {
+            listeningBinding.cancel();
+            listeningBinding = null;
         }
     }
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
-        if (listeningFor == null) return super.onKeyDown(keyCode, event);
+        if (listeningBinding == null) return super.onKeyDown(keyCode, event);
 
         // Ignore generic Virtual Keyboard keycode (it's a placeholder)
         if (keyCode == KeyEvent.KEYCODE_UNKNOWN) return true;
 
-        int scanCode = event.getScanCode();
-        if (KEY_IMMERSION_KEYCODE.equals(listeningFor.prefKey)) {
-            // Back is not delivered as a KeyEvent on every OEM, and Power is owned by
-            // the system. Neither is a reliable root-side escape key.
-            if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_POWER) {
-                Toast.makeText(this, R.string.immerse_bind_key_reserved,
-                        Toast.LENGTH_SHORT).show();
-                return true;
-            }
-            if (scanCode <= 0)
-                scanCode = KeyCodeMapper.getScanCode(keyCode);
-            if (scanCode <= 0) {
-                Toast.makeText(this, R.string.immerse_key_unusable,
-                        Toast.LENGTH_SHORT).show();
-                return true;
-            }
-        }
-
-        // Record the raw/fallback evdev scancode alongside: the helper matches on it.
-        finishListening(keyCode, scanCode);
-        Log.i(TAG, "Bound keycode: " + keyCode + " scancode: " + scanCode);
+        // The scan code is recorded alongside the key code: it is what the
+        // immersive-mode root helper matches on, and it is the only identity a
+        // key like Volume Up has once Android is out of the picture.
+        listeningBinding.bind(keyCode, event.getScanCode());
+        Log.i(TAG, "Bound keycode: " + keyCode + " scancode: " + event.getScanCode());
         return true;
     }
 

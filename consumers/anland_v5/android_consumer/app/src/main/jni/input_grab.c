@@ -1,851 +1,812 @@
 /*
- * input_grab — root-side exclusive input grabber. See input_grab.h for the
- * architecture and wire format. Built as libinputgrab.so (an executable named
- * lib*.so so the packager extracts it with +x), launched by the app via `su -c`.
+ * inputgrab -- the root helper behind "immersive mode".
+ *
+ * Immersive mode hands the device over to the Linux desktop: the touchscreen,
+ * the keyboard and any pointer stop reaching Android entirely and are streamed
+ * to the app instead, which replays them onto the remote desktop.
+ *
+ * The app cannot read /dev/input itself (untrusted_app is denied
+ * input_device:chr_file), so it launches this helper through `su -c`. The
+ * helper opens and EVIOCGRABs the devices in the root context and forwards a
+ * fixed-size record stream over a unix socket the app listens on -- the same
+ * bridge pattern fd_helper.c uses to hand back the daemon connection. It is
+ * shipped inside the APK as lib*.so so Android extracts it into the app's
+ * nativeLibraryDir with execute permission.
+ *
+ *   usage: libinputgrab.so <bridge_socket_path> <toggle_scancode>
+ *
+ * Grabbing every input device is a good way to brick a tablet, so the escape
+ * hatches are the design, in the order they matter:
+ *
+ *   1. EVIOCGRAB hangs off the open file description, so the kernel drops every
+ *      grab as soon as this process dies -- including on SIGKILL.
+ *   2. <toggle_scancode> is mandatory and is watched on every device: pressing
+ *      it ungrabs and exits, so the user gets out even if the app is wedged.
+ *   3. Records are sent non-blocking and dropped under back-pressure. A stalled
+ *      app can therefore never park this process inside send() and stop it from
+ *      ever reaching the toggle key -- which is what actually locks a device up.
+ *   4. The app heartbeats over the same socket. Silence for HEARTBEAT_TIMEOUT_MS
+ *      (or EOF, which the kernel guarantees when the app dies) releases
+ *      everything. The app only heartbeats while its main thread is running, so
+ *      an ANR frees the input too.
+ *   5. Devices carrying KEY_POWER that are not keyboards are watched but never
+ *      grabbed: the power button always stays with Android.
  */
 #define _GNU_SOURCE
+#include <android/log.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/input.h>
 #include <poll.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
-#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
-#include <linux/input.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "input_grab.h"
+#include "socket_utils.h"
 
-#ifdef __ANDROID__
-#include <android/log.h>
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "AnlandGrab", __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "AnlandGrab", __VA_ARGS__)
-#else
-#define LOGI(...) fprintf(stderr, __VA_ARGS__)
-#define LOGE(...) fprintf(stderr, __VA_ARGS__)
-#endif
+#define TAG "AnlandGrab"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-#define BITS_PER_LONG ((int)(sizeof(unsigned long) * 8))
-#define NBITS(x) ((((x) - 1) / BITS_PER_LONG) + 1)
-#define ARRAY_SIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
+/* No heartbeat for this long => the app is gone or frozen; release everything. */
+#define HEARTBEAT_TIMEOUT_MS 6000
+/* How often to look for input devices that appeared since the session started.
+ * Bluetooth mice and keyboards sleep and reconnect as brand-new nodes
+ * mid-session; a one-time scan at start would leave them out of the grab and
+ * at Android's mercy. */
+#define RESCAN_INTERVAL_MS 2000
+/* Consecutive dropped records before we give the input back rather than keep
+ * grabbing for an app that is plainly not reading. */
+#define MAX_DROPS 2000
+/* Poll slice; also how often the timeout above is re-checked. */
+#define POLL_SLICE_MS 250
 
-#define IGRAB_CONNECT_TIMEOUT_MS 3000
-#define IGRAB_STARTUP_SEND_MS    2000
-#define IGRAB_READ_BATCH         64
+#define BITS_PER_LONG  (8 * (int)sizeof(unsigned long))
+#define NBITS(x)       ((((x) - 1) / BITS_PER_LONG) + 1)
+#define TEST_BIT(bit, arr) \
+    (((arr)[(bit) / BITS_PER_LONG] >> ((bit) % BITS_PER_LONG)) & 1UL)
 
-static int test_bit(int bit, const unsigned long *arr)
+struct dev_entry {
+    int  fd;
+    int  cls;        /* IGRAB_CLASS_* */
+    int  grabbed;    /* 0 => watched only (toggle detection), events not forwarded */
+    int  multitouch;
+    int  clickpad;   /* one button under the pad: BTN_LEFT alone means "a click" */
+    int  min_x, max_x, min_y, max_y;
+    char name[80];
+};
+
+static struct dev_entry g_devs[IGRAB_MAX_DEVICES];
+static int g_ndevs = 0;
+static volatile sig_atomic_t g_quit = 0;
+
+static void on_signal(int sig)
 {
-    return (arr[bit / BITS_PER_LONG] >> (bit % BITS_PER_LONG)) & 1UL;
+    (void)sig;
+    g_quit = 1;
 }
 
-struct dev {
-    int fd;
-    char path[128];
-    uint32_t kind;
-    int forward;
-    int grabbed;
-    int has_ev_key;
-    int has_exit;
-    int wire_index;
-    int32_t abs_x_min, abs_x_max, abs_y_min, abs_y_max;
-    int32_t slot_min, slot_max, slot_current;
-};
-
-struct pending_batch {
-    int count;
-    struct input_event events[IGRAB_READ_BATCH];
-};
-
-static int64_t now_ms(void)
+static long now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-static int wait_fd(int fd, short events, int timeout_ms)
+/*
+ * Connect to the app's listening socket, which lives in the abstract namespace
+ * (that is what android.net.LocalServerSocket creates). Abstract means there is
+ * no file to find, chmod or clean up, and root needs one SELinux permission
+ * fewer than for a socket inside the app's data directory. socket_utils'
+ * connect_unix() only speaks filesystem paths, hence this one.
+ */
+static int connect_abstract(const char *name)
 {
-    struct pollfd p = { .fd = fd, .events = events };
-    for (;;) {
-        int r = poll(&p, 1, timeout_ms);
-        if (r < 0 && errno == EINTR)
-            continue;
-        if (r <= 0)
-            return r;
-        if (p.revents & (POLLERR | POLLHUP | POLLNVAL))
-            return -1;
-        return (p.revents & events) ? 1 : 0;
-    }
-}
-
-static int connect_bridge(const char *path)
-{
-    if (!path || strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        errno = ENAMETOOLONG;
+    size_t len = strlen(name);
+    struct sockaddr_un addr;
+    if (len + 1 > sizeof(addr.sun_path))
         return -1;
-    }
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
+    memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof addr.sun_path - 1);
+    addr.sun_path[0] = '\0';            /* leading NUL == abstract namespace */
+    memcpy(addr.sun_path + 1, name, len);
+    socklen_t alen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + len);
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0)
-        return fd;
-    if (errno != EINPROGRESS && errno != EAGAIN) {
-        close(fd);
-        return -1;
-    }
-
-    if (wait_fd(fd, POLLOUT, IGRAB_CONNECT_TIMEOUT_MS) != 1) {
-        close(fd);
-        errno = ETIMEDOUT;
-        return -1;
-    }
-    int err = 0;
-    socklen_t len = sizeof err;
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-        if (err != 0)
-            errno = err;
+    if (connect(fd, (struct sockaddr *)&addr, alen) < 0) {
         close(fd);
         return -1;
     }
     return fd;
 }
 
-static int send_exact_timeout(int fd, const void *buf, size_t len, int timeout_ms)
+/* Release every grab and close. Called on every exit path; the kernel would do
+ * it anyway when the process dies, but doing it explicitly keeps the window
+ * where Android sees no input as short as possible. */
+static void release_all(void)
 {
-    const unsigned char *p = buf;
-    size_t sent = 0;
-    int64_t deadline = now_ms() + timeout_ms;
-    while (sent < len) {
-        int64_t left = deadline - now_ms();
-        if (left <= 0)
-            return -1;
-        int r = wait_fd(fd, POLLOUT, left > INT32_MAX ? INT32_MAX : (int)left);
-        if (r != 1)
-            return -1;
-        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
-        if (n > 0) {
-            sent += (size_t)n;
+    for (int i = 0; i < g_ndevs; i++) {
+        if (g_devs[i].fd < 0)
             continue;
-        }
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-            continue;
-        return -1;
+        if (g_devs[i].grabbed)
+            ioctl(g_devs[i].fd, EVIOCGRAB, 0);
+        close(g_devs[i].fd);
+        g_devs[i].fd = -1;
     }
-    return 0;
+    g_ndevs = 0;
 }
 
-/* One event record is deliberately all-or-nothing. A short stream write would leave
- * the reader with a partial frame, so treat it as fatal and release the grab. */
-static int send_rec_nb(int sock, const struct igrab_rec *rec)
+/* ---------------- record transport ---------------- */
+
+/* Tail of a record that only went out partially. A stream socket can accept
+ * fewer than 32 bytes, and losing the rest would desync the framing for good,
+ * so the remainder is held here and flushed before anything else. */
+static uint8_t g_pending[IGRAB_REC_SIZE];
+static size_t  g_pending_len = 0;
+static int     g_drops = 0;
+static int     g_need_resync = 0;
+
+static int writable(int fd)
 {
-    ssize_t n = send(sock, rec, sizeof *rec, MSG_NOSIGNAL | MSG_DONTWAIT);
-    if (n == (ssize_t)sizeof *rec)
-        return 1;
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+    struct pollfd p = { .fd = fd, .events = POLLOUT };
+    return poll(&p, 1, 0) > 0 && (p.revents & POLLOUT);
+}
+
+/* Flush a partial record. 1 = nothing pending anymore, 0 = still pending. */
+static int flush_pending(int fd)
+{
+    while (g_pending_len > 0) {
+        if (!writable(fd))
+            return 0;
+        ssize_t n = send(fd, g_pending + (IGRAB_REC_SIZE - g_pending_len),
+                         g_pending_len, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n > 0) {
+            g_pending_len -= (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+            return 0;
+        return -1;
+    }
+    return 1;
+}
+
+/*
+ * Send one record, never blocking. Under back-pressure the record is dropped
+ * and counted: input that cannot be delivered is worth less than the ability to
+ * keep polling for the toggle key. Returns 0 on success or a drop, -1 when the
+ * socket is dead.
+ */
+static int send_rec(int fd, const struct igrab_rec *rec)
+{
+    int fp = flush_pending(fd);
+    if (fp < 0)
+        return -1;
+    if (fp == 0) {
+        g_drops++;
+        g_need_resync = 1;
         return 0;
+    }
+
+    if (!writable(fd)) {
+        g_drops++;
+        g_need_resync = 1;
+        return 0;
+    }
+
+    ssize_t n = send(fd, rec, IGRAB_REC_SIZE, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n == IGRAB_REC_SIZE) {
+        g_drops = 0;
+        return 0;
+    }
+    if (n > 0) {
+        /* Partial: stash the tail so the next call restores the framing. */
+        memcpy(g_pending, rec, IGRAB_REC_SIZE);
+        g_pending_len = IGRAB_REC_SIZE - (size_t)n;
+        g_drops = 0;
+        return 0;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        g_drops++;
+        g_need_resync = 1;
+        return 0;
+    }
     return -1;
 }
 
-static void send_failed_hello(int sock, int reason)
+/* Tell the app that records were lost, so it can release every key/contact it
+ * still believes is held instead of leaving them stuck on the desktop. Mirrors
+ * what the kernel does with SYN_DROPPED. */
+static int send_resync(int fd)
 {
-    if (sock < 0)
-        return;
-    struct igrab_hello hello = {
-        .magic = IGRAB_MAGIC,
-        .version = IGRAB_PROTOCOL_VERSION,
-        .status = IGRAB_STATUS_FAILED,
-        .reason = (uint32_t)reason,
-        .dev_count = 0,
-    };
-    (void)send_exact_timeout(sock, &hello, sizeof hello, IGRAB_STARTUP_SEND_MS);
-}
-
-static int send_success_hello(int sock, struct dev *devs, int n, int forward_count)
-{
-    struct igrab_hello hello = {
-        .magic = IGRAB_MAGIC,
-        .version = IGRAB_PROTOCOL_VERSION,
-        .status = IGRAB_STATUS_OK,
-        .reason = IGRAB_REASON_NONE,
-        .dev_count = (uint32_t)forward_count,
-    };
-    if (send_exact_timeout(sock, &hello, sizeof hello, IGRAB_STARTUP_SEND_MS) < 0)
+    struct igrab_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.rtype = IGRAB_REC_EVENT;
+    rec.dev   = IGRAB_DEV_ALL;
+    rec.etype = EV_SYN;
+    rec.code  = SYN_DROPPED;
+    if (send_rec(fd, &rec) < 0)
         return -1;
-
-    for (int i = 0; i < n; i++) {
-        struct dev *d = &devs[i];
-        if (!d->forward)
-            continue;
-        struct igrab_dev gd = {
-            .index = (uint32_t)d->wire_index,
-            .kind = d->kind,
-            .abs_x_min = d->abs_x_min,
-            .abs_x_max = d->abs_x_max,
-            .abs_y_min = d->abs_y_min,
-            .abs_y_max = d->abs_y_max,
-            .abs_slot_min = d->slot_min,
-            .abs_slot_max = d->slot_max,
-        };
-        if (send_exact_timeout(sock, &gd, sizeof gd, IGRAB_STARTUP_SEND_MS) < 0)
-            return -1;
-    }
-
-    /* EVIOCGABS reports the device-global current Type-B slot. A newly opened evdev
-     * client is not guaranteed to receive ABS_MT_SLOT before the next contact when
-     * the driver reuses that same slot, so seed the app reader explicitly. */
-    for (int i = 0; i < n; i++) {
-        struct dev *d = &devs[i];
-        if (!d->forward || d->kind != IGRAB_KIND_TOUCH)
-            continue;
-        struct igrab_rec slot = {
-            .index = (uint32_t)d->wire_index,
-            .type = EV_ABS,
-            .code = ABS_MT_SLOT,
-            .value = d->slot_current,
-        };
-        if (send_exact_timeout(sock, &slot, sizeof slot, IGRAB_STARTUP_SEND_MS) < 0)
-            return -1;
-    }
+    /* Only clear once it actually left: a dropped resync marker is worse than
+     * useless, it would hide the drop it was meant to report. */
+    if (g_drops == 0 && g_pending_len == 0)
+        g_need_resync = 0;
     return 0;
 }
 
-static int is_external_bus(uint16_t bustype)
+static int send_bye(int fd, int reason)
 {
-    return bustype == BUS_USB || bustype == BUS_BLUETOOTH;
+    /* Finish any half-written record first: leaving one truncated would put the
+     * app's parser out of step with the stream, and this is the one record it
+     * really has to be able to read. */
+    if (g_pending_len > 0) {
+        send_all(fd, g_pending + (IGRAB_REC_SIZE - g_pending_len), g_pending_len);
+        g_pending_len = 0;
+    }
+
+    struct igrab_rec rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.rtype = IGRAB_REC_BYE;
+    rec.value = reason;
+    /* Blocking on purpose: this is the last record and the socket has a send
+     * timeout, so it cannot hang. Losing it would leave the app waiting for a
+     * stream that has already ended. */
+    return send_all(fd, &rec, sizeof(rec));
 }
 
-static int any_key_except_reserved(const unsigned long *key)
+/* ---------------- device discovery ---------------- */
+
+/* A real keyboard: the letter block. Used both to keep alphabetic keyboards out
+ * of the "carries KEY_POWER, do not grab" rule (external keyboards commonly
+ * report a power key) and to classify key-only devices. */
+static int has_alpha_keys(const unsigned long *key)
 {
-    for (int code = 1; code < KEY_CNT; code++) {
-        if (test_bit(code, key))
+    static const int letters[] = {
+        KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y,
+        KEY_A, KEY_S, KEY_D, KEY_F, KEY_G,
+        KEY_Z, KEY_X, KEY_C, KEY_V,
+    };
+    for (size_t i = 0; i < sizeof(letters) / sizeof(letters[0]); i++) {
+        if (!TEST_BIT(letters[i], key))
+            return 0;
+    }
+    return 1;
+}
+
+static int any_key_bit(const unsigned long *key)
+{
+    for (int i = 0; i <= KEY_MAX; i++) {
+        if (TEST_BIT(i, key))
             return 1;
     }
     return 0;
 }
 
-/* Returns 1 to retain the fd, 0 to skip it, -1 for a startup-fatal capability
- * mismatch. Pointer devices are handled by Android pointer capture, but an exit key
- * on one is retained watch-only so the root-side escape remains independent. */
-static int classify_device(int fd, int exit_code, struct dev *d, int *reason)
+static void read_abs_range(int fd, int axis, int *min, int *max)
 {
-    unsigned long ev[NBITS(EV_CNT)];
-    unsigned long prop[NBITS(INPUT_PROP_CNT)];
-    unsigned long key[NBITS(KEY_CNT)];
-    unsigned long abs[NBITS(ABS_CNT)];
-    unsigned long rel[NBITS(REL_CNT)];
-    struct input_id id;
-    memset(ev, 0, sizeof ev);
-    memset(prop, 0, sizeof prop);
-    memset(key, 0, sizeof key);
-    memset(abs, 0, sizeof abs);
-    memset(rel, 0, sizeof rel);
-    memset(&id, 0, sizeof id);
+    struct input_absinfo info;
+    if (ioctl(fd, EVIOCGABS(axis), &info) == 0 && info.maximum > info.minimum) {
+        *min = info.minimum;
+        *max = info.maximum;
+    }
+}
 
-    if (ioctl(fd, EVIOCGBIT(0, sizeof ev), ev) < 0 ||
-        ioctl(fd, EVIOCGPROP(sizeof prop), prop) < 0 ||
-        ioctl(fd, EVIOCGID, &id) < 0) {
-        *reason = IGRAB_REASON_STARTUP_IO_ERROR;
+/*
+ * Open one /dev/input node and decide what it is. Returns 0 when the node was
+ * taken (entry filled in, fd owned by the caller), -1 when it was skipped.
+ *
+ * Classification is by capability bits, never by event number: the numbering
+ * shifts as soon as a keyboard or dock is attached.
+ */
+static int inspect_device(const char *path, struct dev_entry *out)
+{
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+
+    unsigned long ev[NBITS(EV_MAX)];
+    unsigned long key[NBITS(KEY_MAX)];
+    unsigned long abs[NBITS(ABS_MAX)];
+    unsigned long rel[NBITS(REL_MAX)];
+    unsigned long prop[NBITS(INPUT_PROP_MAX)];
+    memset(ev, 0, sizeof(ev));
+    memset(key, 0, sizeof(key));
+    memset(abs, 0, sizeof(abs));
+    memset(rel, 0, sizeof(rel));
+    memset(prop, 0, sizeof(prop));
+
+    if (ioctl(fd, EVIOCGBIT(0, sizeof(ev)), ev) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (TEST_BIT(EV_KEY, ev))
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key)), key);
+    if (TEST_BIT(EV_ABS, ev))
+        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs)), abs);
+    if (TEST_BIT(EV_REL, ev))
+        ioctl(fd, EVIOCGBIT(EV_REL, sizeof(rel)), rel);
+    ioctl(fd, EVIOCGPROP(sizeof(prop)), prop);
+
+    memset(out, 0, sizeof(*out));
+    out->fd = fd;
+    if (ioctl(fd, EVIOCGNAME(sizeof(out->name)), out->name) < 0)
+        out->name[0] = '\0';
+    out->name[sizeof(out->name) - 1] = '\0';
+
+    int mt      = TEST_BIT(ABS_MT_POSITION_X, abs) && TEST_BIT(ABS_MT_POSITION_Y, abs);
+    int abs_xy  = TEST_BIT(ABS_X, abs) && TEST_BIT(ABS_Y, abs);
+    int rel_xy  = TEST_BIT(REL_X, rel) && TEST_BIT(REL_Y, rel);
+    int direct  = TEST_BIT(INPUT_PROP_DIRECT, prop);
+    int pointer = TEST_BIT(INPUT_PROP_POINTER, prop);
+    int touch   = TEST_BIT(BTN_TOUCH, key);
+    int click   = TEST_BIT(BTN_LEFT, key);
+    int pen     = TEST_BIT(BTN_TOOL_PEN, key) || TEST_BIT(BTN_STYLUS, key);
+    int alpha   = has_alpha_keys(key);
+    int power   = TEST_BIT(KEY_POWER, key);
+    int keys    = any_key_bit(key);
+
+    /* A stylus digitizer overlaps the panel; forwarding it as a second finger
+     * only confuses the gesture engine, and its barrel keys are useless here. */
+    if (pen) {
+        close(fd);
         return -1;
     }
 
-    d->has_ev_key = test_bit(EV_KEY, ev);
-    if (d->has_ev_key && ioctl(fd, EVIOCGBIT(EV_KEY, sizeof key), key) < 0) {
-        *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-        return -1;
-    }
-    if (test_bit(EV_ABS, ev) && ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs), abs) < 0) {
-        *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-        return -1;
-    }
-    if (test_bit(EV_REL, ev) && ioctl(fd, EVIOCGBIT(EV_REL, sizeof rel), rel) < 0) {
-        *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-        return -1;
-    }
-
-    d->has_exit = d->has_ev_key && exit_code > 0 && exit_code < KEY_CNT &&
-                  test_bit(exit_code, key);
-    int direct = test_bit(INPUT_PROP_DIRECT, prop);
-    int mt = test_bit(ABS_MT_POSITION_X, abs) && test_bit(ABS_MT_POSITION_Y, abs);
-    int pointer_buttons = 0;
-    if (d->has_ev_key) {
-        for (int code = BTN_MOUSE; code < BTN_JOYSTICK; code++) {
-            if (test_bit(code, key)) {
-                pointer_buttons = 1;
-                break;
-            }
-        }
-    }
-    int relative_pointer = test_bit(REL_X, rel) || test_bit(REL_Y, rel);
-    int pointer = test_bit(INPUT_PROP_POINTER, prop) || relative_pointer ||
-                  pointer_buttons || test_bit(INPUT_PROP_BUTTONPAD, prop) ||
-                  test_bit(INPUT_PROP_SEMI_MT, prop) || (!direct && mt);
-    int power = d->has_ev_key && test_bit(KEY_POWER, key);
-    int protected_power = power && !is_external_bus(id.bustype);
-
-    int type_b = mt && test_bit(ABS_MT_SLOT, abs) && test_bit(ABS_MT_TRACKING_ID, abs);
-    if (!pointer && mt) {
-        if (!type_b) {
-            *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            return -1;
-        }
-        struct input_absinfo ax, ay, as;
-        if (ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &ax) < 0 ||
-            ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &ay) < 0 ||
-            ioctl(fd, EVIOCGABS(ABS_MT_SLOT), &as) < 0 ||
-            ax.maximum <= ax.minimum || ay.maximum <= ay.minimum ||
-            as.maximum < as.minimum ||
-            as.value < as.minimum || as.value > as.maximum ||
-            (int64_t)as.maximum - as.minimum + 1 > IGRAB_MAX_SLOTS) {
-            *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            return -1;
-        }
-        if (protected_power) {
-            *reason = IGRAB_REASON_GRAB_FAILED;
-            return -1;
-        }
-        d->kind = IGRAB_KIND_TOUCH;
-        d->forward = 1;
-        d->abs_x_min = ax.minimum; d->abs_x_max = ax.maximum;
-        d->abs_y_min = ay.minimum; d->abs_y_max = ay.maximum;
-        d->slot_min = as.minimum; d->slot_max = as.maximum;
-        d->slot_current = as.value;
-        return 1;
-    }
-
-    int single = !pointer && test_bit(ABS_X, abs) && test_bit(ABS_Y, abs) &&
-                 d->has_ev_key && test_bit(BTN_TOUCH, key);
-    if (single) {
-        struct input_absinfo ax, ay;
-        if (ioctl(fd, EVIOCGABS(ABS_X), &ax) < 0 ||
-            ioctl(fd, EVIOCGABS(ABS_Y), &ay) < 0 ||
-            ax.maximum <= ax.minimum || ay.maximum <= ay.minimum) {
-            *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            return -1;
-        }
-        if (protected_power) {
-            *reason = IGRAB_REASON_GRAB_FAILED;
-            return -1;
-        }
-        d->kind = IGRAB_KIND_SINGLE_TOUCH;
-        d->forward = 1;
-        d->abs_x_min = ax.minimum; d->abs_x_max = ax.maximum;
-        d->abs_y_min = ay.minimum; d->abs_y_max = ay.maximum;
-        d->slot_min = d->slot_max = 0;
-        return 1;
-    }
-
-    /* A direct device that is neither supported Type-B touch nor BTN_TOUCH single
-     * touch would otherwise keep reaching Android while we claimed full immersion. */
-    if (direct) {
-        *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-        return -1;
-    }
-
-    if (pointer) {
-        if (d->has_exit) {
-            d->kind = IGRAB_KIND_KEY;
-            d->forward = 0;
-            return 1;
-        }
+    /* The power button (and the fingerprint/hall nodes that ride along with it)
+     * is the last way out of a wedged grab, so it is never taken away from
+     * Android. The node is still opened so the toggle key can be seen on
+     * chipsets that put the volume keys on the same node. */
+    if (power && !alpha) {
+        out->cls = IGRAB_CLASS_KEYBOARD;
+        out->grabbed = 0;
         return 0;
     }
 
-    if (d->has_ev_key && any_key_except_reserved(key)) {
-        if (protected_power) {
-            /* EVIOCGRAB is per node. Leave a built-in Power-bearing node with
-             * Android; retain it only when it carries the configured exit key. */
-            if (d->has_exit) {
-                d->kind = IGRAB_KIND_KEY;
-                d->forward = 0;
-                return 1;
-            }
-            return 0;
-        }
-        d->kind = IGRAB_KIND_KEY;
-        d->forward = 1;
-        return 1;
+    /* Contacts, not axes: a gamepad also reports ABS_X/ABS_Y, and its sticks
+     * must not be mistaken for a finger. */
+    int contacts = mt || (abs_xy && (direct || pointer || touch));
+
+    if (contacts) {
+        /* The property bits say it outright when they are set. Panels that set
+         * neither are told apart by the clickpad button: a touchscreen has no
+         * BTN_LEFT, an integrated pad almost always does. */
+        if (direct)
+            out->cls = IGRAB_CLASS_TOUCHSCREEN;
+        else if (pointer || click)
+            out->cls = IGRAB_CLASS_TOUCHPAD;
+        else
+            out->cls = IGRAB_CLASS_TOUCHSCREEN;
+    } else if (rel_xy) {
+        out->cls = IGRAB_CLASS_MOUSE;
+    } else if (keys) {
+        out->cls = IGRAB_CLASS_KEYBOARD;
+    } else {
+        close(fd);
+        return -1;
     }
 
-    if (d->has_exit) {
-        d->kind = IGRAB_KIND_KEY;
-        d->forward = 0;
-        return 1;
+    out->multitouch = mt;
+    /* A clickpad has one button under the whole surface, so every press comes in
+     * as BTN_LEFT and the app has to work out left vs right from where the
+     * finger is. INPUT_PROP_BUTTONPAD is the authoritative bit; a pad that
+     * offers no BTN_RIGHT at all is one in practice too. */
+    out->clickpad = TEST_BIT(INPUT_PROP_BUTTONPAD, prop)
+            || (click && !TEST_BIT(BTN_RIGHT, key));
+    if (out->cls == IGRAB_CLASS_TOUCHSCREEN || out->cls == IGRAB_CLASS_TOUCHPAD) {
+        if (mt) {
+            read_abs_range(fd, ABS_MT_POSITION_X, &out->min_x, &out->max_x);
+            read_abs_range(fd, ABS_MT_POSITION_Y, &out->min_y, &out->max_y);
+        }
+        /* Single-touch panels only have ABS_X/ABS_Y; multitouch ones still use
+         * them as a fallback when the MT axes report nothing usable. */
+        if (out->max_x <= out->min_x)
+            read_abs_range(fd, ABS_X, &out->min_x, &out->max_x);
+        if (out->max_y <= out->min_y)
+            read_abs_range(fd, ABS_Y, &out->min_y, &out->max_y);
+        if (out->max_x <= out->min_x || out->max_y <= out->min_y) {
+            close(fd);
+            return -1;
+        }
     }
+
+    if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+        /* Someone else already owns it exclusively. Watching it would double up
+         * with Android's own delivery, so let it go entirely. */
+        LOGE("grab '%s' failed: %s", out->name, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    out->grabbed = 1;
     return 0;
 }
 
-static int inotify_changed(int fd)
-{
-    char buf[4096];
-    int changed = 0;
-    for (;;) {
-        ssize_t n = read(fd, buf, sizeof buf);
-        if (n > 0) {
-            changed = 1;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            return changed;
-        return n == 0 ? changed : -1;
-    }
-}
-
-static int collect_devices(struct dev *devs, int max, int exit_code,
-                           int *count, int *forward_count, int *reason)
+static int scan_devices(void)
 {
     DIR *dir = opendir("/dev/input");
     if (!dir) {
-        *reason = IGRAB_REASON_INPUT_DIR_OPEN_FAILED;
+        LOGE("opendir(/dev/input): %s", strerror(errno));
         return -1;
     }
 
-    int n = 0, forwards = 0, exit_visible = 0;
-    struct dirent *e;
-    while ((e = readdir(dir)) != NULL) {
-        if (strncmp(e->d_name, "event", 5) != 0)
-            continue;
-
-        char path[128];
-        int plen = snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
-        if (plen < 0 || plen >= (int)sizeof path) {
-            *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            goto fail;
-        }
-        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-        if (fd < 0) {
-            *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            goto fail;
-        }
-
-        struct dev d;
-        memset(&d, 0, sizeof d);
-        d.fd = fd;
-        d.wire_index = -1;
-        int keep = classify_device(fd, exit_code, &d, reason);
-        if (keep < 0) {
-            close(fd);
-            goto fail;
-        }
-        if (keep == 0) {
-            close(fd);
-            continue;
-        }
-        if (n >= max) {
-            close(fd);
-            *reason = IGRAB_REASON_DEVICE_LIMIT;
-            goto fail;
-        }
-        snprintf(d.path, sizeof d.path, "%s", path);
-        if (d.forward)
-            d.wire_index = forwards++;
-        if (d.has_exit)
-            exit_visible = 1;
-        devs[n++] = d;
-    }
-    closedir(dir);
-
-    if (!exit_visible) {
-        *reason = IGRAB_REASON_EXIT_KEY_UNAVAILABLE;
-        goto fail_closed;
-    }
-    if (forwards == 0) {
-        *reason = IGRAB_REASON_NO_GRABBED_DEVICE;
-        goto fail_closed;
-    }
-    *count = n;
-    *forward_count = forwards;
-    return 0;
-
-fail:
-    closedir(dir);
-fail_closed:
-    for (int i = 0; i < n; i++)
-        close(devs[i].fd);
-    return -1;
-}
-
-static int check_idle(struct dev *devs, int n, int exit_code, int *reason)
-{
-    for (int i = 0; i < n; i++) {
-        struct dev *d = &devs[i];
-        unsigned long key[NBITS(KEY_CNT)];
-        memset(key, 0, sizeof key);
-        if (d->has_ev_key) {
-            if (ioctl(d->fd, EVIOCGKEY(sizeof key), key) < 0) {
-                *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-                return -1;
-            }
-            if (exit_code > 0 && exit_code < KEY_CNT && test_bit(exit_code, key)) {
-                *reason = IGRAB_REASON_EXIT_KEY_HELD;
-                return -1;
-            }
-            if (d->forward) {
-                for (int code = 1; code < KEY_CNT; code++) {
-                    if (test_bit(code, key)) {
-                        *reason = IGRAB_REASON_INPUT_BUSY;
-                        return -1;
-                    }
-                }
-            }
-        }
-
-        if (d->forward && d->kind == IGRAB_KIND_TOUCH) {
-            int slots = d->slot_max - d->slot_min + 1;
-            int32_t values[IGRAB_MAX_SLOTS + 1];
-            memset(values, 0, sizeof values);
-            values[0] = ABS_MT_TRACKING_ID;
-            size_t bytes = (size_t)(slots + 1) * sizeof(values[0]);
-            if (ioctl(d->fd, EVIOCGMTSLOTS(bytes), values) < 0) {
-                *reason = IGRAB_REASON_STARTUP_IO_ERROR;
-                return -1;
-            }
-            for (int s = 1; s <= slots; s++) {
-                if (values[s] >= 0) {
-                    *reason = IGRAB_REASON_INPUT_BUSY;
-                    return -1;
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-/* Opening an evdev fd starts a private event queue. EVIOCGKEY/EVIOCGMTSLOTS only
- * describe the current state, so a quick press-and-release could otherwise occur
- * entirely between the two idle snapshots and remain queued for the new session.
- * Treat any such startup-window record as busy and retry from a clean open. */
-static int reject_pending_startup_events(struct dev *devs, int n, int exit_code,
-                                         int *reason)
-{
-    struct input_event events[IGRAB_READ_BATCH];
-    for (int i = 0; i < n; i++) {
-        for (;;) {
-            ssize_t got = read(devs[i].fd, events, sizeof events);
-            if (got < 0 && errno == EINTR)
-                continue;
-            if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                break;
-            if (got <= 0 || got % (ssize_t)sizeof(events[0]) != 0) {
-                *reason = IGRAB_REASON_DEVICE_LOST;
-                return -1;
-            }
-            int count = (int)(got / (ssize_t)sizeof(events[0]));
-            for (int k = 0; k < count; k++) {
-                if (events[k].type == EV_KEY && events[k].code == exit_code &&
-                    events[k].value != 0) {
-                    *reason = IGRAB_REASON_EXIT_KEY_HELD;
-                    return -1;
-                }
-            }
-            *reason = IGRAB_REASON_INPUT_BUSY;
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static void ungrab_and_close(struct dev *devs, int n)
-{
-    for (int i = 0; i < n; i++) {
-        if (devs[i].fd < 0)
-            continue;
-        if (devs[i].grabbed)
-            (void)ioctl(devs[i].fd, EVIOCGRAB, 0);
-        close(devs[i].fd);
-        devs[i].fd = -1;
-        devs[i].grabbed = 0;
-    }
-}
-
-static int grab_all(struct dev *devs, int n, int *reason)
-{
+    struct dirent *ent;
     int grabbed = 0;
-    for (int i = 0; i < n; i++) {
-        if (!devs[i].forward)
+    while ((ent = readdir(dir)) != NULL && g_ndevs < IGRAB_MAX_DEVICES) {
+        if (strncmp(ent->d_name, "event", 5) != 0)
             continue;
-        if (ioctl(devs[i].fd, EVIOCGRAB, 1) < 0) {
-            LOGE("EVIOCGRAB %s failed: %s", devs[i].path, strerror(errno));
-            *reason = IGRAB_REASON_GRAB_FAILED;
-            return -1;
-        }
-        devs[i].grabbed = 1;
-        grabbed++;
+        char path[300];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        if (inspect_device(path, &g_devs[g_ndevs]) < 0)
+            continue;
+        LOGI("%s '%s' class=%d %s", path, g_devs[g_ndevs].name,
+             g_devs[g_ndevs].cls, g_devs[g_ndevs].grabbed ? "GRABBED" : "watch-only");
+        if (g_devs[g_ndevs].grabbed)
+            grabbed++;
+        g_ndevs++;
     }
-    if (grabbed == 0) {
-        *reason = IGRAB_REASON_NO_GRABBED_DEVICE;
+    closedir(dir);
+    return grabbed;
+}
+
+/* ---------------- mid-session device hotplug ---------------- */
+
+/* Device number of an event node; -1 when it is gone or not a device. */
+static int node_identity(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISCHR(st.st_mode))
         return -1;
+    return (int)st.st_rdev;
+}
+
+/* Whether a tracked device still owns this node (dead fds do not count: the
+ * device was unplugged, and a reconnect with the same number must be treated
+ * as new). */
+static int already_tracked(int rdev)
+{
+    for (int i = 0; i < g_ndevs; i++) {
+        if (g_devs[i].fd < 0)
+            continue;
+        struct stat st;
+        if (fstat(g_devs[i].fd, &st) == 0 && (int)st.st_rdev == rdev)
+            return 1;
     }
     return 0;
 }
 
-static int forward_record(int sock, const struct igrab_rec *rec)
+/*
+ * Grab any input device that appeared since the last scan. A Bluetooth mouse
+ * that went to sleep reconnects as a brand-new node mid-session; without this
+ * it would keep feeding Android, and the app would forward it unaccelerated
+ * and ungated. New devices get the same classification rules as at session
+ * start, a DEVICE record announces them to the app, and the toggle key is
+ * watched on them like on everything else.
+ */
+static void scan_new_devices(int sock)
 {
-    return send_rec_nb(sock, rec);
+    DIR *dir = opendir("/dev/input");
+    if (!dir)
+        return;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && g_ndevs < IGRAB_MAX_DEVICES) {
+        if (strncmp(ent->d_name, "event", 5) != 0)
+            continue;
+        char path[300];
+        snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+        int rdev = node_identity(path);
+        if (rdev < 0 || already_tracked(rdev))
+            continue;
+
+        struct dev_entry de;
+        if (inspect_device(path, &de) < 0)
+            continue;   /* uninteresting, ungrabbable, or already grabbed by us */
+        int idx = g_ndevs;
+        g_devs[idx] = de;
+        g_ndevs++;
+        LOGI("new device %s '%s' class=%d %s", path, de.name, de.cls,
+             de.grabbed ? "GRABBED" : "watch-only");
+
+        struct igrab_rec rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.rtype = IGRAB_REC_DEVICE;
+        rec.dev   = (uint16_t)idx;
+        rec.etype = (uint16_t)de.cls;
+        rec.aux[IGRAB_AUX_MIN_X] = de.min_x;
+        rec.aux[IGRAB_AUX_MAX_X] = de.max_x;
+        rec.aux[IGRAB_AUX_MIN_Y] = de.min_y;
+        rec.aux[IGRAB_AUX_MAX_Y] = de.max_y;
+        rec.aux[IGRAB_AUX_FLAGS] =
+            (de.grabbed ? IGRAB_DEV_GRABBED : 0) |
+            (de.multitouch ? IGRAB_DEV_MULTITOUCH : 0) |
+            (de.clickpad ? IGRAB_DEV_CLICKPAD : 0);
+        send_rec(sock, &rec);   /* non-blocking; a drop is harmless */
+    }
+    closedir(dir);
 }
 
-static int run_stream(struct dev *devs, int n, int inotify_fd, int sock, int exit_code)
+static int send_device_list(int sock, int grabbed)
 {
-    struct pollfd pfd[IGRAB_MAX_DEVICES + 2];
-    struct pending_batch batches[IGRAB_MAX_DEVICES];
-    for (int i = 0; i < n; i++) {
-        pfd[i].fd = devs[i].fd;
-        pfd[i].events = POLLIN;
-    }
-    int ino_slot = n;
-    pfd[ino_slot].fd = inotify_fd;
-    pfd[ino_slot].events = POLLIN;
-    int sock_slot = -1;
-    int nfds = n + 1;
-    if (sock >= 0) {
-        sock_slot = nfds++;
-        pfd[sock_slot].fd = sock;
-        pfd[sock_slot].events = POLLIN;
+    struct igrab_rec rec;
+
+    memset(&rec, 0, sizeof(rec));
+    rec.rtype  = IGRAB_REC_HELLO;
+    rec.value  = IGRAB_PROTO_VERSION;
+    rec.aux[0] = grabbed;
+    rec.aux[1] = (int32_t)getpid();
+    if (send_all(sock, &rec, sizeof(rec)) < 0)
+        return -1;
+
+    for (int i = 0; i < g_ndevs; i++) {
+        memset(&rec, 0, sizeof(rec));
+        rec.rtype = IGRAB_REC_DEVICE;
+        rec.dev   = (uint16_t)i;
+        rec.etype = (uint16_t)g_devs[i].cls;
+        rec.aux[IGRAB_AUX_MIN_X] = g_devs[i].min_x;
+        rec.aux[IGRAB_AUX_MAX_X] = g_devs[i].max_x;
+        rec.aux[IGRAB_AUX_MIN_Y] = g_devs[i].min_y;
+        rec.aux[IGRAB_AUX_MAX_Y] = g_devs[i].max_y;
+        rec.aux[IGRAB_AUX_FLAGS] =
+            (g_devs[i].grabbed ? IGRAB_DEV_GRABBED : 0) |
+            (g_devs[i].multitouch ? IGRAB_DEV_MULTITOUCH : 0) |
+            (g_devs[i].clickpad ? IGRAB_DEV_CLICKPAD : 0);
+        if (send_all(sock, &rec, sizeof(rec)) < 0)
+            return -1;
     }
 
+    memset(&rec, 0, sizeof(rec));
+    rec.rtype = IGRAB_REC_READY;
+    rec.aux[0] = grabbed;
+    return send_all(sock, &rec, sizeof(rec));
+}
+
+/* ---------------- main loop ---------------- */
+
+/*
+ * Drain one device. Returns 1 to keep going, 0 when the toggle key was pressed
+ * and the session must end, -1 when the socket died.
+ */
+static int pump_device(int sock, int idx, int toggle)
+{
+    struct input_event evs[64];
     for (;;) {
-        int r = poll(pfd, (nfds_t)nfds, -1);
-        if (r < 0) {
+        ssize_t n = read(g_devs[idx].fd, evs, sizeof(evs));
+        if (n < 0) {
             if (errno == EINTR)
                 continue;
-            return IGRAB_REASON_STREAM_IO_ERROR;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return 1;   /* drained */
+            return -2;      /* ENODEV: the device was unplugged */
         }
+        if (n == 0)
+            return -2;      /* would otherwise spin: poll keeps reporting POLLIN */
 
-        memset(batches, 0, sizeof batches);
-        int pending_reason = IGRAB_REASON_NONE;
-        int changed = 0;
-        if (pfd[ino_slot].revents & POLLIN) {
-            int cr = inotify_changed(inotify_fd);
-            changed = cr != 0;
-            if (cr < 0)
-                pending_reason = IGRAB_REASON_DEVICE_CHANGED;
-        }
-        if (pfd[ino_slot].revents & (POLLERR | POLLHUP | POLLNVAL))
-            pending_reason = IGRAB_REASON_DEVICE_CHANGED;
-        if (changed && pending_reason == IGRAB_REASON_NONE)
-            pending_reason = IGRAB_REASON_DEVICE_CHANGED;
+        int count = (int)(n / (ssize_t)sizeof(struct input_event));
+        for (int i = 0; i < count; i++) {
+            struct input_event *e = &evs[i];
 
-        if (sock_slot >= 0 &&
-            (pfd[sock_slot].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)))
-            pending_reason = IGRAB_REASON_PEER_CLOSED;
-
-        for (int i = 0; i < n; i++) {
-            if (pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL))
-                pending_reason = IGRAB_REASON_DEVICE_LOST;
-            if (!(pfd[i].revents & POLLIN))
-                continue;
-            ssize_t got = read(devs[i].fd, batches[i].events, sizeof batches[i].events);
-            if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
-                continue;
-            if (got <= 0 || got % (ssize_t)sizeof(struct input_event) != 0) {
-                pending_reason = IGRAB_REASON_DEVICE_LOST;
+            if (e->type == EV_KEY && e->code == toggle) {
+                /* Press ends the session; the release and any auto-repeat are
+                 * swallowed so the key never reaches the desktop. Checked before
+                 * the grabbed test so a watch-only node can still trigger it. */
+                if (e->value == 1)
+                    return 0;
                 continue;
             }
-            batches[i].count = (int)(got / (ssize_t)sizeof(struct input_event));
-        }
 
-        /* Scan every ready node for the escape before forwarding any record from
-         * this poll batch. This preserves the root-side escape even under heavy touch. */
-        for (int i = 0; i < n; i++) {
-            for (int k = 0; k < batches[i].count; k++) {
-                struct input_event *ev = &batches[i].events[k];
-                if (devs[i].has_exit && ev->type == EV_KEY &&
-                    ev->code == exit_code && ev->value == 1)
-                    return IGRAB_REASON_EXIT_KEY;
-                /* A kernel-side evdev overrun means the current key/slot state is
-                 * unknowable without querying and reseeding every device. Hand input
-                 * back to Android instead of risking a stuck or misidentified touch. */
-                if (ev->type == EV_SYN && ev->code == SYN_DROPPED)
-                    return IGRAB_REASON_APP_STALLED;
-            }
-        }
+            if (!g_devs[idx].grabbed)
+                continue;   /* Android still owns it; forwarding would duplicate */
 
-        if (pending_reason != IGRAB_REASON_NONE)
-            return pending_reason;
+            if (g_need_resync && send_resync(sock) < 0)
+                return -1;
 
-        for (int i = 0; i < n; i++) {
-            struct dev *d = &devs[i];
-            for (int k = 0; k < batches[i].count; k++) {
-                struct input_event *ev = &batches[i].events[k];
-                if (d->has_exit && ev->type == EV_KEY && ev->code == exit_code)
-                    continue;
-                if (!d->forward)
-                    continue;
-
-                struct igrab_rec rec = {
-                    .index = (uint32_t)d->wire_index,
-                    .type = ev->type,
-                    .code = ev->code,
-                    .value = ev->value,
-                };
-                if (sock >= 0) {
-                    int fr = forward_record(sock, &rec);
-                    if (fr < 0)
-                        return IGRAB_REASON_PEER_CLOSED;
-                    /* A full bridge means at least one framed state transition would
-                     * be lost. Release immediately; root-side exit detection remains
-                     * responsive and the producer can never retain a phantom press. */
-                    if (fr == 0)
-                        return IGRAB_REASON_APP_STALLED;
-                } else if (ev->type != EV_SYN || ev->code != SYN_REPORT) {
-                    printf("dev%d t=%u code=%u val=%d\n", d->wire_index,
-                           ev->type, ev->code, ev->value);
-                    fflush(stdout);
-                }
+            struct igrab_rec rec;
+            memset(&rec, 0, sizeof(rec));
+            rec.rtype = IGRAB_REC_EVENT;
+            rec.dev   = (uint16_t)idx;
+            rec.etype = e->type;
+            rec.code  = e->code;
+            rec.value = e->value;
+            if (send_rec(sock, &rec) < 0)
+                return -1;
+            if (g_drops > MAX_DROPS) {
+                LOGE("app is not reading (%d dropped records); giving input back",
+                     g_drops);
+                return -3;
             }
         }
     }
-}
-
-static void send_release_control(int sock, int reason)
-{
-    if (sock < 0)
-        return;
-    struct igrab_rec rec = {
-        .index = 0,
-        .type = IGRAB_REC_TYPE_CONTROL,
-        .code = IGRAB_CONTROL_RELEASE,
-        .value = reason,
-    };
-    (void)send_rec_nb(sock, &rec);
-}
-
-static int parse_exit_code(const char *s)
-{
-    if (!s || !*s)
-        return -1;
-    char *end = NULL;
-    errno = 0;
-    long value = strtol(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0' || value <= 0 || value >= KEY_CNT)
-        return -1;
-    return (int)value;
 }
 
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        LOGE("usage: %s <bridge_socket|selftest> <exit_keycode>", argv[0]);
+        LOGE("usage: %s <bridge_socket> <toggle_scancode>", argv[0]);
         return 1;
     }
 
-    int selftest = strcmp(argv[1], "selftest") == 0;
-    int sock = -1;
-    if (!selftest) {
-        sock = connect_bridge(argv[1]);
-        if (sock < 0) {
-            LOGE("connect bridge %s failed: %s", argv[1], strerror(errno));
-            return 3;
-        }
-    }
-
-    int exit_code = parse_exit_code(argv[2]);
-    if (exit_code <= 0) {
-        send_failed_hello(sock, IGRAB_REASON_INVALID_EXIT_KEY);
-        if (sock >= 0)
-            close(sock);
-        return 1;
-    }
-
-    int inotify_fd = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-    if (inotify_fd < 0 ||
-        inotify_add_watch(inotify_fd, "/dev/input",
-                          IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
-                          IN_DELETE_SELF | IN_MOVE_SELF) < 0) {
-        LOGE("inotify /dev/input failed: %s", strerror(errno));
-        send_failed_hello(sock, IGRAB_REASON_HOTPLUG_WATCH_FAILED);
-        if (inotify_fd >= 0)
-            close(inotify_fd);
-        if (sock >= 0)
-            close(sock);
+    const char *bridge = argv[1];
+    int toggle = atoi(argv[2]);
+    /* A session with no way out is never started: the toggle key is the only
+     * thing that guarantees the user can hand the input back. */
+    if (toggle <= 0 || toggle > KEY_MAX) {
+        LOGE("refusing to grab without a valid toggle scancode (%d)", toggle);
         return 2;
     }
 
-    struct dev devs[IGRAB_MAX_DEVICES];
-    memset(devs, 0, sizeof devs);
-    for (int i = 0; i < IGRAB_MAX_DEVICES; i++)
-        devs[i].fd = -1;
-    int n = 0, forward_count = 0;
-    int reason = IGRAB_REASON_NONE;
-    int success_hello_started = 0;
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal);
+    signal(SIGHUP, on_signal);
 
-    if (collect_devices(devs, IGRAB_MAX_DEVICES, exit_code,
-                        &n, &forward_count, &reason) < 0)
-        goto startup_fail;
-    int changed = inotify_changed(inotify_fd);
-    if (changed != 0) {
-        reason = changed < 0 ? IGRAB_REASON_HOTPLUG_WATCH_FAILED
-                             : IGRAB_REASON_DEVICE_CHANGED;
-        goto startup_fail;
-    }
-    if (check_idle(devs, n, exit_code, &reason) < 0)
-        goto startup_fail;
-    if (grab_all(devs, n, &reason) < 0)
-        goto startup_fail;
-    if (check_idle(devs, n, exit_code, &reason) < 0)
-        goto startup_fail;
-    changed = inotify_changed(inotify_fd);
-    if (changed != 0) {
-        reason = changed < 0 ? IGRAB_REASON_HOTPLUG_WATCH_FAILED
-                             : IGRAB_REASON_DEVICE_CHANGED;
-        goto startup_fail;
-    }
-    if (reject_pending_startup_events(devs, n, exit_code, &reason) < 0)
-        goto startup_fail;
-
-    if (sock >= 0) {
-        success_hello_started = 1;
-        if (send_success_hello(sock, devs, n, forward_count) < 0) {
-            reason = IGRAB_REASON_STARTUP_IO_ERROR;
-            goto startup_fail;
-        }
+    int sock = connect_abstract(bridge);
+    if (sock < 0) {
+        LOGE("connect to bridge '%s' failed: %s", bridge, strerror(errno));
+        return 3;
     }
 
-    LOGI("immersive grab active: %d forwarded devices, exit key %d",
-         forward_count, exit_code);
-    if (selftest) {
-        printf("SELFTEST %d forwarded devices (exit evdev key %d)\n",
-               forward_count, exit_code);
-        for (int i = 0; i < n; i++) {
-            printf("  %s %s kind=%u%s\n", devs[i].forward ? "grabbed" : "watching",
-                   devs[i].path, devs[i].kind,
-                   devs[i].has_exit ? " [exit]" : "");
-        }
-        fflush(stdout);
-    }
+    /* The hello/device records are sent blocking; bound them so a peer that
+     * connects and then stops reading cannot wedge the handshake. A large send
+     * buffer keeps the event stream from dropping during a UI hiccup. */
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int sndbuf = 512 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    reason = run_stream(devs, n, inotify_fd, sock, exit_code);
-    /* Input must return to Android before any best-effort notification. */
-    ungrab_and_close(devs, n);
-    send_release_control(sock, reason);
-    LOGI("released input devices, reason=%d", reason);
-    close(inotify_fd);
-    if (sock >= 0)
+    int grabbed = scan_devices();
+    if (grabbed <= 0) {
+        LOGE("no grabbable input devices");
+        send_bye(sock, IGRAB_BYE_ERROR);
+        release_all();
         close(sock);
+        return 4;
+    }
+
+    if (send_device_list(sock, grabbed) < 0) {
+        LOGE("handshake failed: %s", strerror(errno));
+        release_all();
+        close(sock);
+        return 5;
+    }
+    LOGI("immersive session started: %d grabbed device(s), toggle=%d",
+         grabbed, toggle);
+
+    struct pollfd pfds[IGRAB_MAX_DEVICES + 1];
+    long last_beat = now_ms();
+    long last_scan = now_ms();
+    int reason = IGRAB_BYE_PEER_GONE;
+
+    for (;;) {
+        if (g_quit) {
+            /* SIGTERM comes from the app's own last-resort kill, i.e. it has
+             * already given up on the session. */
+            reason = IGRAB_BYE_PEER_GONE;
+            break;
+        }
+
+        int nfds = 0;
+        pfds[nfds].fd = sock;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+        for (int i = 0; i < g_ndevs; i++) {
+            if (g_devs[i].fd < 0)
+                continue;
+            pfds[nfds].fd = g_devs[i].fd;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        int ret = poll(pfds, (nfds_t)nfds, POLL_SLICE_MS);
+        if (ret < 0) {
+            if (errno == EINTR)
+                continue;
+            reason = IGRAB_BYE_ERROR;
+            break;
+        }
+
+        if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            reason = IGRAB_BYE_PEER_GONE;
+            break;
+        }
+        if (pfds[0].revents & POLLIN) {
+            char beat[64];
+            ssize_t n = recv(sock, beat, sizeof(beat), MSG_DONTWAIT);
+            if (n == 0) {
+                reason = IGRAB_BYE_PEER_GONE;   /* app closed / died */
+                break;
+            }
+            if (n > 0)
+                last_beat = now_ms();
+        }
+
+        /* A frozen app keeps its socket open but stops beating. Treat that the
+         * same as death: the input has to go back to Android either way. */
+        if (now_ms() - last_beat > HEARTBEAT_TIMEOUT_MS) {
+            LOGE("no heartbeat for %d ms; releasing", HEARTBEAT_TIMEOUT_MS);
+            reason = IGRAB_BYE_STALLED;
+            break;
+        }
+
+        /* Bluetooth devices wake and reconnect as new nodes; pick them up and
+         * pull them into the session. */
+        if (now_ms() - last_scan > RESCAN_INTERVAL_MS) {
+            scan_new_devices(sock);
+            last_scan = now_ms();
+        }
+
+        int stop = 0;
+        for (int p = 1; p < nfds && !stop; p++) {
+            if (!(pfds[p].revents & (POLLIN | POLLHUP | POLLERR)))
+                continue;
+            int idx = -1;
+            for (int i = 0; i < g_ndevs; i++) {
+                if (g_devs[i].fd == pfds[p].fd) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0)
+                continue;
+
+            int r = pump_device(sock, idx, toggle);
+            if (r == 0) {
+                reason = IGRAB_BYE_TOGGLE;
+                stop = 1;
+            } else if (r == -1) {
+                reason = IGRAB_BYE_PEER_GONE;
+                stop = 1;
+            } else if (r == -3) {
+                reason = IGRAB_BYE_STALLED;
+                stop = 1;
+            } else if (r == -2) {
+                /* Device vanished (unplugged dock/keyboard). Drop it and carry
+                 * on -- the remaining devices are still grabbed. */
+                LOGI("device '%s' went away", g_devs[idx].name);
+                if (g_devs[idx].grabbed)
+                    ioctl(g_devs[idx].fd, EVIOCGRAB, 0);
+                close(g_devs[idx].fd);
+                g_devs[idx].fd = -1;
+            }
+        }
+        if (stop)
+            break;
+
+        /* Every grabbed device is gone (dock unplugged mid-session). There is
+         * nothing left to hold, and staying alive would only keep the app
+         * believing it is still immersive. */
+        int alive = 0;
+        for (int i = 0; i < g_ndevs; i++) {
+            if (g_devs[i].fd >= 0 && g_devs[i].grabbed)
+                alive++;
+        }
+        if (alive == 0) {
+            LOGI("all grabbed devices are gone; ending session");
+            reason = IGRAB_BYE_ERROR;
+            break;
+        }
+    }
+
+    /* Ungrab first: the app is about to be told the session ended, and the
+     * sooner Android has its input back the shorter the dead window. */
+    release_all();
+    send_bye(sock, reason);
+    close(sock);
+    LOGI("immersive session ended (reason=%d)", reason);
     return 0;
-
-startup_fail:
-    ungrab_and_close(devs, n);
-    LOGE("immersive grab startup failed, reason=%d", reason);
-    if (!success_hello_started)
-        send_failed_hello(sock, reason);
-    close(inotify_fd);
-    if (sock >= 0)
-        close(sock);
-    return 2;
 }

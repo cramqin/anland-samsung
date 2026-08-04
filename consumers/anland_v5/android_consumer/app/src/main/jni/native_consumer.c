@@ -336,6 +336,16 @@ static void *event_thread_func(void *arg)
         return NULL;
     }
 
+    /* CONSUMER_VAR_* callbacks land on the owning MainActivity (var, value). */
+    jmethodID setVarMethod = NULL;
+    if (s->activity_obj) {
+        jclass actClass = (*env)->GetObjectClass(env, s->activity_obj);
+        setVarMethod = (*env)->GetMethodID(env, actClass, "nativeSetConsumerVar", "(II)V");
+        (*env)->DeleteLocalRef(env, actClass);
+        if (!setVarMethod)
+            LOGE("event thread: nativeSetConsumerVar not found");
+    }
+
     while (s->event_running) {
         if (!s->ctx) {
             usleep(50000);
@@ -366,6 +376,13 @@ static void *event_thread_func(void *arg)
                 }
             }
             free(buf);
+        } else if (ev.type == OUTPUT_TYPE_SET_CONSUMER_VAR) {
+            /* Producer asserts a transient runtime override. CONSUMER_VAR_CAPTURE_MOUSE
+             * forces pointer capture on for Wayland pointer lock (games); 0 releases.
+             * Forwarded to MainActivity, which marshals to the UI thread. */
+            if (setVarMethod && s->activity_obj)
+                (*env)->CallVoidMethod(env, s->activity_obj, setVarMethod,
+                                       (jint)ev.set_consumer_var.var, (jint)ev.set_consumer_var.value);
         } else {
             /* Unknown or zero-length event: drain any trailing data if size > 0 */
             LOGI("event thread: unknown output event type=%u size=%u", ev.type, ev.clipboard.size);
@@ -2547,4 +2564,14 @@ Java_com_anland_consumer_Native_nativeSetAudioLatency(
     if (!s)
         return;
     audio_set_latency(s->audio, speakerMs, micMs);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSetAudioKeepalive(
+    JNIEnv *env, jclass clazz, jlong handle, jboolean enabled)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    audio_set_keepalive(s->audio, enabled == JNI_TRUE);
 }

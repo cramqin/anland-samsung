@@ -15,7 +15,7 @@
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ 返回</string>
     <string name="cat_keyboard_title">鍵盤與按鍵</string>
-    <string name="cat_keyboard_subtitle">按鍵綁定、無障礙與擴充按鍵列</string>
+    <string name="cat_keyboard_subtitle">按鍵綁定、沉浸模式、無障礙與擴充按鍵列</string>
     <string name="cat_touchpad_title">觸控板與滑鼠</string>
     <string name="cat_touchpad_subtitle">觸控板模式、指標擷取與靈敏度</string>
     <string name="cat_connection_subtitle">socket、root、麥克風、相機與音訊延遲</string>
@@ -38,7 +38,21 @@
     <string name="listening_countdown">正在監聽…（%1$d 秒）</string>
     <string name="status_current_none">目前：無</string>
     <string name="status_current">目前：%1$s</string>
+    <string name="status_current_no_scancode">目前：%1$s —— 該按鍵不回報掃描碼，沉浸模式無法使用它。請改綁音量+等硬體按鍵。</string>
     <string name="keycode_unknown">鍵碼 %1$d</string>
+    <string name="scancode_unknown">掃描碼 %1$d</string>
+
+    <!-- Immersive mode -->
+    <string name="section_immersive">沉浸模式</string>
+    <string name="immersive_switch">啟用沉浸模式</string>
+    <string name="immersive_hint">透過 root 獨佔接管（EVIOCGRAB）觸控螢幕、鍵盤與指標裝置，讓 Android 完全收不到這些輸入，全部直接送往 Linux 桌面，系統手勢、通知列與導覽列都不會再干擾。需要 root。預設關閉且不會自行啟動：先開啟此開關並在下方綁定按鍵，然後按該鍵進入，再按一次離開。工作階段期間本應用程式自身的螢幕控制項按設計無法點選；「擷取外接指標」會暫時停用（該開關本身不受影響）；觸控板模式依然生效——手指移動游標，靈敏度沿用「觸控板與滑鼠」中的設定。應用程式失去焦點時工作階段也會結束。</string>
+    <string name="bind_immersive_key_button">綁定沉浸模式按鍵</string>
+    <string name="immersive_entering">已進入沉浸模式：所有輸入交給桌面，再按一次 %1$s 離開</string>
+    <string name="immersive_exited">已離開沉浸模式</string>
+    <string name="immersive_no_scancode">請先為沉浸模式綁定按鍵</string>
+    <string name="immersive_failed">無法進入沉浸模式：root 遭拒或無法使用</string>
+    <string name="immersive_no_devices">無法進入沉浸模式：沒有可接管的輸入裝置</string>
+    <string name="immersive_interrupted">沉浸模式已結束，輸入已交還 Android</string>
 
     <!-- Accessibility -->
     <string name="accessibility_switch">無障礙按鍵攔截</string>
@@ -107,6 +121,8 @@
     <string name="mic_hint">桌面音訊始終透過本裝置的喇叭播放。啟用此項還會把麥克風反向發送到桌面。下次連線時生效（請重新開啟應用程式）。</string>
     <string name="camera_switch">將相機轉發到桌面</string>
     <string name="camera_hint">允許桌面將本裝置的相機作為視訊來源開啟。僅在桌面正在錄製時相機才會開啟。下次返回應用程式時生效；首次使用會請求相機權限。</string>
+    <string name="audio_keepalive_switch">音訊保活</string>
+    <string name="audio_keepalive_hint">保持音訊輸出串流持續活躍，讓 Linux 的短促系統音（音量提示、按鍵音）始終即時播放；會略增待機耗電。關閉時桌面靜默約 1.5 秒後音訊路徑自動休眠，下次出聲時自動喚醒。開啟後若聽感延遲不合預期，可能需要配合調整下方的「音訊延遲」預設。</string>
     <string name="audio_latency_title">音訊延遲</string>
     <string name="latency_speaker_label">喇叭（桌面 → 手機）</string>
     <string name="latency_mic_label">麥克風（手機 → 桌面）</string>

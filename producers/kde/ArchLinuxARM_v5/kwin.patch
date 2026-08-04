@@ -1,0 +1,98 @@
+diff --git a/src/backends/CMakeLists.txt b/src/backends/CMakeLists.txt
+--- a/src/backends/CMakeLists.txt	2026-07-14 18:56:10.000000000 +0800
++++ b/src/backends/CMakeLists.txt	2026-07-21 18:56:06.449830469 +0800
+@@ -1,3 +1,4 @@
++add_subdirectory(anland)
+ add_subdirectory(drm)
+ add_subdirectory(fakeinput)
+ add_subdirectory(libinput)
+diff --git a/src/inputmethod.cpp b/src/inputmethod.cpp
+--- a/src/inputmethod.cpp	2026-07-14 18:56:10.000000000 +0800
++++ b/src/inputmethod.cpp	2026-07-21 18:11:01.669831501 +0800
+@@ -502,6 +502,16 @@
+     }
+ }
+ 
++void InputMethod::commitText(const QString &text)
++{
++    if (text.isEmpty()) {
++        return;
++    }
++
++    // Use the same routing path as a real zwp_input_method_v1 commit_string.
++    commitString(m_serial++, text);
++}
++
+ void InputMethod::commitString(quint32 serial, const QString &text)
+ {
+     if (auto t2 = waylandServer()->seat()->textInputV2(); t2 && t2->isEnabled()) {
+diff --git a/src/inputmethod.h b/src/inputmethod.h
+--- a/src/inputmethod.h	2026-07-14 18:56:10.000000000 +0800
++++ b/src/inputmethod.h	2026-07-21 18:10:47.537831507 +0800
+@@ -91,6 +91,7 @@
+ 
+     RectF cursorRectangle() const;
+ 
++    void commitText(const QString &text);
+ Q_SIGNALS:
+     void panelChanged();
+     void activeChanged(bool active);
+diff --git a/src/main_wayland.cpp b/src/main_wayland.cpp
+--- a/src/main_wayland.cpp	2026-07-14 18:56:10.000000000 +0800
++++ b/src/main_wayland.cpp	2026-07-21 21:22:59.025694334 +0800
+@@ -10,6 +10,7 @@
+ 
+ #include "config-kwin.h"
+ 
++#include "backends/anland/anland_backend.h"
+ #include "backends/drm/drm_backend.h"
+ #include "backends/virtual/virtual_backend.h"
+ #include "backends/wayland/wayland_backend.h"
+@@ -378,6 +379,7 @@
+                                      i18n("Exits this instance so it can be restarted by kwin_wayland_wrapper."));
+ 
+     QCommandLineOption drmOption(QStringLiteral("drm"), i18n("Render through drm node."));
++    QCommandLineOption anlandOption(QStringLiteral("anland"), i18n("Render to the anland display daemon."));
+     QCommandLineOption locale1Option(QStringLiteral("locale1"), i18n("Extract locale information from locale1 rather than the user's configuration"));
+ 
+     QCommandLineParser parser;
+@@ -400,6 +402,7 @@
+     parser.addOption(heightOption);
+     parser.addOption(scaleOption);
+     parser.addOption(outputCountOption);
++    parser.addOption(anlandOption);
+     parser.addOption(drmOption);
+     parser.addOption(locale1Option);
+     parser.addOption(fullscreenOption);
+@@ -466,6 +469,7 @@
+         X11,
+ #endif
+         Wayland,
++        Anland,
+         Virtual,
+     };
+ 
+@@ -475,7 +479,9 @@
+     qreal outputScale = 1;
+ 
+     // Decide what backend to use.
+-    if (parser.isSet(drmOption)) {
++    if (parser.isSet(anlandOption) || qEnvironmentVariableIsSet("ANLAND_SOCKET")) {
++        backendType = BackendType::Anland;
++    } else if (parser.isSet(drmOption)) {
+         backendType = BackendType::Kms;
+ #if KWIN_BUILD_X11
+     } else if (parser.isSet(x11DisplayOption)) {
+@@ -533,6 +539,12 @@
+     }
+ 
+     switch (backendType) {
++    case BackendType::Anland: {
++        const QString anlandSocket = qEnvironmentVariable("ANLAND_SOCKET");
++        a.setSession(KWin::Session::create(KWin::Session::Type::Noop));
++        a.setOutputBackend(std::make_unique<KWin::AnlandBackend>(anlandSocket));
++        break;
++    }
+     case BackendType::Kms:
+         a.setSession(KWin::Session::create());
+         if (!a.session()) {

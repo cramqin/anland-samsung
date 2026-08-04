@@ -7,17 +7,19 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.util.Log;
 import android.util.SparseArray;
-import android.util.SparseIntArray;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.InputDevice;
@@ -28,7 +30,6 @@ import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
-import android.view.ViewConfiguration;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -40,11 +41,11 @@ import java.nio.charset.StandardCharsets;
 
 
 public class MainActivity extends Activity
-        implements SurfaceHolder.Callback, SystemIME.Host {
+        implements SurfaceHolder.Callback, SystemIME.Host, ImmersiveMode.Host {
     private static final String TAG = "Anland";
 
     private SurfaceView surfaceView;
-    private volatile boolean surfaceReady = false;
+    private boolean surfaceReady = false;
     // System-clipboard bridge; also the target for the native clipboard callbacks.
     private Clipboard clipboard;
     private static final String PREFS_NAME = "anland_settings";
@@ -60,6 +61,8 @@ public class MainActivity extends Activity
     // Latency presets in ms; 0 = engine default. Shared with SettingsActivity.
     static final String KEY_SPEAKER_LATENCY_MS = "speaker_latency_ms";
     static final String KEY_MIC_LATENCY_MS = "mic_latency_ms";
+    // Audio keep-alive toggle. Shared with SettingsActivity.
+    static final String KEY_AUDIO_KEEPALIVE = "audio_keepalive";
     private static final int REQ_RECORD_AUDIO = 1001;
     private static final int REQ_CAMERA = 1002;
     // Camera service fds/threads are created once and persist across reconnects;
@@ -72,7 +75,10 @@ public class MainActivity extends Activity
     static final String EXTRA_SOCKET_PATH = "socket_path";
     static final String EXTRA_WINDOW_NAME = "window_name";
     // This window's own native transport instance (its own consumer_state handle).
-    private volatile Native mNative;
+    private Native mNative;
+    // Media audio focus for this window (volume keys + playback priority).
+    private AudioManager mAudioManager;
+    private AudioFocusRequest mAudioFocusRequest;
     // Socket path from the launch Intent; overrides the saved pref when non-null.
     private String mSocketOverride = null;
     // Title shown in recents / freeform (setTaskDescription); default "anland".
@@ -135,102 +141,12 @@ public class MainActivity extends Activity
     // the Android screen edges. This is deliberately opt-in: existing installations
     // keep the old absolute-pointer behaviour until the user enables it.
     public static final String KEY_POINTER_CAPTURE = "pointer_capture";
-    // Immersive full-input capture: a root helper (libinputgrab.so) takes an exclusive
-    // EVIOCGRAB on the touchscreen + key devices, so Android sees no input at all
-    // (home/back/recents gestures, notification shade, and every key are dead); the raw
-    // evdev stream is forwarded to Linux instead.
-    //
-    // This setting only ARMS the feature; it never immerses by itself. Immersion is
-    // always entered and left by the user pressing the key bound in Settings, and
-    // every launch/resume starts un-immersed. Nothing grabs input without an explicit
-    // press, which is what keeps a bad state from ever locking the device down.
-    public static final String KEY_FULL_KEY_CAPTURE = "full_key_capture";
-    private boolean fullKeyCaptureEnabled = false;
-
-    // The single key bound in Settings that toggles immersion. Immersion cannot be
-    // entered without one: the helper detects that same key root-side to leave, so a
-    // binding is what guarantees there is always a way out.
-    public static final String KEY_IMMERSION_KEYCODE = "immersion_keycode";
-    // Raw evdev scancode of that key, captured from the KeyEvent when it was bound.
-    // The helper matches on this, and taking it from the event works for keys
-    // KeyCodeMapper has no entry for -- the volume keys among them.
-    public static final String KEY_IMMERSION_SCANCODE = "immersion_scancode";
-    private static final int UNBOUND = -1;
-    private int immersionKeycode = UNBOUND;
-    private int immersionScancode = 0;
-
-    private enum ImmersionState { OFF, STARTING, ACTIVE, STOPPING }
-    private ImmersionState immersionState = ImmersionState.OFF;
-    private long immersionSessionId = 0L;
-    private long immersionNativeStartQueuedSession = -1L;
-    private volatile long immersionDesiredSessionId = -1L;
-    // Snapshot of KEY_TOUCHPAD_MODE for the current grab session. The setting is
-    // deliberately session-scoped: native must choose one raw-touch route for the
-    // whole helper lifetime, and returning from Settings always ends immersion.
-    private boolean immersionTouchpadMode = false;
-    private boolean immersionToggleDownPending = false;
-    private int immersionToggleDeviceId = 0;
-    private long immersionToggleDownTime = 0L;
-
-    // Pointer capture is a session resource while immersive input is starting/active.
-    // Keep the user's saved setting untouched and restore the pre-session temporary
-    // suppression state when the session ends.
-    private boolean immersionPointerCaptureForced = false;
-    private boolean immersionPointerCaptureRequired = false;
-    private boolean immersionPointerSuppressedBefore = false;
-    private boolean immersionExitToastPending = false;
-
-    // Transport changes are also serialized on grabExecutor. A generation makes stale
-    // surface/lifecycle work harmless when callbacks arrive in quick succession.
-    private volatile long transportGeneration = 0L;
-    private volatile boolean transportReady = false;
-    private volatile boolean activityResumed = false;
-
-    private static final int IMMERSION_REASON_POINTER_CAPTURE = 100;
-    // Tracked from onWindowFocusChanged rather than read via hasWindowFocus(), so the
-    // grab decision does not depend on when the framework updates the decor view.
-    private boolean mHasWindowFocus = false;
-    // Grab start/stop must never run on the main thread: they fork `su` and join the
-    // grab thread, and su can take seconds to grant -- that blocked main thread is
-    // what produced a real ANR ("Waited 5000ms for PointerCaptureChangedEvent").
-    // A single worker keeps start/stop strictly ordered while the UI stays responsive.
-    private final java.util.concurrent.ExecutorService grabExecutor =
-            java.util.concurrent.Executors.newSingleThreadExecutor();
 
     // Routing gate: when on, non-mouse touches go to the on-screen touchpad.
     private boolean isTouchpadMode = true;
-    // Raw touchscreen changes delivered by the immersive helper are frame deltas,
-    // not Android MotionEvents. Keep the active set here and rebuild ordinary
-    // touchscreen MotionEvents on the UI thread so both input paths share exactly
-    // the same Touchpad state machine.
-    private static final int IMMERSIVE_TOUCH_DOWN = 0;
-    private static final int IMMERSIVE_TOUCH_UP = 1;
-    private static final int IMMERSIVE_TOUCH_MOVE = 2;
-    private static final int IMMERSIVE_TOUCH_CANCEL = 3;
-    private static final int MAX_MOTION_EVENT_POINTERS = 32;
-
-    private static final class ImmersiveTouchPoint {
-        final int rawId;
-        final int motionId;
-        float normalizedX;
-        float normalizedY;
-
-        ImmersiveTouchPoint(int rawId, int motionId,
-                            float normalizedX, float normalizedY) {
-            this.rawId = rawId;
-            this.motionId = motionId;
-            this.normalizedX = normalizedX;
-            this.normalizedY = normalizedY;
-        }
-    }
-
-    private final SparseArray<ImmersiveTouchPoint> immersiveTouchPointers =
-            new SparseArray<>();
-    private long immersiveTouchDownTimeMs = 0L;
-    private long immersiveTouchLastEventTimeMs = 0L;
     // The two touch devices, same gesture logic, different input space (see
-    // Touchpad): the on-screen one receives both normal Android touches and raw
-    // immersive frames, while the captured one reads a physical pad's own range.
+    // Touchpad): the on-screen one reads the screen, the captured one reads a
+    // physical pad's own coordinate range.
     private Touchpad screenTouchpad;
     // Its movement output is intentionally dropped: a captured pad reports reliable
     // relative axes, which drive the cursor from handleCapturedTouchpadEvent below.
@@ -246,6 +162,15 @@ public class MainActivity extends Activity
     // relative delta for every motion event.
     private boolean pointerCaptureEnabled = false;
     private boolean pointerCaptureSuppressed = false;
+    // Forced by the producer via CONSUMER_VAR_CAPTURE_MOUSE while a Wayland client
+    // holds an active pointer lock (a game grabbed the mouse for relative motion).
+    // Interaction with the user setting (see pointerCaptureWanted()): if the setting
+    // is ON, capture stays on the whole time and the var is ignored; if the setting
+    // is OFF, capture follows the var (on while asserted, off when 0). A manual
+    // Back-key release still suppresses either source. Regressed to false on consumer
+    // fallback; the producer resends the current value on reconnect.
+    private volatile boolean captureMouseForced = false;
+    private static final int CONSUMER_VAR_CAPTURE_MOUSE = 1;
     // Tracks the Back key whose DOWN released pointer capture, so only its matching
     // UP is swallowed. Device/downTime matching prevents a stale missing UP from
     // consuming a later, unrelated Back press.
@@ -259,15 +184,36 @@ public class MainActivity extends Activity
     // Raw hardware-touchpad coordinate state while pointer capture is active.
     // Gesture recognition itself belongs to Touchpad above.
     private float capturedTouchpadAccel = 1.0f;
-    // Explicit scroll axes bypass Touchpad's contact recognizer on some drivers;
-    // retain the shared preferences here so that path observes the same tuning.
-    private float touchpadScrollSpeed = Touchpad.DEFAULT_SCROLL_SPEED;
-    private boolean touchpadScrollReversed = false;
     private boolean capturedTouchpadBaselineValid = false;
     private int capturedTouchpadBaselinePointers = 0;
     private float capturedTouchpadLastCentroidX = 0f;
     private float capturedTouchpadLastCentroidY = 0f;
     private final float[] capturedTouchpadResolvedDelta = new float[2];
+
+    // Touchpad click-drag: while a mouse button is physically held, the pressing
+    // finger rests and another moves. These hold each contact's last pad position
+    // by pointer id so the moving finger can be isolated and driven as the cursor.
+    private final SparseArray<Float> buttonDragLastX = new SparseArray<>();
+    private final SparseArray<Float> buttonDragLastY = new SparseArray<>();
+
+    // Single-button (clickpad) touchpads report every physical press as
+    // BUTTON_PRIMARY and cannot tell left from right. On press we ask the
+    // Touchpad for the pressing finger (the slowest contact, held still to click)
+    // and pick left/right from its position, latching the choice here for the
+    // whole press. Release always drops the latched button, so a finger drifting
+    // across the midline before lift-off cannot strand a held button.
+    private int lastTouchpadBtnPressed = 0;
+
+    // Immersive mode: a root helper grabs the physical input devices so nothing
+    // reaches Android at all, and their events are replayed onto the desktop
+    // through the same paths as the on-screen ones. Off unless the user both
+    // enables it in Settings and presses the key they bound to it.
+    private ImmersiveMode immersive;
+    private boolean immersiveActive = false;
+    // Cached display rotation. A grabbed touchscreen reports in the panel's own
+    // fixed frame, so the rotation has to be undone before its coordinates mean
+    // anything on screen; reading it per contact would be wasteful.
+    private int displayRotation = Surface.ROTATION_0;
 
     static {
         // Loads the single shared .so backing MainActivity, Native and
@@ -284,25 +230,28 @@ public class MainActivity extends Activity
                 Display d = getDisplay();
                 if (d != null && d.getDisplayId() == displayId) {
                     pushRefreshRate();
-                    // Keep the immersive-grab touch transform aligned with the
-                    // current rotation (the activity handles orientation config
-                    // changes itself, so it is not recreated on rotate).
-                    if (mNative != null)
-                        mNative.setGrabRotation(d.getRotation());
+                    updateDisplayRotation();
                 }
             }
         };
+
+    /** Keep the cached rotation current; see {@link #displayRotation}. */
+    private void updateDisplayRotation() {
+        Display d = getDisplay();
+        if (d != null)
+            displayRotation = d.getRotation();
+    }
 
     // Called from native on_fallback (display lib dropped the connection). Runs on a
     // native worker thread, so hop to the UI thread before touching the toast/finish.
     // If the daemon socket is gone the daemon really went down, so close this window.
     public void onFallback(){
         runOnUiThread(() -> {
-            clearImmersionToggleTracking();
-            requestImmersionStop(false);
-            clearPointerCaptureBackTracking();
-            releasePointerCapture(false);
-            resetScreenTouchpadGesture();
+            // The producer connection is gone: every consumer var regresses to 0.
+            // The producer resends the current value once it reconnects.
+            captureMouseForced = false;
+            if (mRoot != null)
+                mRoot.post(this::syncPointerCapture);
             if (!isSocketFile(resolveSocketPath())) {
                 //exit
                 android.widget.Toast.makeText(this, "Deamon Down",
@@ -315,21 +264,6 @@ public class MainActivity extends Activity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        mHasWindowFocus = hasFocus;
-        // Release FIRST, before the root socket probe below: that probe forks `su` and
-        // must never be able to delay handing input back to Android.
-        if (!hasFocus) {
-            clearImmersionToggleTracking();
-            requestImmersionStop(false);
-            /* PointerCaptureChanged is dispatched on the main thread. Release before
-             * the root socket probe below, which may wait on su, so ViewRootImpl is
-             * never left waiting for this callback behind a blocking probe. */
-            if (mRoot != null) {
-                clearPointerCaptureBackTracking();
-                releasePointerCapture(false);
-                resetScreenTouchpadGesture();
-            }
-        }
         if (!isSocketFile(resolveSocketPath())) {
             //exit
             android.widget.Toast.makeText(this, "Deamon Down",
@@ -341,634 +275,48 @@ public class MainActivity extends Activity
             // camera frames route to this window (others get blank frames).
             sInstance = this;
             if (mNative != null) mNative.setFocused(true);
-            releaseAllHardwarePointerButtons(); // Reset button state when window gains focus
+            savedBS = 0; // Reset button state when window gains focus
         }
         if (hasFocus && clipboard != null) {
             clipboard.pushClipboard();
         }
-        if (hasFocus && mRoot != null)
-            mRoot.post(this::syncPointerCapture);
-        // Immersion never survives losing focus: the grab must not outlive our
-        // foreground, or the device would be input-dead behind us. Coming back starts
-        // un-immersed, so the user re-enters deliberately with the toggle key.
-    }
-
-    private boolean isImmersionEngaged() {
-        return immersionState != ImmersionState.OFF;
-    }
-
-    private void clearImmersionToggleTracking() {
-        immersionToggleDownPending = false;
-        immersionToggleDeviceId = 0;
-        immersionToggleDownTime = 0L;
-    }
-
-    private void restoreImmersionPointerCapture() {
-        immersionPointerCaptureForced = false;
-        immersionPointerCaptureRequired = false;
-        pointerCaptureSuppressed = immersionPointerSuppressedBefore;
-        immersionPointerSuppressedBefore = false;
-        if (mRoot != null)
-            mRoot.post(this::syncPointerCapture);
-    }
-
-    /** Move Java state to STOPPING; pointer capture is restored after native joins. */
-    private long beginImmersionStopping() {
-        if (immersionState == ImmersionState.OFF)
-            return -1L;
-        if (immersionState != ImmersionState.STOPPING) {
-            immersionState = ImmersionState.STOPPING;
-            immersionNativeStartQueuedSession = -1L;
-            immersionDesiredSessionId = -1L;
-            immersionTouchpadMode = false;
-            clearImmersionToggleTracking();
-            // Rejecting later callbacks is not enough: a long-press drag may already
-            // hold BTN_LEFT, so end the recognizer synchronously as the session stops.
-            resetScreenTouchpadGesture();
-        }
-        return immersionSessionId;
-    }
-
-    private void finishImmersionStopping(long sessionId, boolean showExitToast) {
-        if (sessionId != immersionSessionId || immersionState != ImmersionState.STOPPING)
-            return;
-        immersionState = ImmersionState.OFF;
-        immersionNativeStartQueuedSession = -1L;
-        restoreImmersionPointerCapture();
-        if (showExitToast || immersionExitToastPending)
-            android.widget.Toast.makeText(this, R.string.immerse_exited,
-                    android.widget.Toast.LENGTH_SHORT).show();
-        immersionExitToastPending = false;
-    }
-
-    /** Stop the helper off the UI thread; nativeStopInputGrab joins it there. */
-    private void stopImmersiveGrabForSession(long sessionId, boolean showExitToast) {
-        final Native n = mNative;
-        if (n == null) {
-            finishImmersionStopping(sessionId, showExitToast);
-            return;
-        }
-        postGrabTask(() -> {
-            n.stopInputGrab();
-            runOnUiThread(() -> finishImmersionStopping(sessionId, showExitToast));
-        });
-    }
-
-    private void requestImmersionStop(boolean showExitToast) {
-        if (immersionState == ImmersionState.OFF)
-            return;
-        boolean wasActive = immersionState == ImmersionState.ACTIVE;
-        long sessionId = beginImmersionStopping();
-        stopImmersiveGrabForSession(sessionId, showExitToast && wasActive);
-    }
-
-    // Enter immersion only after the toggle key's matching UP. This prevents the
-    // helper from grabbing a device between Android's DOWN and UP events.
-    private void enterImmersion() {
-        if (mNative == null || !fullKeyCaptureEnabled
-                || immersionState != ImmersionState.OFF || !mHasWindowFocus)
-            return;
-        if (!surfaceReady || !transportReady) {
-            android.widget.Toast.makeText(this, R.string.immerse_not_ready,
-                    android.widget.Toast.LENGTH_SHORT).show();
-            return;
-        }
-        // The helper reads raw evdev, so it needs the scancode, not the Android
-        // keycode. Prefer the one captured when the key was bound; fall back to the
-        // mapping table for bindings made before that was recorded. If neither
-        // resolves, the helper would have no way to detect the exit key -- so refuse
-        // to grab at all rather than take over with no way out.
-        int exitScan = immersionScancode > 0
-                ? immersionScancode : KeyCodeMapper.getScanCode(immersionKeycode);
-        if (exitScan <= 0) {
-            android.widget.Toast.makeText(this, R.string.immerse_key_unusable,
-                    android.widget.Toast.LENGTH_LONG).show();
-            return;
-        }
-
-        final long sessionId = ++immersionSessionId;
-        // Drop an Android-delivered gesture before the helper takes the touchscreen;
-        // otherwise its missing UP could leave a drag/button held indefinitely.
-        resetScreenTouchpadGesture();
-        immersionState = ImmersionState.STARTING;
-        immersionNativeStartQueuedSession = -1L;
-        immersionDesiredSessionId = sessionId;
-        immersionTouchpadMode = isTouchpadMode;
-        immersionPointerSuppressedBefore = pointerCaptureSuppressed;
-        immersionPointerCaptureForced = true;
-        /* Always establish pointer capture before the root helper starts. Android's
-         * InputManager device list and raw evdev enumeration are not an atomic view;
-         * conditioning this on a Java-side mouse scan can miss a just-added or
-         * unusually classified pointer that the helper deliberately skips. */
-        immersionPointerCaptureRequired = true;
-        pointerCaptureSuppressed = false;
-        if (mRoot != null)
-            mRoot.post(this::syncPointerCapture);
-
-        maybeStartImmersionNative(sessionId, exitScan);
-        if (immersionPointerCaptureRequired && mRoot != null
-                && !mRoot.hasPointerCapture()) {
-            final long waitSession = sessionId;
-            mRoot.postDelayed(() -> {
-                if (waitSession != immersionSessionId
-                        || immersionState != ImmersionState.STARTING)
-                    return;
-                if (!mRoot.hasPointerCapture())
-                    failImmersionLocally(waitSession, IMMERSION_REASON_POINTER_CAPTURE);
-                else
-                    maybeStartImmersionNative(waitSession, exitScan);
-            }, 1200L);
-        }
-    }
-
-    private void maybeStartImmersionNative(long sessionId, int exitScan) {
-        if (sessionId != immersionSessionId || immersionState != ImmersionState.STARTING
-                || immersionNativeStartQueuedSession == sessionId)
-            return;
-        if (!mHasWindowFocus || !surfaceReady || !transportReady)
-            return;
-        if (immersionPointerCaptureRequired
-                && (mRoot == null || !mRoot.hasPointerCapture()))
-            return;
-
-        String helper = getApplicationInfo().nativeLibraryDir + "/libinputgrab.so";
-        String bridge = getCacheDir().getAbsolutePath() + "/anland_grab.sock";
-        int rotation = currentDisplayRotation();
-        final Native n = mNative;
-        if (n == null)
-            return;
-        final boolean touchpadMode = immersionTouchpadMode;
-        immersionNativeStartQueuedSession = sessionId;
-        postGrabTask(() -> {
-            // The user/lifecycle may have cancelled while this task waited behind a
-            // previous stop. Never resurrect an obsolete session from the queue.
-            if (immersionDesiredSessionId != sessionId)
-                return;
-            n.startInputGrab(helper, bridge, rotation, exitScan, sessionId,
-                    touchpadMode);
-        });
-    }
-
-    private void failImmersionLocally(long sessionId, int reason) {
-        if (sessionId != immersionSessionId || immersionState == ImmersionState.OFF
-                || immersionState == ImmersionState.STOPPING)
-            return;
-        Log.w(TAG, "ending immersion locally: session=" + sessionId
-                + " reason=" + reason);
-        boolean wasActive = immersionState == ImmersionState.ACTIVE;
-        beginImmersionStopping();
-        android.widget.Toast.makeText(this,
-                wasActive ? R.string.immerse_released : R.string.immerse_failed,
-                android.widget.Toast.LENGTH_SHORT).show();
-        stopImmersiveGrabForSession(sessionId, false);
-    }
-
-    // The executor is shut down in onDestroy, and a late lifecycle callback can still
-    // reach here; a rejected task means the pipeline is already being torn down (which
-    // releases the grab natively), so dropping it is correct rather than crashing.
-    private void postGrabTask(Runnable task) {
-        try {
-            grabExecutor.execute(task);
-        } catch (java.util.concurrent.RejectedExecutionException e) {
-            Log.w(TAG, "grab task rejected (shutting down)");
-        }
-    }
-
-    // Surface.ROTATION_* (0..3). Raw evdev touch is in the panel's natural
-    // orientation, so native rotates it into surface space by this value.
-    private int currentDisplayRotation() {
-        Display d = getDisplay();
-        return d != null ? d.getRotation() : Surface.ROTATION_0;
-    }
-
-    /**
-     * Called from the immersive grab thread once per raw touchscreen SYN_REPORT.
-     * Arrays contain only slots changed in that frame; the UI-thread adapter below
-     * retains the complete active set and emits Android-compatible MotionEvents.
-     */
-    public void onImmersiveTouchFrame(long sessionId, int[] pointerIds,
-            int[] actions, float[] xs, float[] ys, long eventTimeMs) {
-        runOnUiThread(() -> {
-            // Native callbacks may already be queued when stop/restart wins the race.
-            // Recheck both generation and state on the UI thread before touching the
-            // recognizer, otherwise an old session can press a button in a new one.
-            if (sessionId != immersionSessionId
-                    || (immersionState != ImmersionState.STARTING
-                        && immersionState != ImmersionState.ACTIVE)
-                    || !immersionTouchpadMode)
-                return;
-            handleImmersiveTouchFrame(pointerIds, actions, xs, ys, eventTimeMs);
-        });
-    }
-
-    private void handleImmersiveTouchFrame(int[] pointerIds, int[] actions,
-            float[] xs, float[] ys, long nativeEventTimeMs) {
-        if (pointerIds == null || actions == null || xs == null || ys == null
-                || pointerIds.length != actions.length
-                || pointerIds.length != xs.length
-                || pointerIds.length != ys.length) {
-            Log.w(TAG, "dropping malformed immersive touch frame");
-            resetScreenTouchpadGesture();
-            return;
-        }
-
-        final int changedCount = pointerIds.length;
-        for (int i = 0; i < changedCount; i++) {
-            if (actions[i] == IMMERSIVE_TOUCH_CANCEL) {
-                // A synthetic release caused by SYN_DROPPED, device loss, or helper
-                // teardown is not a user's finger-up and must never complete a tap.
-                resetScreenTouchpadGesture();
-                return;
-            }
-            if (pointerIds[i] < 0
-                    || (actions[i] != IMMERSIVE_TOUCH_DOWN
-                        && actions[i] != IMMERSIVE_TOUCH_UP
-                        && actions[i] != IMMERSIVE_TOUCH_MOVE)
-                    || !Float.isFinite(xs[i]) || !Float.isFinite(ys[i])) {
-                Log.w(TAG, "dropping invalid immersive touch change");
-                resetScreenTouchpadGesture();
-                return;
+        if (mRoot != null) {
+            if (hasFocus)
+                mRoot.post(this::syncPointerCapture);
+            else {
+                clearPointerCaptureBackTracking();
+                releasePointerCapture(false);
             }
         }
-
-        long eventTimeMs = nativeEventTimeMs > 0L
-                ? nativeEventTimeMs : SystemClock.uptimeMillis();
-        if (immersiveTouchLastEventTimeMs > 0L
-                && eventTimeMs < immersiveTouchLastEventTimeMs)
-            eventTimeMs = immersiveTouchLastEventTimeMs;
-        immersiveTouchLastEventTimeMs = eventTimeMs;
-
-        // Apply all existing-pointer coordinates first. One ACTION_MOVE then carries
-        // the complete SYN_REPORT snapshot, rather than turning simultaneous finger
-        // movement into several artificial Android events.
-        boolean existingPointerMoved = false;
-        int touchWidth = Math.max(1, pointerViewWidth());
-        int touchHeight = Math.max(1, pointerViewHeight());
-        int touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
-        for (int i = 0; i < changedCount; i++) {
-            int action = actions[i];
-            if (action != IMMERSIVE_TOUCH_MOVE && action != IMMERSIVE_TOUCH_UP)
-                continue;
-            ImmersiveTouchPoint point = immersiveTouchPointers.get(pointerIds[i]);
-            if (point == null)
-                continue;
-            if (action == IMMERSIVE_TOUCH_UP
-                    && Math.hypot((clampNormalized(xs[i]) - point.normalizedX)
-                                      * touchWidth,
-                                  (clampNormalized(ys[i]) - point.normalizedY)
-                                      * touchHeight) > touchSlop) {
-                // Some panels put the final coordinate change and TRACKING_ID=-1 in
-                // one report. Preserve a real last movement, but ignore normal lift
-                // jitter so a stationary long hold cannot turn into a ghost click.
-                existingPointerMoved = true;
-            }
-            setImmersiveTouchCoordinates(point, xs[i], ys[i]);
-            if (action == IMMERSIVE_TOUCH_MOVE)
-                existingPointerMoved = true;
-        }
-        if (existingPointerMoved && immersiveTouchPointers.size() > 0)
-            dispatchImmersiveTouchEvent(MotionEvent.ACTION_MOVE, -1, eventTimeMs);
-
-        // Add every newly pressed pointer before processing lifts from the same raw
-        // frame. A simultaneous hand-off is therefore treated as a multi-touch
-        // transition, not as an accidental tap from the finger that was lifted.
-        for (int i = 0; i < changedCount; i++) {
-            if (actions[i] != IMMERSIVE_TOUCH_DOWN)
-                continue;
-            int rawId = pointerIds[i];
-            ImmersiveTouchPoint existing = immersiveTouchPointers.get(rawId);
-            if (existing != null) {
-                setImmersiveTouchCoordinates(existing, xs[i], ys[i]);
-                continue;
-            }
-            int motionId = allocateImmersiveMotionPointerId();
-            if (motionId < 0) {
-                Log.w(TAG, "too many active immersive touch pointers");
-                resetScreenTouchpadGesture();
-                return;
-            }
-            boolean firstPointer = immersiveTouchPointers.size() == 0;
-            ImmersiveTouchPoint point = new ImmersiveTouchPoint(rawId, motionId,
-                    clampNormalized(xs[i]), clampNormalized(ys[i]));
-            immersiveTouchPointers.put(rawId, point);
-            if (firstPointer)
-                immersiveTouchDownTimeMs = eventTimeMs;
-            dispatchImmersiveTouchEvent(firstPointer ? MotionEvent.ACTION_DOWN
-                    : MotionEvent.ACTION_POINTER_DOWN, rawId, eventTimeMs);
-        }
-
-        // ACTION_UP/POINTER_UP must still include the lifted pointer. Remove it only
-        // after the recognizer has consumed that event.
-        for (int i = 0; i < changedCount; i++) {
-            if (actions[i] != IMMERSIVE_TOUCH_UP)
-                continue;
-            int rawId = pointerIds[i];
-            int pointerIndex = immersiveTouchPointers.indexOfKey(rawId);
-            if (pointerIndex < 0)
-                continue;
-            boolean lastPointer = immersiveTouchPointers.size() == 1;
-            dispatchImmersiveTouchEvent(lastPointer ? MotionEvent.ACTION_UP
-                    : MotionEvent.ACTION_POINTER_UP, rawId, eventTimeMs);
-            immersiveTouchPointers.removeAt(pointerIndex);
-            if (lastPointer)
-                immersiveTouchDownTimeMs = 0L;
-        }
-    }
-
-    private static float clampNormalized(float value) {
-        return Math.max(0f, Math.min(1f, value));
-    }
-
-    private static void setImmersiveTouchCoordinates(ImmersiveTouchPoint point,
-                                                      float x, float y) {
-        point.normalizedX = clampNormalized(x);
-        point.normalizedY = clampNormalized(y);
-    }
-
-    /** MotionEvent pointer ids are limited to 0..31; raw ids include device index. */
-    private int allocateImmersiveMotionPointerId() {
-        if (immersiveTouchPointers.size() >= MAX_MOTION_EVENT_POINTERS)
-            return -1;
-        for (int candidate = 0; candidate < MAX_MOTION_EVENT_POINTERS; candidate++) {
-            boolean used = false;
-            for (int i = 0; i < immersiveTouchPointers.size(); i++) {
-                if (immersiveTouchPointers.valueAt(i).motionId == candidate) {
-                    used = true;
-                    break;
-                }
-            }
-            if (!used)
-                return candidate;
-        }
-        return -1;
-    }
-
-    private void dispatchImmersiveTouchEvent(int actionMasked, int actionRawId,
-                                              long eventTimeMs) {
-        int pointerCount = immersiveTouchPointers.size();
-        if (pointerCount <= 0 || screenTouchpad == null)
-            return;
-
-        int action = actionMasked;
-        if (actionMasked == MotionEvent.ACTION_POINTER_DOWN
-                || actionMasked == MotionEvent.ACTION_POINTER_UP) {
-            int actionIndex = immersiveTouchPointers.indexOfKey(actionRawId);
-            if (actionIndex < 0)
-                return;
-            action |= actionIndex << MotionEvent.ACTION_POINTER_INDEX_SHIFT;
-        }
-
-        int width = Math.max(1, pointerViewWidth());
-        int height = Math.max(1, pointerViewHeight());
-        MotionEvent.PointerProperties[] properties =
-                new MotionEvent.PointerProperties[pointerCount];
-        MotionEvent.PointerCoords[] coordinates =
-                new MotionEvent.PointerCoords[pointerCount];
-        for (int i = 0; i < pointerCount; i++) {
-            ImmersiveTouchPoint point = immersiveTouchPointers.valueAt(i);
-            MotionEvent.PointerProperties prop = new MotionEvent.PointerProperties();
-            prop.id = point.motionId;
-            prop.toolType = MotionEvent.TOOL_TYPE_FINGER;
-            properties[i] = prop;
-
-            MotionEvent.PointerCoords coord = new MotionEvent.PointerCoords();
-            coord.x = point.normalizedX * width;
-            coord.y = point.normalizedY * height;
-            coord.pressure = 1f;
-            coord.size = 1f;
-            coordinates[i] = coord;
-        }
-
-        long downTimeMs = immersiveTouchDownTimeMs > 0L
-                ? immersiveTouchDownTimeMs : eventTimeMs;
-        MotionEvent event = MotionEvent.obtain(downTimeMs, eventTimeMs, action,
-                pointerCount, properties, coordinates, 0, 0, 1f, 1f,
-                0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
-        try {
-            // Raw immersive frames and ordinary Android touchscreen delivery must
-            // observe one gesture state and the same globally configured tuning.
-            updateTouchpadBounds(null);
-            screenTouchpad.onTouch(event);
-        } finally {
-            event.recycle();
-        }
-    }
-
-    public void onImmersionStarted(long sessionId) {
-        runOnUiThread(() -> {
-            if (sessionId != immersionSessionId
-                    || immersionState != ImmersionState.STARTING)
-                return;
-            if (immersionPointerCaptureRequired
-                    && (mRoot == null || !mRoot.hasPointerCapture())) {
-                failImmersionLocally(sessionId, IMMERSION_REASON_POINTER_CAPTURE);
-                return;
-            }
-            // The helper start callback is queued before its raw event loop. Clear
-            // touches delivered by Android during STARTING at that exact hand-over.
-            resetScreenTouchpadGesture();
-            immersionState = ImmersionState.ACTIVE;
-            android.widget.Toast.makeText(this, R.string.immerse_entered,
-                    android.widget.Toast.LENGTH_SHORT).show();
-        });
-    }
-
-    public void onImmersionFailed(long sessionId, int reason) {
-        runOnUiThread(() -> {
-            if (sessionId != immersionSessionId
-                    || immersionState != ImmersionState.STARTING)
-                return;
-            Log.w(TAG, "immersion start failed: session=" + sessionId
-                    + " reason=" + reason);
-            beginImmersionStopping();
-            android.widget.Toast.makeText(this, R.string.immerse_failed,
-                    android.widget.Toast.LENGTH_SHORT).show();
-            stopImmersiveGrabForSession(sessionId, false);
-        });
-    }
-
-    public void onImmersionReleased(long sessionId, int reason) {
-        runOnUiThread(() -> {
-            if (sessionId != immersionSessionId
-                    || immersionState == ImmersionState.OFF
-                    || immersionState == ImmersionState.STOPPING)
-                return;
-            boolean wasActive = immersionState == ImmersionState.ACTIVE;
-            beginImmersionStopping();
-            if (wasActive) {
-                String msg = reason == Native.INPUT_GRAB_REASON_EXIT_KEY
-                        ? getString(R.string.immerse_exited)
-                        : getString(R.string.immerse_released);
-                android.widget.Toast.makeText(this, msg,
-                        android.widget.Toast.LENGTH_SHORT).show();
-            }
-            stopImmersiveGrabForSession(sessionId, false);
-        });
-    }
-
-    // The bound key toggles immersion. Entering is detected here from an ordinary
-    // Android key event (we are not grabbing yet); leaving is detected by the root
-    // helper, which sees the same key and releases the grab itself -- so the way out
-    // never depends on this process being responsive.
-    //
-    // Returns true if the event was consumed.
-    private boolean handleImmersionKey(KeyEvent event) {
-        if (!fullKeyCaptureEnabled || immersionKeycode == UNBOUND)
-            return false;
-        if (event.getKeyCode() != immersionKeycode)
-            return false;
-        // Swallow both DOWN and UP. Entering waits for the matching UP; while a
-        // session is active/starting, a delivered Android DOWN is a safe cancel.
-        if (event.getAction() == KeyEvent.ACTION_DOWN
-                && event.getRepeatCount() == 0) {
-            if (immersionState == ImmersionState.OFF) {
-                immersionToggleDownPending = true;
-                immersionToggleDeviceId = event.getDeviceId();
-                immersionToggleDownTime = event.getDownTime();
-            } else if (immersionState != ImmersionState.STOPPING) {
-                requestImmersionStop(immersionState == ImmersionState.ACTIVE);
-            }
-        } else if (event.getAction() == KeyEvent.ACTION_UP
-                && immersionToggleDownPending
-                && immersionToggleDeviceId == event.getDeviceId()
-                && immersionToggleDownTime == event.getDownTime()) {
-            clearImmersionToggleTracking();
-            enterImmersion();
-        }
-        return true;
+        // Losing focus means something else is on screen (a system dialog, a
+        // call). Holding an exclusive grab on every input device through that
+        // would leave the user with nothing to answer it with.
+        if (!hasFocus && immersive != null)
+            immersive.stop();
     }
 
     private void pushRefreshRate() {
-        Native n = mNative;
-        if (n == null || !transportReady)
-            return;
         Display d = getDisplay();
         if (d != null)
-            n.setRefreshRate(d.getRefreshRate());
+            mNative.setRefreshRate(d.getRefreshRate());
     }
 
-    private static final class NativeTransportConfig {
-        final String socketPath;
-        final boolean useRoot;
-        final String helperPath;
-        final String bridgePath;
-        final int customWidth;
-        final int customHeight;
-        final float refreshRate;
-        final boolean micEnabled;
-        final int speakerLatencyMs;
-        final int micLatencyMs;
-
-        NativeTransportConfig(String socketPath, boolean useRoot, String helperPath,
-                String bridgePath, int customWidth, int customHeight, float refreshRate,
-                boolean micEnabled, int speakerLatencyMs, int micLatencyMs) {
-            this.socketPath = socketPath;
-            this.useRoot = useRoot;
-            this.helperPath = helperPath;
-            this.bridgePath = bridgePath;
-            this.customWidth = customWidth;
-            this.customHeight = customHeight;
-            this.refreshRate = refreshRate;
-            this.micEnabled = micEnabled;
-            this.speakerLatencyMs = speakerLatencyMs;
-            this.micLatencyMs = micLatencyMs;
-        }
-    }
-
-    /** Snapshot UI/preferences before handing a restart to the native worker. */
-    private NativeTransportConfig snapshotNativeTransportConfig() {
+    // Push the current connection settings (socket path / root mode) to native
+    // before (re)connecting. The root helper is the executable bundled in the
+    // app's native lib dir; the bridge is a unix socket in our cache dir that
+    // the helper, launched via su, uses to hand back the daemon fd.
+    private void applyConnectionConfig() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         String sock = resolveSocketPath();
         boolean useRoot = prefs.getBoolean(KEY_USE_ROOT, true);
         String helperPath = getApplicationInfo().nativeLibraryDir + "/libfdhelper.so";
         String bridgePath = getCacheDir().getAbsolutePath() + "/anland_fdbridge.sock";
+        mNative.configure(sock, useRoot, helperPath, bridgePath);
         int customW = prefs.getInt("custom_width", 0);
         int customH = prefs.getInt("custom_height", 0);
-        customScreenWidth = customW;
-        customScreenHeight = customH;
-        Display d = getDisplay();
-        float refresh = d != null ? d.getRefreshRate() : 60.0f;
-        boolean wantMic = prefs.getBoolean(KEY_MIC_ENABLED, false);
-        boolean micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED;
-        if (wantMic && !micGranted) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_RECORD_AUDIO);
-        }
-        return new NativeTransportConfig(sock, useRoot, helperPath, bridgePath,
-                customW, customH, refresh, wantMic && micGranted,
-                prefs.getInt(KEY_SPEAKER_LATENCY_MS, 0),
-                prefs.getInt(KEY_MIC_LATENCY_MS, 0));
-    }
-
-    private boolean isTransportOperationCurrent(long generation, Native n) {
-        return generation == transportGeneration && mNative == n;
-    }
-
-    /**
-     * Stop/restart the display transport only after nativeStopInputGrab has joined the
-     * grab reader. This keeps disconnect(ctx) from racing its input writes. All work
-     * that may block runs on grabExecutor; generation checks suppress stale restarts.
-     */
-    private void scheduleNativeTransport(Surface surface, boolean restart,
-                                         boolean showImmersionExit) {
-        final Native n = mNative;
-        if (n == null)
-            return;
-        final boolean wasImmersed = immersionState == ImmersionState.ACTIVE;
-        if (showImmersionExit && wasImmersed)
-            immersionExitToastPending = true;
-        final long stoppingSession = beginImmersionStopping();
-        final long generation = ++transportGeneration;
-        transportReady = false;
-        final NativeTransportConfig config = restart
-                ? snapshotNativeTransportConfig() : null;
-
-        postGrabTask(() -> {
-            if (!isTransportOperationCurrent(generation, n))
-                return;
-            n.stopInputGrab();
-            if (!isTransportOperationCurrent(generation, n))
-                return;
-
-            n.stop();
-            boolean started = false;
-            boolean socketMissing = false;
-            if (restart && activityResumed && surfaceReady
-                    && surface != null && surface.isValid()
-                    && isTransportOperationCurrent(generation, n)) {
-                if (!isSocketFile(config.socketPath, config.useRoot)) {
-                    socketMissing = true;
-                } else if (isTransportOperationCurrent(generation, n)) {
-                    n.configure(config.socketPath, config.useRoot,
-                            config.helperPath, config.bridgePath);
-                    n.setCustomResolution(config.customWidth, config.customHeight);
-                    n.start(surface, clipboard, this);
-                    n.setRefreshRate(config.refreshRate);
-                    n.setMicEnabled(config.micEnabled);
-                    n.setAudioLatency(config.speakerLatencyMs, config.micLatencyMs);
-                    started = true;
-                }
-            }
-
-            final boolean transportStarted = started;
-            final boolean daemonMissing = socketMissing;
-            runOnUiThread(() -> {
-                if (stoppingSession >= 0L) {
-                    finishImmersionStopping(stoppingSession,
-                            showImmersionExit && wasImmersed);
-                }
-                if (!isTransportOperationCurrent(generation, n))
-                    return;
-                transportReady = transportStarted;
-                if (transportStarted)
-                    pushRefreshRate();
-                if (daemonMissing) {
-                    android.widget.Toast.makeText(this, "Deamon Down",
-                            android.widget.Toast.LENGTH_SHORT).show();
-                    finish();
-                }
-            });
-        });
+        customScreenWidth = prefs.getInt("custom_width", 0);
+        customScreenHeight = prefs.getInt("custom_height", 0);
+        mNative.setCustomResolution(customW, customH);
     }
 
     // The daemon socket this window targets: the launch-Intent override if any,
@@ -984,6 +332,19 @@ public class MainActivity extends Activity
         return sock.trim();
     }
 
+    // Start (or restart) this window's native pipeline, but only if the daemon
+    // socket is still a live socket. The daemon can go down after launch, so
+    // re-check on every (re)connect; if it is gone, report it and exit the window.
+    private void startNative(android.view.Surface surface) {
+        if (!isSocketFile(resolveSocketPath())) {
+            android.widget.Toast.makeText(this, "Deamon Down",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            finish();
+            return;
+        }
+        mNative.start(surface, clipboard, this);
+    }
+
     // True only when `path` exists and is a unix-domain socket. In root mode the
     // daemon socket usually lives in a root-only location (e.g. /data/local/tmp),
     // which this untrusted_app process cannot stat() directly -- a direct stat
@@ -993,10 +354,6 @@ public class MainActivity extends Activity
     private boolean isSocketFile(String path) {
         boolean useRoot = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
                 .getBoolean(KEY_USE_ROOT, true);
-        return isSocketFile(path, useRoot);
-    }
-
-    private boolean isSocketFile(String path, boolean useRoot) {
         return useRoot ? isSocketFileRoot(path) : isSocketFileLocal(path);
     }
 
@@ -1022,17 +379,7 @@ public class MainActivity extends Activity
             p = new ProcessBuilder("su", "-c", helperPath + " " + path + " test")
                     .redirectErrorStream(true)
                     .start();
-            // Bounded: this runs on the main thread (onWindowFocusChanged, onCreate,
-            // startNative) and `su` can sit on an unanswered root prompt indefinitely,
-            // which is exactly the main-thread block that ANRs us. A timeout is
-            // inconclusive, not proof the daemon is gone -- returning false here would
-            // toast "Deamon Down" and finish(). A genuinely dead daemon is still caught
-            // by the native on_fallback path.
-            if (!p.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                Log.w(TAG, "root socket probe timed out; assuming daemon alive");
-                return true;
-            }
-            return p.exitValue() == 0;
+            return p.waitFor() == 0;
         } catch (Exception e) {
             Log.w(TAG, "root socket probe failed: " + e);
             return false;
@@ -1057,6 +404,7 @@ public class MainActivity extends Activity
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        setupMediaAudio();
         applyOrientation();
 
         // Apply the launch parameters: socket path (overrides the saved pref) and
@@ -1137,10 +485,9 @@ public class MainActivity extends Activity
             public void dispatchPointerCaptureChanged(boolean hasCapture) {
                 super.dispatchPointerCaptureChanged(hasCapture);
                 if (!hasCapture) {
-                    releaseAllHardwarePointerButtons();
+                    releaseAllMouseButtons();
                     resetCapturedTouchpadGesture();
                 }
-                onImmersionPointerCaptureChanged(hasCapture);
             }
         };
         root.addView(surfaceView, new FrameLayout.LayoutParams(
@@ -1220,26 +567,24 @@ public class MainActivity extends Activity
         });
 
         setupFullscreen();
+        setupCursorHiding();
 
         // ===== 加载触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
-        // Android already turns two separate taps into two click pairs. Enabling
-        // Touchpad's optional extra double-tap pair would turn the second tap into
-        // additional clicks, so both input sources keep that synthesis disabled.
-        screenTouchpad = new Touchpad(this,
-                new TouchpadOutput(true, BUTTON_OWNER_SCREEN_TOUCHPAD), false);
-        capturedTouchpad = new Touchpad(this,
-                new TouchpadOutput(false, BUTTON_OWNER_CAPTURED_TOUCHPAD), false);
+        screenTouchpad = new Touchpad(this, new TouchpadOutput(true), true);
+        capturedTouchpad = new Touchpad(this, new TouchpadOutput(false), false);
         applyTouchpadPrefs(prefs);
         pointerCaptureEnabled = prefs.getBoolean(KEY_POINTER_CAPTURE, false);
+        updateDisplayRotation();
+        // Never starts a session by itself: the user has to enable it in Settings
+        // and press the key they bound to it.
+        immersive = new ImmersiveMode(this);
 
         // Requesting capture before the window is attached is a no-op. The post
         // below covers the initial attach; onWindowFocusChanged() retries after a
         // focus transition (including returning from Settings).
         root.post(this::syncPointerCapture);
-
-        setupCursorHiding();
 
         registerWindow();
     }
@@ -1342,17 +687,9 @@ public class MainActivity extends Activity
      */
     private final class TouchpadOutput implements Touchpad.Output {
         private final boolean emitMotion;
-        private final int buttonOwner;
-        private final int touchPointerBase;
 
-        TouchpadOutput(boolean emitMotion, int buttonOwner) {
+        TouchpadOutput(boolean emitMotion) {
             this.emitMotion = emitMotion;
-            this.buttonOwner = buttonOwner;
-            // Native immersive touch ids occupy 0..4095. Keep gestures forwarded
-            // by the two Java touchpads in separate ranges so a screen pinch,
-            // stylus contact and physical-pad gesture can coexist safely.
-            this.touchPointerBase = buttonOwner == BUTTON_OWNER_SCREEN_TOUCHPAD
-                    ? 0x1000 : 0x2000;
         }
 
         @Override
@@ -1369,7 +706,8 @@ public class MainActivity extends Activity
 
         @Override
         public void onButton(int button, boolean pressed) {
-            setSyntheticPointerButton(buttonOwner, button, pressed);
+            if (mNative != null)
+                mNative.sendMouseButton(button, pressed);
         }
 
         @Override
@@ -1377,8 +715,7 @@ public class MainActivity extends Activity
             if (mNative == null)
                 return;
             float[] coords = convertToNativeCoords(x, y);
-            mNative.sendTouch(action, coords[0], coords[1],
-                    touchPointerBase + pointerId);
+            mNative.sendTouch(action, coords[0], coords[1], pointerId);
         }
 
         @Override
@@ -1407,26 +744,26 @@ public class MainActivity extends Activity
     private void applyTouchpadPrefs(SharedPreferences prefs) {
         capturedTouchpadAccel = Math.max(0.5f,
                 Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f)));
-        touchpadScrollSpeed = Math.max(0.05f, Math.min(5.0f,
-                prefs.getFloat(KEY_SCROLL_SPEED, Touchpad.DEFAULT_SCROLL_SPEED)));
-        touchpadScrollReversed = prefs.getBoolean(KEY_SCROLL_REVERSE, false);
-        float scrollFactor = prefs.getFloat(KEY_SCROLL_THRESHOLD,
-                Touchpad.DEFAULT_SCROLL_THRESHOLD_FACTOR);
-        float moveFactor = prefs.getFloat(KEY_MOVE_THRESHOLD,
-                Touchpad.DEFAULT_MOVE_THRESHOLD_FACTOR);
-        float gestureScale = prefs.getFloat(KEY_GESTURE_SCALE,
-                Touchpad.DEFAULT_GESTURE_SCALE);
+        applyTouchpadPrefs(prefs, screenTouchpad);
+        applyTouchpadPrefs(prefs, capturedTouchpad);
+    }
 
-        Touchpad[] touchpads = {screenTouchpad, capturedTouchpad};
-        for (Touchpad pad : touchpads) {
-            if (pad == null)
-                continue;
-            pad.setAccelStrength(capturedTouchpadAccel);
-            pad.setScrollSpeed(touchpadScrollSpeed);
-            pad.setScrollReversed(touchpadScrollReversed);
-            pad.setGestureThresholds(scrollFactor, moveFactor);
-            pad.setGestureScale(gestureScale);
-        }
+    /** The same tuning for one pad, so an immersive session's pad shares it. */
+    private void applyTouchpadPrefs(SharedPreferences prefs, Touchpad pad) {
+        if (pad == null)
+            return;
+        pad.setAccelStrength(Math.max(0.5f,
+                Math.min(10.0f, prefs.getFloat(KEY_MOUSE_ACCEL, 1.0f))));
+        pad.setScrollSpeed(prefs.getFloat(KEY_SCROLL_SPEED,
+                Touchpad.DEFAULT_SCROLL_SPEED));
+        pad.setScrollReversed(prefs.getBoolean(KEY_SCROLL_REVERSE, false));
+        pad.setGestureThresholds(
+                prefs.getFloat(KEY_SCROLL_THRESHOLD,
+                        Touchpad.DEFAULT_SCROLL_THRESHOLD_FACTOR),
+                prefs.getFloat(KEY_MOVE_THRESHOLD,
+                        Touchpad.DEFAULT_MOVE_THRESHOLD_FACTOR));
+        pad.setGestureScale(prefs.getFloat(KEY_GESTURE_SCALE,
+                Touchpad.DEFAULT_GESTURE_SCALE));
     }
 
     /**
@@ -1458,18 +795,34 @@ public class MainActivity extends Activity
                 xRange.getRange(), yRange.getRange());
     }
 
+    /** Whether pointer capture should be active. Setting ON -> always on (the var is
+     *  ignored); setting OFF -> follows the producer's CONSUMER_VAR_CAPTURE_MOUSE.
+     *  An immersive session overrides both: the pointer is already grabbed at the
+     *  evdev level, so Android's capture would only fight with it. */
+    private boolean pointerCaptureWanted() {
+        return !immersiveActive && (pointerCaptureEnabled || captureMouseForced);
+    }
+
+    /** Called from the native event thread when the producer sets a consumer var.
+     *  CONSUMER_VAR_CAPTURE_MOUSE forces pointer capture on (value != 0) for as long
+     *  as a Wayland client holds a pointer lock; 0 releases it back to the setting. */
+    public void nativeSetConsumerVar(int var, int value) {
+        runOnUiThread(() -> {
+            if (var == CONSUMER_VAR_CAPTURE_MOUSE) {
+                captureMouseForced = (value != 0);
+                if (mRoot != null)
+                    mRoot.post(this::syncPointerCapture);
+            }
+        });
+    }
+
     /** Keep the window's pointer-capture state in sync with the saved setting. */
     private void syncPointerCapture() {
         if (mRoot == null)
             return;
 
-        boolean sessionCapture = immersionPointerCaptureForced
-                && (immersionState == ImmersionState.STARTING
-                    || immersionState == ImmersionState.ACTIVE
-                    || immersionState == ImmersionState.STOPPING);
-        boolean shouldCapture = (sessionCapture
-                || (pointerCaptureEnabled && !pointerCaptureSuppressed))
-                && activityResumed
+        boolean shouldCapture = pointerCaptureWanted()
+                && !pointerCaptureSuppressed
                 && mRoot.hasWindowFocus();
         if (shouldCapture) {
             if (!mRoot.hasPointerCapture()) {
@@ -1483,30 +836,11 @@ public class MainActivity extends Activity
         }
     }
 
-    private void onImmersionPointerCaptureChanged(boolean hasCapture) {
-        if (hasCapture) {
-            if (immersionState == ImmersionState.STARTING) {
-                int exitScan = immersionScancode > 0
-                        ? immersionScancode : KeyCodeMapper.getScanCode(immersionKeycode);
-                if (exitScan > 0)
-                    maybeStartImmersionNative(immersionSessionId, exitScan);
-            }
-            return;
-        }
-        // A capture request can transiently report false while STARTING; its bounded
-        // timeout handles that case. Once ACTIVE, losing a required external pointer
-        // capture would let the device escape into Android, so release everything.
-        if (immersionState == ImmersionState.ACTIVE && immersionPointerCaptureRequired) {
-            Log.w(TAG, "external pointer capture lost during immersion");
-            failImmersionLocally(immersionSessionId, IMMERSION_REASON_POINTER_CAPTURE);
-        }
-    }
-
     /** Release capture, optionally keeping it off until the next pointer click. */
     private void releasePointerCapture(boolean suppressUntilClick) {
         if (suppressUntilClick)
             pointerCaptureSuppressed = true;
-        releaseAllHardwarePointerButtons();
+        releaseAllMouseButtons();
         resetCapturedTouchpadGesture();
         if (mRoot != null && mRoot.hasPointerCapture())
             mRoot.releasePointerCapture();
@@ -1536,19 +870,29 @@ public class MainActivity extends Activity
     }
 
     /**
+     * Whether a Back key comes from a real keyboard key rather than from Android's
+     * navigation. An external keyboard often reports its physical Esc as Back, and
+     * that key belongs to the desktop, not to the pointer-capture release. The
+     * gesture / three-button navigation Back is a virtual key with no scan code,
+     * so it stays the one way to release the capture.
+     */
+    private boolean isKeyboardBackKey(KeyEvent event) {
+        if (event.getScanCode() == 0)
+            return false;
+        InputDevice device = InputDevice.getDevice(event.getDeviceId());
+        return device != null && !device.isVirtual()
+                && device.getKeyboardType() == InputDevice.KEYBOARD_TYPE_ALPHABETIC;
+    }
+
+    /**
      * Release capture for a non-mouse Android Back key and consume exactly the
      * matching DOWN/UP pair. Shared by the normal Activity and accessibility-key
      * paths so the setting behaves identically with interception enabled.
      */
     private boolean handlePointerCaptureBackKey(KeyEvent event) {
-        if (event.getKeyCode() != KeyEvent.KEYCODE_BACK || isMouseKeyEvent(event))
+        if (event.getKeyCode() != KeyEvent.KEYCODE_BACK || isMouseKeyEvent(event)
+                || isKeyboardBackKey(event))
             return false;
-
-        // Back may never peel pointer capture away from an immersive session. The
-        // dedicated immersion toggle owns session exit; all other Back presses are
-        // simply reserved while STARTING/ACTIVE/STOPPING.
-        if (isImmersionEngaged())
-            return true;
 
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             if (event.getRepeatCount() > 0)
@@ -1580,7 +924,7 @@ public class MainActivity extends Activity
     }
 
     private void requestPointerCaptureAfterClick() {
-        if (!pointerCaptureEnabled || mRoot == null)
+        if (!pointerCaptureWanted() || mRoot == null)
             return;
         pointerCaptureSuppressed = false;
         mRoot.post(this::syncPointerCapture);
@@ -1600,10 +944,6 @@ public class MainActivity extends Activity
         if (surfaceView != null && surfaceView.getHeight() > 0)
             return surfaceView.getHeight();
         return mRoot != null ? mRoot.getHeight() : 0;
-    }
-
-    private boolean hasCustomScreenResolution() {
-        return customScreenWidth > 0 && customScreenHeight > 0;
     }
 
     // pointerX/pointerY live in root-view coordinates, the same space MotionEvent
@@ -1633,12 +973,12 @@ public class MainActivity extends Activity
     }
 
     private float pointerScaleX() {
-        return (hasCustomScreenResolution() && pointerViewWidth() > 0)
+        return (customScreenWidth > 0 && pointerViewWidth() > 0)
                 ? (float) customScreenWidth / pointerViewWidth() : 1.0f;
     }
 
     private float pointerScaleY() {
-        return (hasCustomScreenResolution() && pointerViewHeight() > 0)
+        return (customScreenHeight > 0 && pointerViewHeight() > 0)
                 ? (float) customScreenHeight / pointerViewHeight() : 1.0f;
     }
 
@@ -1662,11 +1002,14 @@ public class MainActivity extends Activity
         if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE) {
             // Relative mouse samples can be batched.  Consume every historical
             // sample so fast movements do not lose deltas between frames.
+            // Same acceleration curve as the touchpads: a Bluetooth mouse is
+            // SOURCE_MOUSE_RELATIVE, and without this it would bypass the
+            // sensitivity setting entirely.
             for (int i = 0; i < event.getHistorySize(); i++) {
-                movePointerBy(event.getHistoricalX(0, i),
+                sendCapturedTouchpadMotion(event.getHistoricalX(0, i),
                         event.getHistoricalY(0, i));
             }
-            movePointerBy(event.getX(), event.getY());
+            sendCapturedTouchpadMotion(event.getX(), event.getY());
         }
 
         if (action == MotionEvent.ACTION_SCROLL) {
@@ -1682,7 +1025,7 @@ public class MainActivity extends Activity
         // this diff in one place also handles mice that report button actions as
         // ACTION_BUTTON_PRESS/RELEASE instead of ACTION_DOWN/UP.
         if (action == MotionEvent.ACTION_CANCEL)
-            releaseMouseButtonsForDevice(event.getDeviceId());
+            releaseAllMouseButtons();
         else
             updateMouseButtonStateFromEvent(event);
         return true;
@@ -1707,24 +1050,39 @@ public class MainActivity extends Activity
                 && hasCapturedTouchpadScrollAxes(event);
         boolean scrollEvent = action == MotionEvent.ACTION_SCROLL || explicitScroll;
 
+        // A touchpad click-drag is driven by the maintained mouse-button state:
+        // when a left/right button is physically held, one finger rests (the
+        // presser) and another moves, and that moving finger must drive the
+        // cursor. While no such button is held the per-finger drag tracker stays
+        // empty, leaving ordinary two-finger gestures untouched.
+        boolean leftOrRightHeld = (effectiveButtonState(event)
+                & (MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY)) != 0;
+        if (!leftOrRightHeld) {
+            buttonDragLastX.clear();
+            buttonDragLastY.clear();
+        }
+
         // Multi-finger gestures are not filtered out here: the Touchpad sees every
         // contact count and forwards whatever it does not implement as touch itself.
         // cancel() also releases any touches it has already forwarded, which the
         // first three branches all need.
         if (canceled) {
-            cancelCapturedTouchpadGesture();
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
             capturedTouchpadBaselineValid = false;
         } else if (scrollEvent) {
             // Absolute capture normally supplies raw pointer coordinates, but a
             // few drivers still emit scroll axes. They must cancel a pending tap
             // before its final ACTION_UP.
-            cancelCapturedTouchpadGesture();
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
             for (int i = 0; i < event.getHistorySize(); i++)
                 sendCapturedTouchpadScrollAxes(event, i);
             sendCapturedTouchpadScrollAxes(event, -1);
             capturedTouchpadBaselineValid = false;
         } else if (hasButton) {
-            cancelCapturedTouchpadGesture();
+            if (capturedTouchpad != null)
+                capturedTouchpad.cancel();
         } else if (capturedTouchpad != null) {
             updateTouchpadBounds(event);
             capturedTouchpad.onTouch(event);
@@ -1739,11 +1097,15 @@ public class MainActivity extends Activity
             switch (action) {
                 case MotionEvent.ACTION_DOWN:
                     setCapturedTouchpadBaseline(event, -1);
+                    buttonDragLastX.clear();
+                    buttonDragLastY.clear();
                     break;
                 case MotionEvent.ACTION_POINTER_DOWN:
                 case MotionEvent.ACTION_POINTER_UP:
                     // A pointer-count transition must not create a cursor jump.
                     capturedTouchpadBaselineValid = false;
+                    buttonDragLastX.clear();
+                    buttonDragLastY.clear();
                     break;
                 case MotionEvent.ACTION_MOVE:
                 case MotionEvent.ACTION_HOVER_MOVE:
@@ -1751,18 +1113,29 @@ public class MainActivity extends Activity
                         for (int i = 0; i < event.getHistorySize(); i++)
                             processCapturedTouchpadMotionSample(event, i);
                         processCapturedTouchpadMotionSample(event, -1);
+                    } else if (leftOrRightHeld) {
+                        // Click-drag: a button is held while one finger rests and
+                        // another moves. Drive the cursor from the moving finger;
+                        // the held button is forwarded by updateMouseButtonState.
+                        processCapturedTouchpadButtonDrag(event);
                     }
                     break;
                 case MotionEvent.ACTION_UP:
                     capturedTouchpadBaselineValid = false;
+                    buttonDragLastX.clear();
+                    buttonDragLastY.clear();
                     break;
             }
         }
 
-        if (action == MotionEvent.ACTION_CANCEL)
-            releaseMouseButtonsForDevice(event.getDeviceId());
-        else
-            updateMouseButtonStateFromEvent(event);
+        if (action == MotionEvent.ACTION_CANCEL) {
+            lastTouchpadBtnPressed = 0;
+            releaseAllMouseButtons();
+        } else {
+            // Resolve clickpad left/right from the pressing finger's position
+            // and latch it, instead of trusting the hardware's generic primary.
+            updateTouchpadButtonStateFromEvent(event);
+        }
         return true;
     }
 
@@ -1770,42 +1143,68 @@ public class MainActivity extends Activity
                                                       int historyPos) {
         if (event.getPointerCount() != 1)
             return;
-        float dx = normalizeCapturedTouchpadRelativeAxis(event,
-                MotionEvent.AXIS_RELATIVE_X, MotionEvent.AXIS_X,
-                true, historyPos);
-        float dy = normalizeCapturedTouchpadRelativeAxis(event,
-                MotionEvent.AXIS_RELATIVE_Y, MotionEvent.AXIS_Y,
-                false, historyPos);
+        float dx = capturedTouchpadAxis(event, MotionEvent.AXIS_RELATIVE_X,
+                0, historyPos);
+        float dy = capturedTouchpadAxis(event, MotionEvent.AXIS_RELATIVE_Y,
+                0, historyPos);
         float[] fallback = applyCapturedTouchpadAbsoluteFallback(
                 event, historyPos, dx, dy);
         sendCapturedTouchpadMotion(fallback[0], fallback[1]);
     }
 
     /**
-     * AOSP reports captured-touchpad relative axes in the pad's raw ABS_MT units.
-     * Convert them to the same view-pixel space used by the absolute fallback and
-     * the shared cursor. OEMs that expose a value without declaring a motion range
-     * retain the old behavior because their units cannot be identified reliably.
+     * Touchpad click-drag motion: a mouse button is physically held while one
+     * finger rests and another travels. Isolate the contact that moved the most
+     * this sample (the traveller) and drive the cursor with its delta, ignoring
+     * the resting finger. The held button is forwarded separately by
+     * updateMouseButtonState, so this emits relative motion only. Per-finger
+     * positions are kept by pointer id and reset on every pointer-count change.
      */
-    private float normalizeCapturedTouchpadRelativeAxis(MotionEvent event,
-                                                        int relativeAxis,
-                                                        int absoluteAxis,
-                                                        boolean xAxis,
-                                                        int historyPos) {
-        float value = capturedTouchpadAxis(event, relativeAxis, 0, historyPos);
-        if (value == 0f)
-            return 0f;
+    private void processCapturedTouchpadButtonDrag(MotionEvent event) {
+        int pointerCount = event.getPointerCount();
+        if (pointerCount < 2)
+            return;
+        float scaleX = capturedTouchpadCoordinateScale(event, MotionEvent.AXIS_X, true);
+        float scaleY = capturedTouchpadCoordinateScale(event, MotionEvent.AXIS_Y, false);
 
-        InputDevice device = event.getDevice();
-        if (device == null)
-            return value;
-        InputDevice.MotionRange relativeRange = device.getMotionRange(
-                relativeAxis, InputDevice.SOURCE_TOUCHPAD);
-        if (relativeRange == null)
-            return value;
+        // Drop contacts that have lifted since the last sample.
+        for (int i = buttonDragLastX.size() - 1; i >= 0; i--) {
+            int id = buttonDragLastX.keyAt(i);
+            if (event.findPointerIndex(id) < 0) {
+                buttonDragLastX.removeAt(i);
+                buttonDragLastY.delete(id);
+            }
+        }
 
-        float scale = capturedTouchpadCoordinateScale(event, absoluteAxis, xAxis);
-        return scale > 0f ? value * scale : value;
+        // The moving finger is the one with the largest travel since the last
+        // sample; the resting finger contributes ~zero and is ignored.
+        float bestDx = 0f, bestDy = 0f;
+        float bestMag = -1f;
+        for (int i = 0; i < pointerCount; i++) {
+            int id = event.getPointerId(i);
+            float lastX = buttonDragLastX.get(id, Float.NaN);
+            float lastY = buttonDragLastY.get(id, Float.NaN);
+            if (Float.isNaN(lastX) || Float.isNaN(lastY))
+                continue; // new contact this sample: no delta yet
+            float dx = (event.getX(i) - lastX) * scaleX;
+            float dy = (event.getY(i) - lastY) * scaleY;
+            float mag = dx * dx + dy * dy;
+            if (mag > bestMag) {
+                bestMag = mag;
+                bestDx = dx;
+                bestDy = dy;
+            }
+        }
+
+        // Record every current contact so the next sample has a baseline.
+        for (int i = 0; i < pointerCount; i++) {
+            int id = event.getPointerId(i);
+            buttonDragLastX.put(id, event.getX(i));
+            buttonDragLastY.put(id, event.getY(i));
+        }
+
+        if (bestMag > 0f)
+            sendCapturedTouchpadMotion(bestDx, bestDy);
     }
 
     /** Pad axis range, preferring the touchpad source over the device-wide one. */
@@ -1873,20 +1272,15 @@ public class MainActivity extends Activity
     private void sendCapturedTouchpadScrollAxes(MotionEvent event, int historyPos) {
         if (event.getPointerCount() <= 0)
             return;
-        // Keep the driver's old axis-to-wire gain at the default preference, then
-        // scale and reverse it exactly like contact-based two-finger scrolling.
-        float tuning = touchpadScrollSpeed / Touchpad.DEFAULT_SCROLL_SPEED;
-        if (touchpadScrollReversed)
-            tuning = -tuning;
         float vScroll = capturedTouchpadAxis(event, MotionEvent.AXIS_VSCROLL,
                 0, historyPos);
         float hScroll = capturedTouchpadAxis(event, MotionEvent.AXIS_HSCROLL,
                 0, historyPos);
         if (vScroll != 0f || hScroll != 0f) {
             if (vScroll != 0f)
-                mNative.sendMouseScroll(0, -vScroll * 10f * tuning);
+                mNative.sendMouseScroll(0, -vScroll * 10f);
             if (hScroll != 0f)
-                mNative.sendMouseScroll(1, hScroll * 10f * tuning);
+                mNative.sendMouseScroll(1, hScroll * 10f);
             return;
         }
 
@@ -1895,9 +1289,9 @@ public class MainActivity extends Activity
         float gestureY = capturedTouchpadAxis(event,
                 MotionEvent.AXIS_GESTURE_SCROLL_Y_DISTANCE, 0, historyPos);
         if (gestureY != 0f)
-            mNative.sendMouseScroll(0, gestureY * tuning);
+            mNative.sendMouseScroll(0, gestureY);
         if (gestureX != 0f)
-            mNative.sendMouseScroll(1, -gestureX * tuning);
+            mNative.sendMouseScroll(1, -gestureX);
     }
 
     private boolean hasCapturedTouchpadScrollAxes(MotionEvent event) {
@@ -1953,34 +1347,19 @@ public class MainActivity extends Activity
         capturedTouchpadBaselineValid = capturedTouchpadBaselinePointers > 0;
     }
 
-    private void cancelCapturedTouchpadGesture() {
+    private void resetCapturedTouchpadGesture() {
         if (capturedTouchpad != null)
             capturedTouchpad.cancel();
-        releaseSyntheticPointerButtons(BUTTON_OWNER_CAPTURED_TOUCHPAD);
-    }
-
-    private void resetCapturedTouchpadGesture() {
-        cancelCapturedTouchpadGesture();
         capturedTouchpadBaselineValid = false;
         capturedTouchpadBaselinePointers = 0;
         capturedTouchpadLastCentroidX = 0f;
         capturedTouchpadLastCentroidY = 0f;
-    }
-
-    private void resetScreenTouchpadGesture() {
-        immersiveTouchPointers.clear();
-        immersiveTouchDownTimeMs = 0L;
-        immersiveTouchLastEventTimeMs = 0L;
-        if (screenTouchpad != null)
-            screenTouchpad.cancel();
-        releaseSyntheticPointerButtons(BUTTON_OWNER_SCREEN_TOUCHPAD);
+        lastTouchpadBtnPressed = 0;
     }
 
     /**
      * Move the shared cursor by a delta in view pixels and report it to the remote.
-     * Touchpad acceleration is applied before this method (inside screenTouchpad or
-     * sendCapturedTouchpadMotion). A captured mouse calls this directly, so the
-     * touchpad-sensitivity preference never changes physical mouse movement.
+     * Both touchpads and a captured mouse end up here.
      */
     private void movePointerBy(float dx, float dy) {
         if (!Float.isFinite(dx) || !Float.isFinite(dy)
@@ -2002,17 +1381,52 @@ public class MainActivity extends Activity
         // (scaled into the output coordinate space).  This is important for games:
         // movement continues to be reported even while the virtual cursor is at an
         // output edge.
-        if (mNative != null) {
-            mNative.sendMouseMotion((pointerX - originX) * scaleX,
-                    (pointerY - originY) * scaleY,
-                    dx * scaleX, dy * scaleY);
-        }
+        mNative.sendMouseMotion((pointerX - originX) * scaleX,
+                (pointerY - originY) * scaleY,
+                dx * scaleX, dy * scaleY);
+    }
+
+    /*
+     * Bind hardware/system volume and media audio focus to the MUSIC stream while
+     * this window is focused. Without focus, short Linux UI sounds (volume ticks,
+     * key clicks) can be throttled or silenced by the audio policy; with
+     * STREAM_MUSIC + USAGE_MEDIA the volume keys adjust the media stream and the
+     * AAudio output keeps priority alongside music/video playback.
+     */
+    private void setupMediaAudio() {
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
+        mAudioManager = getSystemService(AudioManager.class);
+        if (mAudioManager == null)
+            return;
+
+        AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build();
+        mAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(attrs)
+                .setWillPauseWhenDucked(false)
+                .setOnAudioFocusChangeListener(change ->
+                        Log.i(TAG, "audio focus change: " + change))
+                .build();
+    }
+
+    private void requestMediaAudioFocus() {
+        if (mAudioManager == null || mAudioFocusRequest == null)
+            return;
+        int result = mAudioManager.requestAudioFocus(mAudioFocusRequest);
+        if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+            Log.w(TAG, "media audio focus not granted: " + result);
+    }
+
+    private void abandonMediaAudioFocus() {
+        if (mAudioManager != null && mAudioFocusRequest != null)
+            mAudioManager.abandonAudioFocusRequest(mAudioFocusRequest);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        activityResumed = true;
 
         // Bounced to Settings from onCreate (socket missing): nothing was set up, so
         // just exit this window instead of running the connect logic.
@@ -2020,6 +1434,8 @@ public class MainActivity extends Activity
             finish();
             return;
         }
+
+        requestMediaAudioFocus();
 
         // Show settings notification while in foreground, unless disabled in Settings.
         if (getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
@@ -2063,23 +1479,26 @@ public class MainActivity extends Activity
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.registerDisplayListener(displayListener, null);
+        updateDisplayRotation();
         // Bring the camera service up (or confirm it disabled) BEFORE nativeStart, so
         // the render thread's do_connect() sees a settled camera_service_is_ready()
         // and registers SERVICE_TYPE_CAMERA on the very first connect rather than a
         // later reconnect. Idempotent, so safe to call on every resume.
         applyCameraState();
         if (surfaceReady) {
-            scheduleNativeTransport(surfaceView.getHolder().getSurface(), true, false);
-        } else {
-            transportReady = false;
-            requestImmersionStop(false);
+            mNative.stop();
+            applyConnectionConfig();
+            startNative(surfaceView.getHolder().getSurface());
+            pushRefreshRate();
+            applyMicState();
+            applyAudioLatency();
+            applyAudioKeepalive();
         }
 
         // ===== 重新读取触摸板设置 =====
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         isTouchpadMode = prefs.getBoolean(KEY_TOUCHPAD_MODE, false);
         applyTouchpadPrefs(prefs);
-        releaseAllHardwarePointerButtons();
         pointerCaptureEnabled = prefs.getBoolean(KEY_POINTER_CAPTURE, false);
         // A manual Back-key release lasts until the next click or lifecycle
         // transition. Returning from Settings starts a fresh capture session.
@@ -2089,74 +1508,48 @@ public class MainActivity extends Activity
         autoStretch = prefs.getBoolean(KEY_AUTO_STRETCH, true);
         relayout();
 
-        // Pick up an immersive-capture toggle made in Settings. Resuming never immerses
-        // by itself -- it only arms the toggle key and makes sure nothing is still grabbed.
-        fullKeyCaptureEnabled = prefs.getBoolean(KEY_FULL_KEY_CAPTURE, false);
-        immersionKeycode = prefs.getInt(KEY_IMMERSION_KEYCODE, UNBOUND);
-        immersionScancode = prefs.getInt(KEY_IMMERSION_SCANCODE, 0);
-        clearImmersionToggleTracking();
-
         // The socket pref may have been edited in Settings; keep our dedup key current.
         registerWindow();
     }
 
     @Override
     protected void onPause() {
-        activityResumed = false;
+        super.onPause();
         // Socket-missing bounce: no pipeline exists, so skip teardown (mNative is
         // null) and don't let the jump to Settings trigger any of it.
-        if (mForceSettings) {
-            super.onPause();
-            return;
-        }
-        clearImmersionToggleTracking();
-        scheduleNativeTransport(null, false, false);
+        if (mForceSettings) return;
+        // A session must never outlive the foreground: leaving the input devices
+        // grabbed for a window the user has left is how a tablet gets bricked.
+        if (immersive != null) immersive.stop();
         clearPointerCaptureBackTracking();
         releasePointerCapture(false);
-        resetScreenTouchpadGesture();
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
         DisplayManager dm = getSystemService(DisplayManager.class);
         if (dm != null)
             dm.unregisterDisplayListener(displayListener);
-        super.onPause();
+        mNative.stop();
+        abandonMediaAudioFocus();
     }
 
     @Override
     protected void onDestroy() {
-        activityResumed = false;
-        transportReady = false;
-        ++transportGeneration;
-        beginImmersionStopping();
-        clearImmersionToggleTracking();
+        abandonMediaAudioFocus();
+        if (immersive != null) immersive.stop();
         releasePointerCapture(false);
-        resetScreenTouchpadGesture();
-        if (sInstance == this)
-            sInstance = null;
         if (mRegisteredSocket != null) {
             sWindowsBySocket.remove(mRegisteredSocket, this);
             mRegisteredSocket = null;
         }
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(NOTIFICATION_ID);
-        // onPause's queued native stop may be invalidated by the destroy generation.
-        // Unregister synchronously so the Clipboard object cannot retain this dead
-        // Activity through ClipboardManager while native destruction waits in queue.
-        if (clipboard != null)
-            clipboard.nativeClipListening(false);
         // Release only THIS window's native pipeline (its consumer_state, audio bridge
         // and camera client). The camera service itself is a process-global shared by
         // every window, so it is intentionally not torn down here -- destroying it
         // would cut the camera for the other open windows.
         if (mNative != null) {
-            // Destroy on the grab worker, not here: nativeDestroy joins the grab
-            // thread, which can be parked in waitpid() on `su`. Queued behind any
-            // pending start/stop on this single-thread executor, so free() can never
-            // race them. Blocking the main thread here was an ANR plus a use-after-free.
-            final Native n = mNative;
+            mNative.destroy();
             mNative = null;
-            postGrabTask(n::destroy);
-            grabExecutor.shutdown();
         }
         cameraInited = false;
         super.onDestroy();
@@ -2184,6 +1577,42 @@ public class MainActivity extends Activity
         }
     }
 
+    /*
+     * Forward the mic only when the user enabled it AND RECORD_AUDIO is granted.
+     * If enabled but not yet granted, request it; onRequestPermissionsResult applies
+     * the result. Safe to call after every nativeStart (re)connect.
+     */
+    /* Push the speaker/mic latency presets to native (which forwards them to the
+     * producer's PipeWire nodes). Safe to call after every (re)connect and whenever
+     * the user changes a preset. */
+    private void applyAudioLatency() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        int speakerMs = prefs.getInt(KEY_SPEAKER_LATENCY_MS, 0);
+        int micMs = prefs.getInt(KEY_MIC_LATENCY_MS, 0);
+        mNative.setAudioLatency(speakerMs, micMs);
+    }
+
+    private void applyAudioKeepalive() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        mNative.setAudioKeepalive(prefs.getBoolean(KEY_AUDIO_KEEPALIVE, false));
+    }
+
+    private void applyMicState() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        boolean want = prefs.getBoolean(KEY_MIC_ENABLED, false);
+        if (!want) {
+            mNative.setMicEnabled(false);
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+            mNative.setMicEnabled(true);
+        } else {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
+                               REQ_RECORD_AUDIO);
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
@@ -2191,9 +1620,7 @@ public class MainActivity extends Activity
         if (requestCode == REQ_RECORD_AUDIO) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            Native n = mNative;
-            if (n != null)
-                n.setMicEnabled(granted);
+            mNative.setMicEnabled(granted);
         } else if (requestCode == REQ_CAMERA) {
             boolean granted = grantResults.length > 0
                     && grantResults[0] == PackageManager.PERMISSION_GRANTED;
@@ -2219,11 +1646,18 @@ public class MainActivity extends Activity
         Log.i(TAG, "surfaceChanged: " + width + "x" + height);
         viewWidth = width;
         viewHeight = height;
+        updateDisplayRotation();
         ensurePointerPosition();
         surfaceReady = true;
         // Same ordering guarantee as onResume: camera service settled before connect.
         applyCameraState();
-        scheduleNativeTransport(holder.getSurface(), true, true);
+        mNative.stop();
+        applyConnectionConfig();
+        startNative(holder.getSurface());
+        pushRefreshRate();
+        applyMicState();
+        applyAudioLatency();
+        applyAudioKeepalive();
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         updateTouchpadBounds(null);
@@ -2234,11 +1668,9 @@ public class MainActivity extends Activity
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         surfaceReady = false;
-        transportReady = false;
-        clearImmersionToggleTracking();
-        scheduleNativeTransport(null, false, false);
+        if (immersive != null) immersive.stop();
         releasePointerCapture(false);
-        resetScreenTouchpadGesture();
+        mNative.stop();
     }
 
 
@@ -2469,13 +1901,161 @@ public class MainActivity extends Activity
         }
     }
 
-    // The bound key toggles immersion. Intercepted here rather than in onKeyDown so it
-    // is seen before the key would be forwarded to Linux.
+    // ---- ImmersiveMode.Host ----
+    //
+    // Immersive mode replays grabbed devices through the paths the on-screen
+    // input already uses, so touchpad mode, the pointer sensitivity and the
+    // gesture tuning apply to it without any of it being reimplemented.
+
     @Override
-    public boolean dispatchKeyEvent(KeyEvent event) {
-        if (handleImmersionKey(event))
-            return true;
-        return super.dispatchKeyEvent(event);
+    public Context context() {
+        return this;
+    }
+
+    @Override
+    public int outputWidth() {
+        return pointerViewWidth();
+    }
+
+    @Override
+    public int outputHeight() {
+        return pointerViewHeight();
+    }
+
+    /** The panel's current rate, for the session's telemetry line. */
+    @Override
+    public float displayRefreshHz() {
+        Display d = getDisplay();
+        return d != null ? d.getRefreshRate() : 0f;
+    }
+
+    // Letterboxed output starts at the surface's centering offset, the same
+    // origin the virtual cursor is clamped to.
+    @Override
+    public float outputOriginX() {
+        return pointerOriginX();
+    }
+
+    @Override
+    public float outputOriginY() {
+        return pointerOriginY();
+    }
+
+    @Override
+    public int displayRotation() {
+        return displayRotation;
+    }
+
+    /**
+     * A frame from the grabbed touchscreen, already in view pixels. This is the
+     * non-mouse branch of {@link #onTouchEvent} verbatim, which is the point:
+     * with touchpad mode on the finger drives the cursor relatively, with it off
+     * the touch maps straight onto the desktop.
+     */
+    @Override
+    public void onGrabbedTouch(MotionEvent ev) {
+        if (mNative == null)
+            return;
+        if (isTouchpadMode) {
+            updateTouchpadBounds(null);
+            screenTouchpad.onTouch(ev);
+        } else {
+            handleTouchEvent(ev);
+        }
+    }
+
+    /**
+     * A {@link Touchpad} for a grabbed physical pad. Its recognized motion is the
+     * cursor here (emitMotion), unlike Android's captured pad, whose movement
+     * comes from the driver's own relative axes; and its taps are the only click
+     * source, since the tap-to-click Android would have done is bypassed.
+     */
+    @Override
+    public Touchpad newGrabbedPad() {
+        Touchpad pad = new Touchpad(this, new TouchpadOutput(true), true);
+        applyTouchpadPrefs(getSharedPreferences(PREFS_NAME, MODE_PRIVATE), pad);
+        pad.setOutputSize(pointerViewWidth(), pointerViewHeight());
+        return pad;
+    }
+
+    @Override
+    public void movePointerRelative(float dx, float dy) {
+        // Same acceleration curve as a captured pad, so the sensitivity slider
+        // under Touchpad & Mouse means the same thing in an immersive session.
+        sendCapturedTouchpadMotion(dx, dy);
+    }
+
+    @Override
+    public void sendKey(int action, int evdev) {
+        if (mNative != null)
+            mNative.sendKey(action, evdev);
+    }
+
+    @Override
+    public void sendMouseButton(int button, boolean pressed) {
+        if (mNative != null)
+            mNative.sendMouseButton(button, pressed);
+    }
+
+    @Override
+    public void sendMouseScroll(int axis, float value) {
+        if (mNative != null)
+            mNative.sendMouseScroll(axis, value);
+    }
+
+    @Override
+    public void onImmersiveChanged(boolean active) {
+        immersiveActive = active;
+        if (active) {
+            // The pointer is grabbed at the evdev level for the whole session, so
+            // Android's capture is dropped for its duration. The user's "capture
+            // external pointer" setting is left alone and takes effect again as
+            // soon as the session ends.
+            releasePointerCapture(false);
+            pinDisplayRefreshRate(true);
+        } else {
+            pinDisplayRefreshRate(false);
+            if (mRoot != null)
+                mRoot.post(this::syncPointerCapture);
+        }
+    }
+
+    /**
+     * While an immersive session runs, the desktop is the only thing on screen.
+     * Panels with power-saving mode switching drop to 30-60 Hz when the image
+     * goes still, which reads as a sudden refresh-rate drop and stutter the
+     * moment the user stops moving the pointer; a touch on the panel would have
+     * kept it boosted before. Pin the display to a high rate for the duration
+     * (KWin follows the resulting mode switch through pushRefreshRate).
+     */
+    private void pinDisplayRefreshRate(boolean pin) {
+        try {
+            Surface s = surfaceView.getHolder().getSurface();
+            if (s == null || !s.isValid())
+                return;
+            if (!pin) {
+                s.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                        Surface.CHANGE_FRAME_RATE_ALWAYS);
+                return;
+            }
+            Display d = getDisplay();
+            if (d == null)
+                return;
+            float hz = d.getRefreshRate();
+            if (hz < 90f) {
+                // Entered mid-drop: go for the panel's best instead of pinning
+                // whatever low rate it has fallen to.
+                for (float r : d.getSupportedRefreshRates()) {
+                    if (r > hz)
+                        hz = r;
+                }
+            }
+            s.setFrameRate(hz, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS);
+            Log.i(TAG, "immersive: display pinned at " + hz + " Hz");
+        } catch (Exception e) {
+            Log.w(TAG, "setFrameRate failed: " + e);
+        }
     }
 
     // ================================================================
@@ -2485,7 +2065,7 @@ public class MainActivity extends Activity
     public boolean onTouchEvent(MotionEvent event) {
         boolean mouseEvent = isMouseEvent(event);
         if (mouseEvent && event.getActionMasked() == MotionEvent.ACTION_DOWN
-                && pointerCaptureEnabled && mRoot != null
+                && pointerCaptureWanted() && mRoot != null
                 && !mRoot.hasPointerCapture()) {
             // A Back-key release leaves the pointer free long enough for the user
             // to move/click normally; the next click starts a new capture session.
@@ -2512,109 +2092,35 @@ public class MainActivity extends Activity
         return handleTouchEvent(event);
     }
 
-    private float mMouseSmoothX = 0f;
-    private float mMouseSmoothY = 0f;
-    private boolean mMouseSmoothInit = false;
-
-    private void sendSmoothMouseMotion(float rawX, float rawY) {
-        float targetX = getScaledX(rawX);
-        float targetY = getScaledY(rawY);
-
-        if (!mMouseSmoothInit) {
-            mMouseSmoothX = targetX;
-            mMouseSmoothY = targetY;
-            mMouseSmoothInit = true;
-        } else {
-            // EMA smooth factor (matching VirtualTouchpad for butter-smooth physical mouse movement)
-            mMouseSmoothX = 0.4f * targetX + 0.6f * mMouseSmoothX;
-            mMouseSmoothY = 0.4f * targetY + 0.6f * mMouseSmoothY;
-        }
-
-        mNative.sendMouseMotion(mMouseSmoothX, mMouseSmoothY, 0f, 0f);
-    }
-
-    private float getScaledX(float rawX) {
-        if (viewWidth <= 0) return rawX;
-        if (customScreenWidth <= 0) return Math.max(0.0f, rawX);
-
-        float videoAspect = (customScreenHeight > 0) ? (float) customScreenWidth / customScreenHeight : (16.0f / 9.0f);
-        float viewAspect = (viewHeight > 0) ? (float) viewWidth / viewHeight : videoAspect;
-        
-        float renderW = viewWidth;
-        float offsetX = 0.0f;
-        
-        if (viewAspect > videoAspect) {
-            renderW = viewHeight * videoAspect;
-            offsetX = (viewWidth - renderW) / 2.0f;
-        }
-        
-        float scaleX = (float) customScreenWidth / renderW;
-        float x = Math.max(0.0f, (rawX - offsetX) * scaleX);
-        return Math.min(x, (float) customScreenWidth - 0.001f);
-    }
-
-    private float getTitleBarOffset() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            try {
-                WindowInsets insets = getWindow().getDecorView().getRootWindowInsets();
-                if (insets != null) {
-                    int captionTop = insets.getInsets(WindowInsets.Type.captionBar()).top;
-                    return (float) Math.max(0, captionTop);
-                }
-            } catch (Throwable ignored) {}
-        }
-        
-        int displayH = getResources().getDisplayMetrics().heightPixels;
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N && isInMultiWindowMode()
-                && viewHeight > 0 && displayH > 0 && viewHeight < (displayH - 150)) {
-            float density = mDensity > 0 ? mDensity : getResources().getDisplayMetrics().density;
-            return 36.0f * density;
-        }
-        
-        return 0.0f;
-    }
-
-    private float getScaledY(float rawY) {
-        if (viewHeight <= 0) return rawY;
-
-        float titleBarOffset = getTitleBarOffset();
-
-        if (customScreenHeight <= 0) {
-            return Math.max(0.0f, rawY - titleBarOffset);
-        }
-
-        float videoAspect = (customScreenWidth > 0) ? (float) customScreenWidth / customScreenHeight : (16.0f / 9.0f);
-        float viewAspect = (viewWidth > 0) ? (float) viewWidth / viewHeight : videoAspect;
-        
-        float renderH = viewHeight;
-        float offsetY = 0.0f;
-        
-        if (viewAspect < videoAspect) {
-            renderH = viewWidth / videoAspect;
-            offsetY = (viewHeight - renderH) / 2.0f;
-        }
-        
-        float scaleY = (float) customScreenHeight / renderH;
-        float y = Math.max(0.0f, (rawY - titleBarOffset - offsetY) * scaleY);
-        return Math.min(y, (float) customScreenHeight - 0.001f);
-    }
-
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_BUTTON_PRESS
-                    && pointerCaptureEnabled && mRoot != null
+                    && pointerCaptureWanted() && mRoot != null
                     && !mRoot.hasPointerCapture()) {
                 requestPointerCaptureAfterClick();
             }
             if (action == MotionEvent.ACTION_HOVER_MOVE) {
-                if (Float.isFinite(event.getX()) && Float.isFinite(event.getY())) {
-                    pointerX = event.getX();
-                    pointerY = event.getY();
-                    ensurePointerPosition();
+                float nativeX, nativeY;
+                if (autoStretch) {
+                    float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                            (float)customScreenWidth / viewWidth : 1.0f;
+                    float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                            (float)customScreenHeight / viewHeight : 1.0f;
+                    nativeX = event.getX() * scaleX;
+                    nativeY = event.getY() * scaleY;
+                } else {
+                    nativeX = (event.getX() - surfaceOffsetX) / surfaceScale;
+                    nativeY = (event.getY() - surfaceOffsetY) / surfaceScale;
                 }
-                sendSmoothMouseMotion(event.getX(), event.getY());
+        
+                pointerX = event.getX();
+                pointerY = event.getY();
+                ensurePointerPosition();
+                mNative.sendMouseMotion(nativeX, nativeY,
+                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_X),
+                                      event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y));
                 return true;
             }
             if (action == MotionEvent.ACTION_SCROLL) {
@@ -2637,6 +2143,10 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
+        // First: the immersive toggle is the way out of a session that has taken
+        // every input device, so nothing else may consume it.
+        if (immersive != null && immersive.handleKey(event))
+            return true;
         if (handlePointerCaptureBackKey(event))
             return true;
         // Mouse Back is already forwarded as BTN_SIDE from the MotionEvent path.
@@ -2672,8 +2182,6 @@ public class MainActivity extends Activity
     // unexpectedly finish via gesture navigation.
     @Override
     public void onBackPressed() {
-        if (isImmersionEngaged())
-            return;
         if (mRoot != null && mRoot.hasPointerCapture()) {
             releasePointerCapture(true);
             // There is no KeyEvent on this OEM path. Use a wildcard so a trailing
@@ -2687,11 +2195,10 @@ public class MainActivity extends Activity
     // Called from KeyInterceptor (accessibility service) to handle keys that
     // the normal onKeyDown/onKeyUp might miss (e.g. Fn combos).
     public boolean handleAccessibilityKey(KeyEvent event) {
-        // Check the toggle here too: when accessibility interception is on, this path
-        // consumes every key BEFORE the window sees it, so dispatchKeyEvent would never
-        // run and immersion could never be entered. Whichever path delivers the key,
-        // the immersion toggle gets first look.
-        if (handleImmersionKey(event))
+        // With interception on, KeyInterceptor consumes keys before the window
+        // ever sees them, so the immersive toggle has to be recognised here too —
+        // the two features are wanted by exactly the same users.
+        if (immersive != null && immersive.handleKey(event))
             return true;
         if (handlePointerCaptureBackKey(event))
             return true;
@@ -2754,6 +2261,8 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (immersive != null && immersive.handleKey(event))
+            return true;
         if (handlePointerCaptureBackKey(event))
             return true;
         if (keyCode == KeyEvent.KEYCODE_BACK && isMouseKeyEvent(event))
@@ -2766,8 +2275,7 @@ public class MainActivity extends Activity
     private static final int CLASSIFICATION_MULTI_FINGER_SWIPE = 4;
     private static final int CLASSIFICATION_PINCH = 5;
 
-    private static final int BUTTON_OWNER_SCREEN_TOUCHPAD = 0;
-    private static final int BUTTON_OWNER_CAPTURED_TOUCHPAD = 1;
+    private int savedBS = 0;
 
     private static final int[][] BUTTON_MAP = {
         {MotionEvent.BUTTON_PRIMARY,   0x110}, // BTN_LEFT
@@ -2777,107 +2285,84 @@ public class MainActivity extends Activity
         {MotionEvent.BUTTON_FORWARD,   0x114}, // BTN_EXTRA
     };
 
-    private static final int SUPPORTED_POINTER_BUTTONS =
-            MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY
-            | MotionEvent.BUTTON_TERTIARY | MotionEvent.BUTTON_BACK
-            | MotionEvent.BUTTON_FORWARD;
-
-    // Physical devices publish snapshots keyed by device id. Gesture recognizers
-    // own separate masks. The aggregate is sent only when a button transitions
-    // globally, so one source cannot release a button still held by another.
-    private final SparseIntArray hardwarePointerButtonStates = new SparseIntArray();
-    private int screenTouchpadButtonState = 0;
-    private int capturedTouchpadButtonState = 0;
-    private int forwardedPointerButtonState = 0;
-
-    private int motionButtonForLinuxButton(int linuxButton) {
+    private void updateMouseButtonState(int currentBS) {
         for (int[] btn : BUTTON_MAP) {
-            if (btn[1] == linuxButton)
-                return btn[0];
-        }
-        return 0;
-    }
-
-    private void setSyntheticPointerButton(int owner, int linuxButton,
-                                           boolean pressed) {
-        int mask = motionButtonForLinuxButton(linuxButton);
-        if (mask == 0)
-            return;
-
-        int state;
-        if (owner == BUTTON_OWNER_SCREEN_TOUCHPAD) {
-            state = screenTouchpadButtonState;
-            screenTouchpadButtonState = pressed ? state | mask : state & ~mask;
-        } else if (owner == BUTTON_OWNER_CAPTURED_TOUCHPAD) {
-            state = capturedTouchpadButtonState;
-            capturedTouchpadButtonState = pressed ? state | mask : state & ~mask;
-        } else {
-            return;
-        }
-        dispatchPointerButtonState();
-    }
-
-    private void releaseSyntheticPointerButtons(int owner) {
-        if (owner == BUTTON_OWNER_SCREEN_TOUCHPAD)
-            screenTouchpadButtonState = 0;
-        else if (owner == BUTTON_OWNER_CAPTURED_TOUCHPAD)
-            capturedTouchpadButtonState = 0;
-        else
-            return;
-        dispatchPointerButtonState();
-    }
-
-    private void dispatchPointerButtonState() {
-        int currentBS = screenTouchpadButtonState | capturedTouchpadButtonState;
-        for (int i = 0; i < hardwarePointerButtonStates.size(); i++)
-            currentBS |= hardwarePointerButtonStates.valueAt(i);
-        currentBS &= SUPPORTED_POINTER_BUTTONS;
-
-        for (int[] btn : BUTTON_MAP) {
-            boolean wasDown = (forwardedPointerButtonState & btn[0]) != 0;
+            boolean wasDown = (savedBS & btn[0]) != 0;
             boolean isDown  = (currentBS & btn[0]) != 0;
             if (wasDown != isDown && mNative != null)
                 mNative.sendMouseButton(btn[1], isDown);
         }
-        forwardedPointerButtonState = currentBS;
+        savedBS = currentBS;
     }
 
     // ACTION_BUTTON_RELEASE may report a stale buttonState on some touchpad
     // drivers. Use the explicit action button as a correction when available.
-    private void updateMouseButtonStateFromEvent(MotionEvent event) {
+    /** Effective button bitmask, correcting PRESS/RELEASE actions against getButtonState. */
+    private static int effectiveButtonState(MotionEvent event) {
         int buttonState = event.getButtonState();
         int action = event.getActionMasked();
         if (action == MotionEvent.ACTION_BUTTON_PRESS)
             buttonState |= event.getActionButton();
         else if (action == MotionEvent.ACTION_BUTTON_RELEASE)
             buttonState &= ~event.getActionButton();
-        buttonState &= SUPPORTED_POINTER_BUTTONS;
-        int deviceId = event.getDeviceId();
-        if (buttonState == 0)
-            hardwarePointerButtonStates.delete(deviceId);
-        else
-            hardwarePointerButtonStates.put(deviceId, buttonState);
-        dispatchPointerButtonState();
+        return buttonState;
     }
 
-    private void releaseMouseButtonsForDevice(int deviceId) {
-        hardwarePointerButtonStates.delete(deviceId);
-        dispatchPointerButtonState();
+    private void updateMouseButtonStateFromEvent(MotionEvent event) {
+        updateMouseButtonState(effectiveButtonState(event));
     }
 
-    private void releaseAllHardwarePointerButtons() {
-        hardwarePointerButtonStates.clear();
-        dispatchPointerButtonState();
+    /**
+     * Touchpad button state with clickpad left/right resolution. Reached only for
+     * SOURCE_TOUCHPAD events in capture mode. A single-button pad reports every
+     * press as BUTTON_PRIMARY, so on PRESS the Touchpad picks the pressing finger
+     * (the slowest contact) and returns left/right from its position; that choice
+     * is latched in {@link #lastTouchpadBtnPressed}. On RELEASE the latch is
+     * dropped regardless of where the finger now rests, so a finger drifting
+     * across the midline cannot strand a held button.
+     */
+    private void updateTouchpadButtonStateFromEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        int bs = event.getButtonState();
+        if (action == MotionEvent.ACTION_BUTTON_PRESS) {
+            int wire = (capturedTouchpad != null)
+                    ? capturedTouchpad.clickpadButton(event) : 0x110; // BTN_LEFT
+            lastTouchpadBtnPressed = (wire == 0x111) // BTN_RIGHT
+                    ? MotionEvent.BUTTON_SECONDARY : MotionEvent.BUTTON_PRIMARY;
+            bs &= ~(MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY);
+            bs |= lastTouchpadBtnPressed;
+        } else if (action == MotionEvent.ACTION_BUTTON_RELEASE) {
+            // Release exactly what we pressed: the latch, not the current position.
+            bs &= ~(MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY);
+            lastTouchpadBtnPressed = 0;
+        } else if (lastTouchpadBtnPressed != 0) {
+            // While held, keep the latched button instead of the hardware's
+            // generic primary so the compositor sees a consistent left/right.
+            bs &= ~(MotionEvent.BUTTON_PRIMARY | MotionEvent.BUTTON_SECONDARY);
+            bs |= lastTouchpadBtnPressed;
+        }
+        updateMouseButtonState(bs);
+    }
+
+    private void releaseAllMouseButtons() {
+        if (savedBS == 0)
+            return;
+        for (int[] btn : BUTTON_MAP) {
+            if ((savedBS & btn[0]) != 0 && mNative != null)
+                mNative.sendMouseButton(btn[1], false);
+        }
+        savedBS = 0;
     }
 
     private boolean isMouseEvent(MotionEvent event) {
-        int toolType = event.getToolType(event.getActionIndex());
-        if (toolType == MotionEvent.TOOL_TYPE_MOUSE) return true;
-        
         int source = event.getSource();
-        if ((source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) return true;
-        
-        return false;
+        if ((source & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN)
+            return false;
+        if ((source & InputDevice.SOURCE_MOUSE) != InputDevice.SOURCE_MOUSE)
+            return false;
+        int toolType = event.getToolType(event.getActionIndex());
+        return toolType == MotionEvent.TOOL_TYPE_MOUSE
+            || toolType == MotionEvent.TOOL_TYPE_FINGER;
     }
 
     private boolean isMouseKeyEvent(KeyEvent event) {
@@ -2886,17 +2371,39 @@ public class MainActivity extends Activity
     }
 
     private boolean handleMouseEvent(MotionEvent event) {
+        float dx = 0f;
+        float dy = 0f;
+        
+        float nativeX, nativeY;
+        if (autoStretch) {
+            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
+                       (float)customScreenWidth / viewWidth : 1.0f;
+            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
+                       (float)customScreenHeight / viewHeight : 1.0f;
+            nativeX = event.getX() * scaleX;
+            nativeY = event.getY() * scaleY;
+            if (event.getHistorySize() > 0) {
+                int last = event.getHistorySize() - 1;
+                dx = (event.getX() - event.getHistoricalX(0, last))*scaleX;
+                dy = (event.getY() - event.getHistoricalY(0, last))*scaleY;
+            }
+        } else {
+            nativeX = (event.getX() - surfaceOffsetX) / surfaceScale;
+            nativeY = (event.getY() - surfaceOffsetY) / surfaceScale;
+            if (event.getHistorySize() > 0) {
+                int last = event.getHistorySize() - 1;
+                dx = (event.getX() - event.getHistoricalX(0, last)) / surfaceScale;
+                dy = (event.getY() - event.getHistoricalY(0, last)) / surfaceScale;
+            }
+        }
         if (Float.isFinite(event.getX()) && Float.isFinite(event.getY())) {
             pointerX = event.getX();
             pointerY = event.getY();
             ensurePointerPosition();
         }
-        sendSmoothMouseMotion(event.getX(), event.getY());
+        mNative.sendMouseMotion(nativeX, nativeY, dx, dy);
 
-        if (event.getActionMasked() == MotionEvent.ACTION_CANCEL)
-            releaseMouseButtonsForDevice(event.getDeviceId());
-        else
-            updateMouseButtonStateFromEvent(event);
+        updateMouseButtonStateFromEvent(event);
         return true;
     }
 
@@ -2954,9 +2461,9 @@ public class MainActivity extends Activity
     
     private float[] convertToNativeCoords(float x, float y) {
         if (autoStretch) {
-            float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
+            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
                            (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
+            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                            (float)customScreenHeight / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {
@@ -2966,9 +2473,9 @@ public class MainActivity extends Activity
     
     private float[] convertMouseToNative(float x, float y) {
         if (autoStretch) {
-            float scaleX = (hasCustomScreenResolution() && viewWidth > 0) ?
+            float scaleX = (customScreenWidth > 0 && viewWidth > 0) ? 
                            (float)customScreenWidth / viewWidth : 1.0f;
-            float scaleY = (hasCustomScreenResolution() && viewHeight > 0) ?
+            float scaleY = (customScreenHeight > 0 && viewHeight > 0) ? 
                            (float)customScreenHeight / viewHeight : 1.0f;
             return new float[]{x * scaleX, y * scaleY};
         } else {

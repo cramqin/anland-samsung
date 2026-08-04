@@ -1,10 +1,45 @@
 package com.anland.consumer;
 
+import android.content.Context;
 import android.util.SparseIntArray;
 import android.view.KeyEvent;
 
 public class KeyCodeMapper {
     private static final SparseIntArray MAP = new SparseIntArray();
+
+    /** Android keycode → localized name, for the keys worth binding to. */
+    private static final SparseIntArray NAME_RES = new SparseIntArray();
+    static {
+        NAME_RES.put(KeyEvent.KEYCODE_VOLUME_UP, R.string.key_volume_up);
+        NAME_RES.put(KeyEvent.KEYCODE_VOLUME_DOWN, R.string.key_volume_down);
+        NAME_RES.put(KeyEvent.KEYCODE_VOLUME_MUTE, R.string.key_volume_mute);
+        NAME_RES.put(KeyEvent.KEYCODE_POWER, R.string.key_power);
+        NAME_RES.put(KeyEvent.KEYCODE_CAMERA, R.string.key_camera);
+        NAME_RES.put(KeyEvent.KEYCODE_HEADSETHOOK, R.string.key_headset_hook);
+        NAME_RES.put(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, R.string.key_media_play_pause);
+        NAME_RES.put(KeyEvent.KEYCODE_MEDIA_NEXT, R.string.key_media_next);
+        NAME_RES.put(KeyEvent.KEYCODE_MEDIA_PREVIOUS, R.string.key_media_previous);
+        NAME_RES.put(KeyEvent.KEYCODE_BRIGHTNESS_UP, R.string.key_brightness_up);
+        NAME_RES.put(KeyEvent.KEYCODE_BRIGHTNESS_DOWN, R.string.key_brightness_down);
+        NAME_RES.put(KeyEvent.KEYCODE_HOME, R.string.key_home);
+        NAME_RES.put(KeyEvent.KEYCODE_BACK, R.string.key_back);
+    }
+
+    /**
+     * A name for a bound key, for status lines and toasts. Falls back to the raw
+     * key code, or to the evdev scan code when Android had no key code for it at
+     * all (some vendor keys only report a scan code).
+     */
+    public static String keyName(Context ctx, int keyCode, int scanCode) {
+        int nameRes = NAME_RES.get(keyCode);
+        if (nameRes != 0)
+            return ctx.getString(nameRes);
+        if (keyCode != -1 && keyCode != KeyEvent.KEYCODE_UNKNOWN)
+            return ctx.getString(R.string.keycode_unknown, keyCode);
+        if (scanCode > 0)
+            return ctx.getString(R.string.scancode_unknown, scanCode);
+        return ctx.getString(R.string.status_current_none);
+    }
 
     static {
         // 字母 A-Z

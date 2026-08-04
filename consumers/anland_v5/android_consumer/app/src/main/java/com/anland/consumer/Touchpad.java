@@ -62,7 +62,11 @@ public final class Touchpad {
     private float startX1, startY1;
     private float lastX2, lastY2;
     private long downTime1;
-    private long twoFingerDownTime;
+    // True while lastX1/lastY1 (and lastX2/lastY2 in a two-finger phase) hold a
+    // live baseline for clickpadButton(). A physical clickpad press cancels the
+    // gesture before recognize() sees it; cancel() intentionally does not clear
+    // this, so the prior finger positions survive for the press to be judged.
+    private boolean clickpadBaselineValid = false;
     private final float touchSlop;
 
     private boolean isSingleTapCandidate = false;
@@ -242,6 +246,53 @@ public final class Touchpad {
     }
 
     /**
+     * Decide left vs right for a single-button (clickpad) physical press. The
+     * pressing finger is the slowest contact -- it is held still to click -- so
+     * each current contact is compared against the last position recognize()
+     * recorded (lastX1 for the primary finger, lastX2 for the second) and the one
+     * that travelled least wins. Left half of the pad => BTN_LEFT (0x110), right
+     * half => BTN_RIGHT (0x111).
+     *
+     * Call on the ACTION_BUTTON_PRESS event. The press triggers cancel(), which
+     * does not clear the baseline, so the prior positions are still live. Returns
+     * BTN_LEFT when no baseline is available (a press with no contact on the pad).
+     */
+    int clickpadButton(MotionEvent event) {
+        if (!clickpadBaselineValid || event.getPointerCount() <= 0)
+            return 0x110; // BTN_LEFT
+        int limit = Math.min(event.getPointerCount(), 2);
+        int slowestIndex = 0;
+        float slowestSpeed = Float.MAX_VALUE;
+        for (int i = 0; i < limit; i++) {
+            float lastX = (i == 0) ? lastX1 : lastX2;
+            float lastY = (i == 0) ? lastY1 : lastY2;
+            float curX = toOutputX(event.getX(i));
+            float curY = toOutputY(event.getY(i));
+            float dx = curX - lastX;
+            float dy = curY - lastY;
+            float speed = dx * dx + dy * dy;
+            if (speed < slowestSpeed) {
+                slowestSpeed = speed;
+                slowestIndex = i;
+            }
+        }
+        float curX = toOutputX(event.getX(slowestIndex));
+        float mid = outputWidth > 0 ? outputWidth / 2f : curX;
+        return curX < mid ? 0x110 : 0x111; // BTN_LEFT / BTN_RIGHT
+    }
+
+    /** Map a pad (input-space) coordinate to the output space recognize() uses. */
+    private float toOutputX(float x) {
+        return (inputRangeX > 0f && outputWidth > 0)
+                ? (x - inputMinX) * (outputWidth / inputRangeX) : x;
+    }
+
+    private float toOutputY(float y) {
+        return (inputRangeY > 0f && outputHeight > 0)
+                ? (y - inputMinY) * (outputHeight / inputRangeY) : y;
+    }
+
+    /**
      * Interpret one event from this device.
      *
      * Events belonging to a gesture this class does not implement are forwarded as
@@ -381,6 +432,15 @@ public final class Touchpad {
         int action = event.getActionMasked();
         int pointerCount = event.getPointerCount();
 
+        // Keep clickpadBaselineValid current on every contact event: a physical
+        // clickpad press cancels the gesture before recognize() sees it, so this
+        // is the only place the flag is maintained.
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_POINTER_DOWN
+                || action == MotionEvent.ACTION_MOVE)
+            clickpadBaselineValid = true;
+        else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
+            clickpadBaselineValid = false;
+
         // Once declined, stay declined: the gesture is mid-way through being
         // forwarded as touch and its pointer-up events still have to get there.
         if (gestureUnhandled) {
@@ -394,18 +454,11 @@ public final class Touchpad {
 
         switch (action) {
             case MotionEvent.ACTION_DOWN: {
-                // Recover from a missing CANCEL/UP before starting a new stream.
-                // Without this, a long-press drag or a forwarded gesture could
-                // remain held on the remote indefinitely.
-                releaseForwardedTouches();
-                if (isDraggingActive)
-                    sendButton(0x110, false);
                 float x = event.getX();
                 float y = event.getY();
                 startX1 = lastX1 = x;
                 startY1 = lastY1 = y;
                 downTime1 = event.getEventTime();
-                twoFingerDownTime = 0L;
                 hasLongPressed = false;
                 isLongPressPossible = true;
                 isSingleTapCandidate = true;
@@ -428,7 +481,6 @@ public final class Touchpad {
                 if (pointerCount == 2) {
                     currentState = STATE_TWO_FINGER;
                     isTwoFingerTapCandidate = true;
-                    twoFingerDownTime = event.getEventTime();
                     lastX1 = twoFingerStartX1 = event.getX(0);
                     lastY1 = twoFingerStartY1 = event.getY(0);
                     lastX2 = twoFingerStartX2 = event.getX(1);
@@ -563,8 +615,6 @@ public final class Touchpad {
             case MotionEvent.ACTION_UP: {
                 long duration = event.getEventTime() - downTime1;
                 boolean isQuickTap = duration < 300;
-                boolean isQuickTwoFingerTap = twoFingerDownTime > 0L
-                        && event.getEventTime() - twoFingerDownTime < 300;
 
                 if (isDraggingActive) {
                     sendButton(0x110, false);
@@ -574,7 +624,7 @@ public final class Touchpad {
                     return true;
                 }
 
-                if (isTwoFingerTapCandidate && isQuickTwoFingerTap) {
+                if (isTwoFingerTapCandidate && isQuickTap) {
                     sendButton(0x111, true);
                     sendButton(0x111, false);
                     resetTouchpadState();
@@ -765,7 +815,6 @@ public final class Touchpad {
         isLongPressPossible = false;
         isMultiFinger = false;
         twoFingerMode = TWO_FINGER_UNDECIDED;
-        twoFingerDownTime = 0L;
         // Cleared here rather than in declineGesture: the latch has to outlive the
         // events that follow it and only lifts when the gesture itself ends.
         gestureUnhandled = false;

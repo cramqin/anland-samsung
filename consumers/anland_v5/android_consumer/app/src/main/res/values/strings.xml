@@ -15,7 +15,7 @@
     <!-- Settings home: category rows and back navigation -->
     <string name="nav_back">‹ Back</string>
     <string name="cat_keyboard_title">Keyboard &amp; Keys</string>
-    <string name="cat_keyboard_subtitle">Key binding, accessibility &amp; extra keys bar</string>
+    <string name="cat_keyboard_subtitle">Key binding, immersive mode, accessibility &amp; extra keys bar</string>
     <string name="cat_touchpad_title">Touchpad &amp; Mouse</string>
     <string name="cat_touchpad_subtitle">Touchpad mode, pointer capture &amp; sensitivity</string>
     <string name="cat_connection_subtitle">Socket, root, mic, camera &amp; audio latency</string>
@@ -38,7 +38,21 @@
     <string name="listening_countdown">Listening… (%1$ds)</string>
     <string name="status_current_none">Current: None</string>
     <string name="status_current">Current: %1$s</string>
+    <string name="status_current_no_scancode">Current: %1$s — this key reports no scan code, so immersive mode cannot use it. Bind a hardware key such as Volume Up.</string>
     <string name="keycode_unknown">Keycode %1$d</string>
+    <string name="scancode_unknown">Scan code %1$d</string>
+
+    <!-- Immersive mode -->
+    <string name="section_immersive">Immersive Mode</string>
+    <string name="immersive_switch">Enable immersive mode</string>
+    <string name="immersive_hint">Uses root to take the touchscreen, keyboard and pointer devices away from Android entirely (EVIOCGRAB) and sends everything to the Linux desktop, so system gestures, the notification shade and the navigation bar cannot get in the way. Requires root. Off by default and never starts on its own: turn this on, bind a key below, then press that key to enter and press it again to leave. While a session runs, this app\'s own on-screen controls are unreachable by design, \"Capture external pointer\" is suspended (that setting itself is left alone), and Touchpad Mode still applies — a finger moves the cursor, at the sensitivity set under Touchpad &amp; Mouse. A session also ends whenever the app loses focus.</string>
+    <string name="bind_immersive_key_button">Bind Immersive Mode Key</string>
+    <string name="immersive_entering">Immersive mode: all input goes to the desktop. Press %1$s again to leave.</string>
+    <string name="immersive_exited">Immersive mode off</string>
+    <string name="immersive_no_scancode">Bind a key for immersive mode first</string>
+    <string name="immersive_failed">Could not start immersive mode: root was denied or is unavailable</string>
+    <string name="immersive_no_devices">Could not start immersive mode: no input device could be taken over</string>
+    <string name="immersive_interrupted">Immersive mode ended; input returned to Android</string>
 
     <!-- Accessibility -->
     <string name="accessibility_switch">Accessibility Key Interception</string>
@@ -108,6 +122,8 @@
     <string name="mic_hint">Desktop audio always plays through this device\'s speaker. Enabling this also sends the mic the other way. Takes effect on next connect (reopen the app).</string>
     <string name="camera_switch">Forward camera to desktop</string>
     <string name="camera_hint">Lets the desktop open this device\'s camera(s) as a video source. The camera only turns on while the desktop is actively recording. Takes effect on next return to the app; first use prompts for the camera permission.</string>
+    <string name="audio_keepalive_switch">Audio keep-alive</string>
+    <string name="audio_keepalive_hint">Keep the audio output stream running so short Linux sounds (volume ticks, key clicks) always play instantly. Costs a little standby power. Off: the audio path sleeps after ~1.5 s of desktop silence and wakes for the next sound. If the audible latency does not match your preference, you may need to tune the Audio latency presets below.</string>
     <string name="audio_latency_title">Audio latency</string>
     <string name="latency_speaker_label">Speaker (desktop → phone)</string>
     <string name="latency_mic_label">Microphone (phone → desktop)</string>
